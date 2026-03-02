@@ -7,9 +7,9 @@ import requests
 import anthropic
 from datetime import datetime
 
-# --- CONFIG (se rellenan como variables de entorno en Railway) ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# --- CONFIG ---
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 # Lista de acciones a monitorear
@@ -18,24 +18,20 @@ TICKERS = [
     "GOOGL", "AMD", "NFLX", "PLTR", "SOFI", "RIVN"
 ]
 
-# RSS de noticias financieras gratis
-NEWS_FEEDS = [
-    "https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
-    "https://feeds.marketwatch.com/marketwatch/realtimeheadlines/",
-]
 
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
+def send_discord(message):
+    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+    headers = {
+        "Authorization": f"Bot {DISCORD_TOKEN}",
+        "Content-Type": "application/json"
     }
+    payload = {"content": message}
     try:
-        requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            print(f"Error Discord: {resp.status_code} {resp.text}")
     except Exception as e:
-        print(f"Error enviando Telegram: {e}")
+        print(f"Error enviando Discord: {e}")
 
 
 def get_technical_data(ticker):
@@ -51,11 +47,9 @@ def get_technical_data(ticker):
         prev_price = closes[-2]
         change_pct = ((price - prev_price) / prev_price) * 100
 
-        # SMA 20 y 50
         sma20 = sum(closes[-20:]) / 20
         sma50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
 
-        # RSI 14
         gains, losses = [], []
         for i in range(1, 15):
             diff = closes[-i] - closes[-i-1]
@@ -67,11 +61,9 @@ def get_technical_data(ticker):
         avg_loss = sum(losses) / 14 if losses else 0.001
         rsi = 100 - (100 / (1 + avg_gain / avg_loss))
 
-        # Volumen relativo (hoy vs media 20 dias)
         avg_vol = sum(volumes[-20:]) / 20
         vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1
 
-        # Maximo y minimo 52 semanas
         hist_year = stock.history(period="1y")
         high_52w = hist_year["High"].max() if not hist_year.empty else price
         low_52w = hist_year["Low"].min() if not hist_year.empty else price
@@ -146,19 +138,19 @@ Si NO hay oportunidad clara, responde únicamente: NO_SIGNAL"""
         return "NO_SIGNAL"
 
 
-def format_telegram_message(data, analysis):
+def format_message(data, analysis):
     signal_line = analysis.split("\n")[0]
     is_buy = "COMPRAR" in signal_line
     emoji = "🟢" if is_buy else "🔴"
 
-    msg = f"""{emoji} <b>ALERTA: {data['ticker']}</b>
+    msg = f"""{emoji} **ALERTA: {data['ticker']}**
 
-💰 Precio: <b>${data['price']}</b> ({'+' if data['change_pct'] >= 0 else ''}{data['change_pct']}% hoy)
+💰 Precio: **${data['price']}** ({'+' if data['change_pct'] >= 0 else ''}{data['change_pct']}% hoy)
 📊 RSI: {data['rsi']} | Vol: {data['vol_ratio']}x normal
 
 {analysis}
 
-⚠️ <i>Solo orientativo. No es asesoramiento financiero.</i>
+⚠️ Solo orientativo. No es asesoramiento financiero.
 🕐 {datetime.now().strftime('%H:%M %d/%m/%Y')}"""
     return msg
 
@@ -173,12 +165,11 @@ def scan_market():
         if not data:
             continue
 
-        # Filtro rápido: solo analizar con IA si hay algo interesante
         interesting = (
-            data['rsi'] < 35 or        # Sobreventa
-            data['rsi'] > 70 or        # Sobrecompra
-            data['vol_ratio'] > 2.0 or # Volumen anormal
-            abs(data['change_pct']) > 3 # Movimiento grande hoy
+            data['rsi'] < 35 or
+            data['rsi'] > 70 or
+            data['vol_ratio'] > 2.0 or
+            abs(data['change_pct']) > 3
         )
 
         if not interesting:
@@ -189,29 +180,27 @@ def scan_market():
         analysis = analyze_with_ai(data, news)
 
         if "NO_SIGNAL" not in analysis:
-            msg = format_telegram_message(data, analysis)
-            send_telegram(msg)
+            msg = format_message(data, analysis)
+            send_discord(msg)
             opportunities_found += 1
-            print(f"    {ticker}: OPORTUNIDAD DETECTADA y enviada a Telegram")
+            print(f"    {ticker}: OPORTUNIDAD DETECTADA y enviada a Discord")
         else:
             print(f"    {ticker}: sin oportunidad clara")
 
-        time.sleep(2)  # Evitar rate limits
+        time.sleep(2)
 
     if opportunities_found == 0:
         print("  Sin oportunidades destacadas en este ciclo")
     else:
-        print(f"  {opportunities_found} oportunidades enviadas a Telegram")
+        print(f"  {opportunities_found} oportunidades enviadas a Discord")
 
 
 def main():
     print("StockBot iniciado")
-    send_telegram("🤖 <b>StockBot activado</b>\nEscaneando mercado cada 30 minutos...")
+    send_discord("🤖 **StockBot activado**\nEscaneando mercado cada 30 minutos...")
 
-    # Escanear al arrancar
     scan_market()
 
-    # Luego cada 30 minutos
     schedule.every(30).minutes.do(scan_market)
 
     while True:
