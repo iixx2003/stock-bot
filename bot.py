@@ -1,9 +1,8 @@
 import os
 import time
 import schedule
-import yfinance as yf
-import feedparser
 import requests
+import feedparser
 import anthropic
 from datetime import datetime
 
@@ -12,7 +11,6 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-# Lista de acciones a monitorear
 TICKERS = [
     "AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "META",
     "GOOGL", "AMD", "NFLX", "PLTR", "SOFI", "RIVN"
@@ -25,6 +23,9 @@ def send_discord(message):
         "Authorization": f"Bot {DISCORD_TOKEN}",
         "Content-Type": "application/json"
     }
+    # Discord tiene limite de 2000 caracteres
+    if len(message) > 1900:
+        message = message[:1900] + "..."
     payload = {"content": message}
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=10)
@@ -36,13 +37,30 @@ def send_discord(message):
 
 def get_technical_data(ticker):
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="3mo")
-        if hist.empty or len(hist) < 20:
+        # Usamos la API de Yahoo Finance v8 directamente con headers de navegador
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=3mo"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"    {ticker}: HTTP {resp.status_code}")
             return None
 
-        closes = hist["Close"].tolist()
-        volumes = hist["Volume"].tolist()
+        data = resp.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return None
+
+        result = result[0]
+        closes = [c for c in result["indicators"]["quote"][0]["close"] if c is not None]
+        volumes = [v for v in result["indicators"]["quote"][0].get("volume", []) if v is not None]
+
+        if len(closes) < 20:
+            return None
+
         price = closes[-1]
         prev_price = closes[-2]
         change_pct = ((price - prev_price) / prev_price) * 100
@@ -52,7 +70,7 @@ def get_technical_data(ticker):
 
         gains, losses = [], []
         for i in range(1, 15):
-            diff = closes[-i] - closes[-i-1]
+            diff = closes[-i] - closes[-i - 1]
             if diff >= 0:
                 gains.append(diff)
             else:
@@ -61,12 +79,11 @@ def get_technical_data(ticker):
         avg_loss = sum(losses) / 14 if losses else 0.001
         rsi = 100 - (100 / (1 + avg_gain / avg_loss))
 
-        avg_vol = sum(volumes[-20:]) / 20
+        avg_vol = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
         vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1
 
-        hist_year = stock.history(period="1y")
-        high_52w = hist_year["High"].max() if not hist_year.empty else price
-        low_52w = hist_year["Low"].min() if not hist_year.empty else price
+        high_52w = max(closes)
+        low_52w = min(closes)
 
         return {
             "ticker": ticker,
@@ -81,7 +98,7 @@ def get_technical_data(ticker):
             "dist_from_low": round(((price - low_52w) / low_52w) * 100, 1),
         }
     except Exception as e:
-        print(f"Error obteniendo datos de {ticker}: {e}")
+        print(f"    Error obteniendo datos de {ticker}: {e}")
         return None
 
 
@@ -99,7 +116,6 @@ def get_news(ticker):
 
 def analyze_with_ai(data, news):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     news_text = "\n".join(f"- {h}" for h in news) if news else "- Sin noticias recientes"
 
     prompt = f"""Eres un analista financiero experto. Analiza esta acción y decide si hay una oportunidad clara de inversión.
@@ -110,21 +126,21 @@ RSI (14): {data['rsi']}
 SMA 20: ${data['sma20']} | Precio {'SOBRE' if data['price'] > data['sma20'] else 'BAJO'} la media
 SMA 50: ${data['sma50']} | Precio {'SOBRE' if data['sma50'] and data['price'] > data['sma50'] else 'BAJO'} la media
 Volumen hoy vs media: {data['vol_ratio']}x
-Máximo 52 semanas: ${data['high_52w']}
-Mínimo 52 semanas: ${data['low_52w']} ({data['dist_from_low']}% sobre el mínimo)
+Máximo 3 meses: ${data['high_52w']}
+Mínimo 3 meses: ${data['low_52w']} ({data['dist_from_low']}% sobre el mínimo)
 
 NOTICIAS RECIENTES:
 {news_text}
 
-Responde SOLO si hay una oportunidad clara (no respondas para señales mediocres).
-Si hay oportunidad, responde en este formato exacto:
+Responde SOLO si hay una oportunidad clara.
+Si hay oportunidad responde exactamente así:
 SEÑAL: COMPRAR o VENDER
 CONFIANZA: Alta / Media
-RAZÓN: 2-3 frases explicando por qué, combinando técnico y noticias
-OBJETIVO: precio objetivo aproximado a corto plazo
+RAZÓN: 2-3 frases explicando por qué
+OBJETIVO: precio objetivo a corto plazo
 RIESGO: qué podría salir mal en 1 frase
 
-Si NO hay oportunidad clara, responde únicamente: NO_SIGNAL"""
+Si NO hay oportunidad clara responde únicamente: NO_SIGNAL"""
 
     try:
         message = client.messages.create(
@@ -134,30 +150,27 @@ Si NO hay oportunidad clara, responde únicamente: NO_SIGNAL"""
         )
         return message.content[0].text.strip()
     except Exception as e:
-        print(f"Error con AI: {e}")
+        print(f"    Error con AI: {e}")
         return "NO_SIGNAL"
 
 
 def format_message(data, analysis):
-    signal_line = analysis.split("\n")[0]
-    is_buy = "COMPRAR" in signal_line
+    is_buy = "COMPRAR" in analysis.split("\n")[0]
     emoji = "🟢" if is_buy else "🔴"
-
-    msg = f"""{emoji} **ALERTA: {data['ticker']}**
-
-💰 Precio: **${data['price']}** ({'+' if data['change_pct'] >= 0 else ''}{data['change_pct']}% hoy)
+    sign = "+" if data['change_pct'] >= 0 else ""
+    return f"""{emoji} **ALERTA: {data['ticker']}**
+💰 Precio: **${data['price']}** ({sign}{data['change_pct']}% hoy)
 📊 RSI: {data['rsi']} | Vol: {data['vol_ratio']}x normal
 
 {analysis}
 
 ⚠️ Solo orientativo. No es asesoramiento financiero.
 🕐 {datetime.now().strftime('%H:%M %d/%m/%Y')}"""
-    return msg
 
 
 def scan_market():
     print(f"[{datetime.now().strftime('%H:%M')}] Escaneando mercado...")
-    opportunities_found = 0
+    found = 0
 
     for ticker in TICKERS:
         print(f"  Analizando {ticker}...")
@@ -173,36 +186,29 @@ def scan_market():
         )
 
         if not interesting:
-            print(f"    {ticker}: sin señal técnica relevante, saltando")
+            print(f"    {ticker}: sin señal relevante")
             continue
 
         news = get_news(ticker)
         analysis = analyze_with_ai(data, news)
 
         if "NO_SIGNAL" not in analysis:
-            msg = format_message(data, analysis)
-            send_discord(msg)
-            opportunities_found += 1
-            print(f"    {ticker}: OPORTUNIDAD DETECTADA y enviada a Discord")
+            send_discord(format_message(data, analysis))
+            found += 1
+            print(f"    {ticker}: OPORTUNIDAD enviada a Discord")
         else:
             print(f"    {ticker}: sin oportunidad clara")
 
         time.sleep(2)
 
-    if opportunities_found == 0:
-        print("  Sin oportunidades destacadas en este ciclo")
-    else:
-        print(f"  {opportunities_found} oportunidades enviadas a Discord")
+    print(f"  Ciclo terminado. {found} oportunidades enviadas.")
 
 
 def main():
     print("StockBot iniciado")
     send_discord("🤖 **StockBot activado**\nEscaneando mercado cada 30 minutos...")
-
     scan_market()
-
     schedule.every(30).minutes.do(scan_market)
-
     while True:
         schedule.run_pending()
         time.sleep(60)
