@@ -36,6 +36,7 @@ status_message_id = None  # ID del mensaje de status para editarlo
 
 PREDICTIONS_FILE  = "/app/predictions.json"
 WATCHSTATE_FILE   = "/app/watchstate.json"
+STATUS_FILE       = "/app/status.json"
 
 # ═══════════════════════════════════════════════════════
 # UNIVERSO DE ACCIONES
@@ -70,15 +71,25 @@ def send_acierto(msg): _post(DISCORD_ACIERTOS_ID, msg)
 def update_status(msg):
     global status_message_id
     try:
+        # Cargar ID guardado si no lo tenemos en memoria
+        if not status_message_id:
+            try:
+                if os.path.exists(STATUS_FILE):
+                    with open(STATUS_FILE) as f:
+                        status_message_id = json.load(f).get("message_id")
+            except: pass
+
         if status_message_id:
-            # Editar mensaje existente
             r = requests.patch(
                 f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages/{status_message_id}",
                 json={"content": msg},
                 headers={"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"},
                 timeout=10)
             if r.status_code in (200, 201): return
-        # Si no hay mensaje previo o falló la edición, crear uno nuevo
+            # Si falla el patch (mensaje borrado), crear uno nuevo
+            status_message_id = None
+
+        # Crear mensaje nuevo
         r = requests.post(
             f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages",
             json={"content": msg},
@@ -86,10 +97,28 @@ def update_status(msg):
             timeout=10)
         if r.status_code in (200, 201):
             status_message_id = r.json().get("id")
+            try:
+                with open(STATUS_FILE, "w") as f:
+                    json.dump({"message_id": status_message_id}, f)
+            except: pass
     except Exception as e:
         print(f"Status err: {e}")
 
 def post_instrucciones():
+    # Borrar mensajes anteriores del bot en #instrucciones
+    try:
+        r = requests.get(
+            f"https://discord.com/api/v10/channels/{DISCORD_INSTRUCCIONES_ID}/messages?limit=20",
+            headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=10)
+        if r.status_code == 200:
+            for m in r.json():
+                if m.get("author", {}).get("bot"):
+                    requests.delete(
+                        f"https://discord.com/api/v10/channels/{DISCORD_INSTRUCCIONES_ID}/messages/{m['id']}",
+                        headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=5)
+                    time.sleep(0.5)
+    except: pass
+
     msg1 = """━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📖  **CÓMO FUNCIONA STOCKBOT PRO**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -948,70 +977,85 @@ def deep_analyze(ticker, name, sector, urgency=0):
 # COMANDO !analizar — ESCUCHA SOLICITUDES
 # ═══════════════════════════════════════════════════════
 _last_solicitud_msg = None
+_bot_start_time = None
 
 def listen_solicitudes(init=False):
     """Revisa el canal #solicitud-en-concreto buscando comandos !analizar TICKER"""
-    global _last_solicitud_msg
+    global _last_solicitud_msg, _bot_start_time
     try:
-        params = {"limit": 5}
+        params = {"limit": 10}
         if _last_solicitud_msg:
             params["after"] = _last_solicitud_msg
+
         r = requests.get(
             f"https://discord.com/api/v10/channels/{DISCORD_SOLICITUD_ID}/messages",
             params=params,
             headers={"Authorization": f"Bot {DISCORD_TOKEN}"},
             timeout=10)
+
         if r.status_code != 200:
-            print(f"  Solicitud canal err: {r.status_code} — {r.text[:100]}")
+            print(f"  Solicitud err: {r.status_code}")
             return
+
         messages = r.json()
         if not messages: return
 
-        # Al arrancar, solo marcar el último mensaje como visto sin procesar
+        # Al arrancar: marcar todos como vistos, solo escuchar desde ahora
         if init:
             _last_solicitud_msg = messages[0]["id"]
-            print(f"  Solicitudes: marcado último mensaje, escuchando desde ahora")
+            print(f"  Solicitudes listas — escuchando nuevos mensajes")
             return
 
-        # Actualizar último mensaje procesado
-        _last_solicitud_msg = messages[0]["id"]
-
+        # Procesar mensajes nuevos
         for msg in reversed(messages):
-            content = msg.get("content", "").strip()
-            author  = msg.get("author", {})
+            msg_id = msg.get("id")
+            text   = msg.get("content", "").strip()
+            author = msg.get("author", {})
+
+            # Ignorar bots
             if author.get("bot"): continue
-            if not content.lower().startswith("!analizar"): continue
 
-            parts = content.split()
-            if len(parts) < 2: continue
+            # Solo procesar !analizar
+            if not text.lower().startswith("!analizar"): continue
+
+            parts = text.split()
+            if len(parts) < 2:
+                _post(DISCORD_SOLICITUD_ID, "⚠️  Uso correcto: `!analizar NVDA`")
+                continue
+
             ticker = parts[1].upper().strip()
+            print(f"  Solicitud: !analizar {ticker}")
 
-            print(f"  Solicitud manual: {ticker}")
-            update_status(f"🔍  Analizando {ticker} bajo demanda...")
             _post(DISCORD_SOLICITUD_ID, f"🔍  Analizando **{ticker}**... dame unos segundos.")
+            update_status(f"🔍  Analizando {ticker} bajo demanda...")
 
             result = deep_analyze(ticker, ticker, "Unknown", urgency=5)
             now = datetime.now(SPAIN_TZ)
 
             if not result:
-                _post(DISCORD_SOLICITUD_ID,
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                no_signal_msg = (
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🔎  **{ticker}**\n"
-                    f"Sin señal clara en este momento.\n"
-                    f"Las 6 capas no encuentran convergencia suficiente.\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐  {now.strftime('%H:%M  %d/%m/%Y')} hora España")
+                    "Sin señal clara en este momento.\n"
+                    "Las 6 capas no encuentran convergencia suficiente.\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🕐  {now.strftime('%H:%M  %d/%m/%Y')} hora España"
+                )
+                _post(DISCORD_SOLICITUD_ID, no_signal_msg)
             else:
                 session = get_session(now)
                 alert_msg = format_alert(result["tech"], result["analysis"], session)
                 _post(DISCORD_SOLICITUD_ID, alert_msg)
-                # También guardar predicción
                 tech = result["tech"]
                 add_prediction(ticker, result["signal"], tech["price"],
                                tech["price"]*1.15, tech["price"]*1.20, tech["price"]*1.30,
                                tech["price"]*0.93, result["conf"], 14)
 
-            update_status(f"🟢  **Activo** — vigilando mercado\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
+            update_status("🟢  Activo — vigilando mercado\n🕐  " + now.strftime("%H:%M  %d/%m/%Y"))
+
+        # Actualizar último mensaje procesado
+        _last_solicitud_msg = messages[0]["id"]
+
     except Exception as e:
         print(f"  Solicitud err: {e}")
 
