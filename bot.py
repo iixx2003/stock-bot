@@ -946,6 +946,9 @@ def scan_market():
         if data:
             if data['signals'] >= 1:
                 candidates.append(data)
+                print(f"    ✓ {ticker}: {data['signals']} señales | RSI {data['rsi']} | vol {data['vol_ratio']}x | {data['change_pct']}%")
+            elif data['signals'] == 0 and data['vol_ratio'] > 1.3:
+                print(f"    ~ {ticker}: 0 señales pero vol {data['vol_ratio']}x | RSI {data['rsi']} | {data['change_pct']}%")
         time.sleep(0.2)
 
     candidates.sort(key=lambda x: (x['signals'], x['vol_ratio']), reverse=True)
