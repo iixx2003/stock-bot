@@ -447,7 +447,7 @@ def main():
     load_predictions()
     now=datetime.now(SPAIN_TZ)
     print(f"StockBot Pro iniciado — {now.strftime('%H:%M %d/%m/%Y')}")
-    send_log(f"🤖 **StockBot Pro activado** — {now.strftime('%H:%M %d/%m/%Y')}\n📡 Escaneo 30min | 9:00-23:00h España\n✅ Confianza min: {MIN_CONFIDENCE}% | 🔥 Especial: 85%+\n🎯 Max {MAX_PER_CYCLE} alertas/ciclo | Max {MAX_SELLS_DAY} venta/dia")
+    send_log(f"🤖 **StockBot Pro activado** — {now.strftime('%H:%M %d/%m/%Y')}\n📡 Escaneo 30min | 9:00-23:00h España\n✅ Confianza min: {MIN_CONFIDENCE}% | 🔥 Especial: 85%+\n🎯 Max {MAX_PER_DAY} alertas/dia | Max {MAX_SELLS_DAY} venta/dia")
     update_market_context()
     scan()
     schedule.every(30).minutes.do(scan)
