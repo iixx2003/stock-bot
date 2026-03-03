@@ -949,7 +949,7 @@ def deep_analyze(ticker, name, sector, urgency=0):
 # ═══════════════════════════════════════════════════════
 _last_solicitud_msg = None
 
-def listen_solicitudes():
+def listen_solicitudes(init=False):
     """Revisa el canal #solicitud-en-concreto buscando comandos !analizar TICKER"""
     global _last_solicitud_msg
     try:
@@ -961,9 +961,17 @@ def listen_solicitudes():
             params=params,
             headers={"Authorization": f"Bot {DISCORD_TOKEN}"},
             timeout=10)
-        if r.status_code != 200: return
+        if r.status_code != 200:
+            print(f"  Solicitud canal err: {r.status_code} — {r.text[:100]}")
+            return
         messages = r.json()
         if not messages: return
+
+        # Al arrancar, solo marcar el último mensaje como visto sin procesar
+        if init:
+            _last_solicitud_msg = messages[0]["id"]
+            print(f"  Solicitudes: marcado último mensaje, escuchando desde ahora")
+            return
 
         # Actualizar último mensaje procesado
         _last_solicitud_msg = messages[0]["id"]
@@ -1249,6 +1257,7 @@ def main():
     )
 
     watch_cycle()
+    listen_solicitudes(init=True)  # Marcar mensajes existentes como vistos
 
     schedule.every(5).minutes.do(watch_cycle)
     schedule.every(5).minutes.do(listen_solicitudes)
