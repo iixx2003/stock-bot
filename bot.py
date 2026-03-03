@@ -1304,16 +1304,34 @@ def main():
     listen_solicitudes(init=True)  # Marcar mensajes existentes como vistos
 
     schedule.every(5).minutes.do(watch_cycle)
-    schedule.every(5).minutes.do(listen_solicitudes)
     schedule.every().sunday.at("10:00").do(weekly_aciertos_report)
     schedule.every().day.at("09:00").do(update_market_context)
     schedule.every().day.at("00:01").do(reset_daily_counters)
     schedule.every().monday.at("09:00").do(send_weekly_summary)
     schedule.every().thursday.at("09:00").do(send_weekly_summary)
 
+    # Loop principal
+    last_solicitud_check = 0
+    last_status_update = 0
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        now_ts = time.time()
+        # Revisar solicitudes cada 30 segundos
+        if now_ts - last_solicitud_check >= 30:
+            listen_solicitudes()
+            last_solicitud_check = now_ts
+        # Actualizar status cada 5 minutos
+        if now_ts - last_status_update >= 300:
+            now = datetime.now(SPAIN_TZ)
+            fg = market_context["fear_greed"]
+            fg_label = ("PÁNICO EXTREMO" if fg<20 else "Miedo" if fg<40 else "Neutral" if fg<60 else "Codicia" if fg<80 else "EUFORIA")
+            update_status(
+                f"🟢  **Activo** — vigilando mercado\n"
+                f"📡 Fear&Greed: {fg} ({fg_label}) | VIX: {market_context['vix']}\n"
+                f"🕐  Última actualización: {now.strftime('%H:%M')} — si esto no cambia en 10 min el bot está caído"
+            )
+            last_status_update = now_ts
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()
