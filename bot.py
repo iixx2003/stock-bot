@@ -8,7 +8,8 @@ import pytz
 # ═══════════════════════════════════════════════════════
 DISCORD_TOKEN     = os.environ.get("DISCORD_TOKEN")
 DISCORD_ALERTS_ID = os.environ.get("DISCORD_CHANNEL_ID")
-DISCORD_LOG_ID    = "1478113089093374034"
+DISCORD_LOG_ID      = "1478113089093374034"
+DISCORD_ACIERTOS_ID = "1478461406251847812"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 NEWS_API_KEY      = os.environ.get("NEWS_API_KEY")
 
@@ -57,8 +58,9 @@ def _post(cid, msg):
     except Exception as e:
         print(f"Discord err: {e}")
 
-def send_alert(msg): _post(DISCORD_ALERTS_ID, msg)
-def send_log(msg):   _post(DISCORD_LOG_ID, msg)
+def send_alert(msg):   _post(DISCORD_ALERTS_ID, msg)
+def send_log(msg):     _post(DISCORD_LOG_ID, msg)
+def send_acierto(msg): _post(DISCORD_ACIERTOS_ID, msg)
 
 # ═══════════════════════════════════════════════════════
 # PERSISTENCIA
@@ -748,17 +750,15 @@ Analiza las 5 capas buscando CONVERGENCIA. Cuantas mas capas apunten en la misma
 Usa ATR para calcular plazos realistas. Ancla objetivos en niveles de Fibonacci o soportes/resistencias probados.
 Da 3 plazos concretos en dias o semanas (no etiquetas como "corto" o "largo").
 
-Si hay oportunidad responde EXACTAMENTE asi:
+Si hay oportunidad responde EXACTAMENTE asi (sin explicar las capas, solo el resultado):
 
 SEÑAL: COMPRAR o VENDER
 CONFIANZA: [X]%
 🎯 ENTRADA ÓPTIMA: $[precio exacto]
-📈 OBJETIVO 1: [+/-X%] → $[precio] en [X dias] — [razon concreta]
-📈 OBJETIVO 2: [+/-X%] → $[precio] en [X semanas] — [razon concreta]
-📈 OBJETIVO 3: [+/-X%] → $[precio] en [X meses] — [razon concreta]
-🛑 STOP LOSS: $[precio anclado en soporte/Fibonacci] — prob. stop: [X]%
+📈 OBJETIVO: [+/-X%] → $[precio] en [X dias o X semanas] — [razon en 5 palabras]
+🛑 STOP LOSS: $[precio en soporte/Fibonacci] — prob. stop: [X]%
 ⚖️ RATIO R/B: [X]:1
-💬 POR QUÉ: [3 frases simples sin jerga. Que pasa, por que va a moverse, por que ahora]
+💬 POR QUÉ: [2-3 frases simples. Qué pasa, por qué va a moverse, por qué ahora]
 ⚡ CATALIZADOR: [factor concreto mas importante]
 ❌ INVALIDACIÓN: [precio o evento exacto]
 
@@ -798,19 +798,20 @@ def format_alert(tech, analysis, session, alert_num=None):
     elif conf_val >= CONF_FUERTE:    emoji = "🔥" if is_buy else "🔴"
     else:                             emoji = "🟢" if is_buy else "🔴"
 
-    nivel = "EXCEPCIONAL" if conf_val >= CONF_EXCEPCIONAL else "FUERTE" if conf_val >= CONF_FUERTE else "NORMAL"
     sign = "+" if tech["change_pct"] >= 0 else ""
     session_tag = f"  [{session}]" if session != "MERCADO" else ""
-    num_tag = f"  │  Alerta {alert_num}" if alert_num else ""
+    num_tag = f"  │  {alert_num}" if alert_num else ""
 
-    clean = "\n".join(l for l in analysis.split("\n") if not l.startswith("SEÑAL:")).strip()
+    # Limpiar respuesta: quitar SEÑAL y CONFIANZA del cuerpo (ya están en el header)
+    skip = {"SEÑAL:", "CONFIANZA:"}
+    clean = "\n".join(l for l in analysis.split("\n")
+                       if not any(l.startswith(s) for s in skip)).strip()
 
     return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {emoji}  **{signal}  —  {tech['ticker']}**{session_tag}{num_tag}
-{tech['name']}  │  Nivel: **{nivel}**
+{tech['name']}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰  **${tech['price']}**  ({sign}{tech['change_pct']}% hoy)
-📊  {tech['tf_confluence']}
+💰  **${tech['price']}**  ({sign}{tech['change_pct']}% hoy)  ·  {conf_val}% confianza
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {clean}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -964,6 +965,64 @@ def watch_cycle():
     if alert_count > 0:
         print(f"  {alert_count} alertas enviadas")
 
+
+# ═══════════════════════════════════════════════════════
+# CANAL ACIERTOS
+# ═══════════════════════════════════════════════════════
+def check_aciertos():
+    """Revisa predicciones pendientes y publica en #aciertos-bot las que se cumplieron."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for p in predictions:
+        if p["result"] != "pending": continue
+        date = datetime.fromisoformat(p["date"])
+        days_passed = (datetime.now() - date).days
+        if days_passed < 1: continue  # Demasiado pronto para evaluar
+        ticker = p["ticker"]
+        try:
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d",
+                headers=headers, timeout=10)
+            if r.status_code != 200: continue
+            closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close",[]) if c]
+            if not closes: continue
+            current = closes[-1]
+            entry   = p.get("entry", current)
+            target  = p.get("target_short") or p.get("target", entry * 1.1)
+            stop    = p.get("stop", entry * 0.93)
+            signal  = p.get("signal", "COMPRAR")
+            change  = ((current - entry) / entry) * 100
+            target_change = ((target - entry) / entry) * 100
+
+            hit_target = (signal == "COMPRAR" and current >= target) or (signal == "VENDER" and current <= target)
+            hit_stop   = (signal == "COMPRAR" and current <= stop)   or (signal == "VENDER" and current >= stop)
+
+            if hit_target:
+                p["result"] = "win"
+                p["exit_price"] = current
+                save_state()
+                sign = "+" if change >= 0 else ""
+                send_acierto(
+                    f"✅  **ACIERTO — {ticker}**\n"
+                    f"Entrada: ${entry:.2f}  →  Actual: ${current:.2f}  ({sign}{change:.1f}%)\n"
+                    f"Objetivo alcanzado: ${target:.2f}  en {days_passed} días\n"
+                    f"Confianza original: {p.get('confidence',0)}%"
+                )
+            elif hit_stop:
+                p["result"] = "loss"
+                p["exit_price"] = current
+                save_state()
+                send_acierto(
+                    f"❌  **STOP — {ticker}**\n"
+                    f"Entrada: ${entry:.2f}  →  Stop: ${current:.2f}  ({change:.1f}%)\n"
+                    f"Stop loss activado en {days_passed} días"
+                )
+            elif days_passed > p.get("days", 30) * 1.5:
+                # Tiempo expirado sin resultado claro
+                p["result"] = "expired"
+                p["exit_price"] = current
+                save_state()
+        except: continue
+
 # ═══════════════════════════════════════════════════════
 # RESUMEN SEMANAL
 # ═══════════════════════════════════════════════════════
@@ -999,6 +1058,7 @@ def main():
     watch_cycle()
 
     schedule.every(5).minutes.do(watch_cycle)
+    schedule.every(1).hours.do(check_aciertos)
     schedule.every().day.at("09:00").do(update_market_context)
     schedule.every().monday.at("09:00").do(send_weekly_summary)
     schedule.every().thursday.at("09:00").do(send_weekly_summary)
