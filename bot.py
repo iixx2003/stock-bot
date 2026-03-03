@@ -914,8 +914,22 @@ def scan_market():
     trending = get_trending_tickers()
     print(f"  {len(trending)} acciones encontradas")
 
+    # Paso 1: pre-filtro rapido con datos basicos del screener
+    # Priorizar acciones del screener (ya tienen datos de cambio y volumen)
+    # Las de la lista fija se analizan después si hay tiempo
+    screener_tickers = {k: v for k, v in trending.items() if v.get("change_pct", 0) != 0}
+    static_tickers = {k: v for k, v in trending.items() if v.get("change_pct", 0) == 0}
+
+    # Ordenar estaticas aleatoriamente para rotar cada ciclo
+    import random
+    static_sample = dict(random.sample(list(static_tickers.items()), min(150, len(static_tickers))))
+
+    # Combinar: primero las del screener, luego muestra aleatoria de las estaticas
+    to_analyze = {**screener_tickers, **static_sample}
+    print(f"  Analizando {len(to_analyze)} acciones este ciclo ({len(screener_tickers)} screener + {len(static_sample)} muestra)")
+
     candidates = []
-    for ticker, basic in trending.items():
+    for ticker, basic in to_analyze.items():
         if already_alerted(ticker):
             continue
 
@@ -932,12 +946,10 @@ def scan_market():
         if data:
             if data['signals'] >= 1:
                 candidates.append(data)
-            else:
-                print(f"    {ticker}: score {data['signals']} | RSI {data['rsi']} | vol {data['vol_ratio']}x | {data['change_pct']}% — descartado")
-        time.sleep(0.3)
+        time.sleep(0.2)
 
     candidates.sort(key=lambda x: (x['signals'], x['vol_ratio']), reverse=True)
-    print(f"  {len(candidates)} candidatas con señales")
+    print(f"  {len(candidates)} candidatas con señales para análisis IA")
 
     found = 0
     for data in candidates[:12]:
