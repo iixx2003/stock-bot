@@ -8,8 +8,11 @@ import pytz
 # ═══════════════════════════════════════════════════════
 DISCORD_TOKEN     = os.environ.get("DISCORD_TOKEN")
 DISCORD_ALERTS_ID = os.environ.get("DISCORD_CHANNEL_ID")
-DISCORD_LOG_ID      = "1478113089093374034"
-DISCORD_ACIERTOS_ID = "1478461406251847812"
+DISCORD_LOG_ID        = "1478113089093374034"
+DISCORD_ACIERTOS_ID   = "1478461406251847812"
+DISCORD_SOLICITUD_ID  = "1478470481693900841"
+DISCORD_INSTRUCCIONES_ID = "1478470715509440748"
+DISCORD_STATUS_ID     = "1478471477568475248"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 NEWS_API_KEY      = os.environ.get("NEWS_API_KEY")
 
@@ -28,6 +31,7 @@ predictions      = []
 failed_patterns  = {}
 market_context   = {"fear_greed":50,"sp500_change":0,"vix":15,"macro_news":[],"economic_events":[],"updated_at":None}
 watch_signals    = {}   # {ticker: {"score": X, "last_analyzed": datetime, "developing": bool}}
+status_message_id = None  # ID del mensaje de status para editarlo
 
 PREDICTIONS_FILE  = "/app/predictions.json"
 WATCHSTATE_FILE   = "/app/watchstate.json"
@@ -61,6 +65,58 @@ def _post(cid, msg):
 def send_alert(msg):   _post(DISCORD_ALERTS_ID, msg)
 def send_log(msg):     _post(DISCORD_LOG_ID, msg)
 def send_acierto(msg): _post(DISCORD_ACIERTOS_ID, msg)
+
+def update_status(msg):
+    global status_message_id
+    try:
+        if status_message_id:
+            # Editar mensaje existente
+            r = requests.patch(
+                f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages/{status_message_id}",
+                json={"content": msg},
+                headers={"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"},
+                timeout=10)
+            if r.status_code in (200, 201): return
+        # Si no hay mensaje previo o falló la edición, crear uno nuevo
+        r = requests.post(
+            f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages",
+            json={"content": msg},
+            headers={"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"},
+            timeout=10)
+        if r.status_code in (200, 201):
+            status_message_id = r.json().get("id")
+    except Exception as e:
+        print(f"Status err: {e}")
+
+def post_instrucciones():
+    msg = """━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📖  **CÓMO FUNCIONA STOCKBOT PRO**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍  **Análisis automático**
+El bot vigila +1.200 acciones cada 5 minutos. Cuando detecta una señal real la analiza en profundidad con 6 capas y te avisa en **#stock-alerts**.
+
+⚡  **Niveles de confianza**
+🟢  Normal  82-87% — señal sólida
+🔥  Fuerte  88-93% — alta convicción
+⚡  Excepcional  94%+ — todo alineado
+
+📅  **Resumen semanal**
+Cada domingo a las 10:00 recibirás en **#aciertos-bot** el resultado de todas las predicciones de la semana.
+
+🎯  **Pedir análisis manual**
+Escribe en **#solicitud-en-concreto**:
+`!analizar TICKER`
+Ejemplo: `!analizar NVDA`
+El bot te responde en segundos con el análisis completo.
+
+📡  **Canales**
+**#stock-alerts** — alertas automáticas
+**#log-bot** — actividad interna del bot
+**#aciertos-bot** — resumen semanal de resultados
+**#solicitud-en-concreto** — análisis bajo demanda
+**#status** — estado del bot en tiempo real
+━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    _post(DISCORD_INSTRUCCIONES_ID, msg)
 
 # ═══════════════════════════════════════════════════════
 # PERSISTENCIA
@@ -887,6 +943,70 @@ def deep_analyze(ticker, name, sector, urgency=0):
 
     return {"tech": tech, "analysis": analysis, "conf": conf, "signal": signal}
 
+
+# ═══════════════════════════════════════════════════════
+# COMANDO !analizar — ESCUCHA SOLICITUDES
+# ═══════════════════════════════════════════════════════
+_last_solicitud_msg = None
+
+def listen_solicitudes():
+    """Revisa el canal #solicitud-en-concreto buscando comandos !analizar TICKER"""
+    global _last_solicitud_msg
+    try:
+        params = {"limit": 5}
+        if _last_solicitud_msg:
+            params["after"] = _last_solicitud_msg
+        r = requests.get(
+            f"https://discord.com/api/v10/channels/{DISCORD_SOLICITUD_ID}/messages",
+            params=params,
+            headers={"Authorization": f"Bot {DISCORD_TOKEN}"},
+            timeout=10)
+        if r.status_code != 200: return
+        messages = r.json()
+        if not messages: return
+
+        # Actualizar último mensaje procesado
+        _last_solicitud_msg = messages[0]["id"]
+
+        for msg in reversed(messages):
+            content = msg.get("content", "").strip()
+            author  = msg.get("author", {})
+            if author.get("bot"): continue
+            if not content.lower().startswith("!analizar"): continue
+
+            parts = content.split()
+            if len(parts) < 2: continue
+            ticker = parts[1].upper().strip()
+
+            print(f"  Solicitud manual: {ticker}")
+            update_status(f"🔍  Analizando {ticker} bajo demanda...")
+            _post(DISCORD_SOLICITUD_ID, f"🔍  Analizando **{ticker}**... dame unos segundos.")
+
+            result = deep_analyze(ticker, ticker, "Unknown", urgency=5)
+            now = datetime.now(SPAIN_TZ)
+
+            if not result:
+                _post(DISCORD_SOLICITUD_ID,
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔎  **{ticker}**\n"
+                    f"Sin señal clara en este momento.\n"
+                    f"Las 6 capas no encuentran convergencia suficiente.\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🕐  {now.strftime('%H:%M  %d/%m/%Y')} hora España")
+            else:
+                session = get_session(now)
+                alert_msg = format_alert(result["tech"], result["analysis"], session)
+                _post(DISCORD_SOLICITUD_ID, alert_msg)
+                # También guardar predicción
+                tech = result["tech"]
+                add_prediction(ticker, result["signal"], tech["price"],
+                               tech["price"]*1.15, tech["price"]*1.20, tech["price"]*1.30,
+                               tech["price"]*0.93, result["conf"], 14)
+
+            update_status(f"🟢  **Activo** — vigilando mercado\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
+    except Exception as e:
+        print(f"  Solicitud err: {e}")
+
 # ═══════════════════════════════════════════════════════
 # CICLO DE VIGILANCIA RÁPIDA (cada 5 min)
 # ═══════════════════════════════════════════════════════
@@ -967,61 +1087,94 @@ def watch_cycle():
 
 
 # ═══════════════════════════════════════════════════════
-# CANAL ACIERTOS
+# CANAL ACIERTOS — RESUMEN DOMINICAL
 # ═══════════════════════════════════════════════════════
-def check_aciertos():
-    """Revisa predicciones pendientes y publica en #aciertos-bot las que se cumplieron."""
+def weekly_aciertos_report():
+    """Cada domingo a las 10:00 revisa todas las predicciones y publica resumen visual."""
+    now = datetime.now(SPAIN_TZ)
     headers = {"User-Agent": "Mozilla/5.0"}
+
+    wins = []; losses = []; pending = []
+
     for p in predictions:
-        if p["result"] != "pending": continue
-        date = datetime.fromisoformat(p["date"])
+        ticker      = p["ticker"]
+        entry       = p.get("entry", 0)
+        target      = p.get("target_short") or p.get("target", entry * 1.1)
+        stop        = p.get("stop", entry * 0.93)
+        signal      = p.get("signal", "COMPRAR")
+        date        = datetime.fromisoformat(p["date"])
         days_passed = (datetime.now() - date).days
-        if days_passed < 1: continue  # Demasiado pronto para evaluar
-        ticker = p["ticker"]
+        conf        = p.get("confidence", 0)
+
+        # Obtener precio actual
+        current = entry
         try:
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d",
-                headers=headers, timeout=10)
-            if r.status_code != 200: continue
-            closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close",[]) if c]
-            if not closes: continue
-            current = closes[-1]
-            entry   = p.get("entry", current)
-            target  = p.get("target_short") or p.get("target", entry * 1.1)
-            stop    = p.get("stop", entry * 0.93)
-            signal  = p.get("signal", "COMPRAR")
-            change  = ((current - entry) / entry) * 100
-            target_change = ((target - entry) / entry) * 100
+                headers=headers, timeout=8)
+            if r.status_code == 200:
+                closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close",[]) if c]
+                if closes: current = closes[-1]
+        except: pass
 
-            hit_target = (signal == "COMPRAR" and current >= target) or (signal == "VENDER" and current <= target)
-            hit_stop   = (signal == "COMPRAR" and current <= stop)   or (signal == "VENDER" and current >= stop)
+        change = ((current - entry) / entry) * 100 if entry else 0
+        hit_target = (signal == "COMPRAR" and current >= target) or (signal == "VENDER" and current <= target)
+        hit_stop   = (signal == "COMPRAR" and current <= stop)   or (signal == "VENDER" and current >= stop)
 
-            if hit_target:
-                p["result"] = "win"
-                p["exit_price"] = current
-                save_state()
-                sign = "+" if change >= 0 else ""
-                send_acierto(
-                    f"✅  **ACIERTO — {ticker}**\n"
-                    f"Entrada: ${entry:.2f}  →  Actual: ${current:.2f}  ({sign}{change:.1f}%)\n"
-                    f"Objetivo alcanzado: ${target:.2f}  en {days_passed} días\n"
-                    f"Confianza original: {p.get('confidence',0)}%"
-                )
-            elif hit_stop:
-                p["result"] = "loss"
-                p["exit_price"] = current
-                save_state()
-                send_acierto(
-                    f"❌  **STOP — {ticker}**\n"
-                    f"Entrada: ${entry:.2f}  →  Stop: ${current:.2f}  ({change:.1f}%)\n"
-                    f"Stop loss activado en {days_passed} días"
-                )
-            elif days_passed > p.get("days", 30) * 1.5:
-                # Tiempo expirado sin resultado claro
-                p["result"] = "expired"
-                p["exit_price"] = current
-                save_state()
-        except: continue
+        if p["result"] == "win" or hit_target:
+            if p["result"] != "win":
+                p["result"] = "win"; p["exit_price"] = current; save_state()
+            wins.append({"ticker": ticker, "change": change, "days": days_passed, "conf": conf})
+        elif p["result"] == "loss" or hit_stop:
+            if p["result"] != "loss":
+                p["result"] = "loss"; p["exit_price"] = current; save_state()
+            losses.append({"ticker": ticker, "change": change, "days": days_passed, "conf": conf})
+        elif p["result"] == "pending" and days_passed >= 1:
+            pending.append({"ticker": ticker, "change": change, "days": days_passed, "conf": conf, "current": current})
+
+        time.sleep(0.3)
+
+    total_closed = len(wins) + len(losses)
+    win_rate = round(len(wins) / total_closed * 100) if total_closed > 0 else 0
+    avg_win  = round(sum(w["change"] for w in wins)   / len(wins),   1) if wins   else 0
+    avg_loss = round(sum(l["change"] for l in losses) / len(losses), 1) if losses else 0
+
+    # Construir mensaje visual
+    week_start = (now - timedelta(days=7)).strftime("%d/%m")
+    week_end   = now.strftime("%d/%m/%Y")
+
+    lines = [
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊  **RESUMEN SEMANAL**",
+        f"Semana del {week_start} al {week_end}",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if wins:
+        for w in sorted(wins, key=lambda x: x["change"], reverse=True):
+            sign = "+" if w["change"] >= 0 else ""
+            lines.append(f"✅  **{w['ticker']}**  {sign}{w['change']:.1f}%  en {w['days']} días")
+    if losses:
+        for l in sorted(losses, key=lambda x: x["change"]):
+            lines.append(f"❌  **{l['ticker']}**  {l['change']:.1f}%  stop activado en {l['days']} días")
+    if pending:
+        for p in pending:
+            sign = "+" if p["change"] >= 0 else ""
+            lines.append(f"⏳  **{p['ticker']}**  {sign}{p['change']:.1f}% hasta ahora  —  pendiente")
+
+    if not wins and not losses and not pending:
+        lines.append("Sin predicciones esta semana")
+
+    lines += [
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🎯  Aciertos: {len(wins)}/{total_closed}  —  {win_rate}%",
+    ]
+    if wins:   lines.append(f"💰  Ganancia media: +{avg_win}%")
+    if losses: lines.append(f"📉  Pérdida media: {avg_loss}%")
+    lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    send_acierto("\n".join(lines))
+    send_log(f"📊 Resumen dominical enviado a #aciertos-bot — {len(wins)} aciertos / {len(losses)} stops / {len(pending)} pendientes")
 
 # ═══════════════════════════════════════════════════════
 # RESUMEN SEMANAL
@@ -1058,7 +1211,7 @@ def main():
     watch_cycle()
 
     schedule.every(5).minutes.do(watch_cycle)
-    schedule.every(1).hours.do(check_aciertos)
+    schedule.every().sunday.at("10:00").do(weekly_aciertos_report)
     schedule.every().day.at("09:00").do(update_market_context)
     schedule.every().monday.at("09:00").do(send_weekly_summary)
     schedule.every().thursday.at("09:00").do(send_weekly_summary)
