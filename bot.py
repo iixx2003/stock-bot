@@ -474,6 +474,7 @@ def get_stock_data(ticker):
             "signals": max(signals, 0),
         }
     except Exception as e:
+        print(f"    ERROR get_stock_data {ticker}: {e}")
         return None
 
 def get_earnings_date(ticker):
@@ -947,8 +948,9 @@ def scan_market():
             if data['signals'] >= 1:
                 candidates.append(data)
                 print(f"    ✓ {ticker}: {data['signals']} señales | RSI {data['rsi']} | vol {data['vol_ratio']}x | {data['change_pct']}%")
-            elif data['signals'] == 0 and data['vol_ratio'] > 1.3:
-                print(f"    ~ {ticker}: 0 señales pero vol {data['vol_ratio']}x | RSI {data['rsi']} | {data['change_pct']}%")
+        else:
+            if ticker in list(to_analyze.keys())[:3]:
+                print(f"    ✗ {ticker}: get_stock_data devolvió None")
         time.sleep(0.2)
 
     candidates.sort(key=lambda x: (x['signals'], x['vol_ratio']), reverse=True)
