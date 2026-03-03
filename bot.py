@@ -27,6 +27,7 @@ MAX_SELLS_DIA    = 1
 
 # Estado global
 alerts_sent      = {}   # {ticker: datetime}
+fuertes_enviados = 0   # contador diario reset cada dia
 predictions      = []
 failed_patterns  = {}
 market_context   = {"fear_greed":50,"sp500_change":0,"vix":15,"macro_news":[],"economic_events":[],"updated_at":None}
@@ -89,34 +90,32 @@ def update_status(msg):
         print(f"Status err: {e}")
 
 def post_instrucciones():
-    msg = """━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    msg1 = """━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📖  **CÓMO FUNCIONA STOCKBOT PRO**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍  **Análisis automático**
-El bot vigila +1.200 acciones cada 5 minutos. Cuando detecta una señal real la analiza en profundidad con 6 capas y te avisa en **#stock-alerts**.
+Vigila +1.200 acciones cada 5 min. Cuando detecta señal real la analiza con 6 capas y avisa en **#stock-alerts**.
 
 ⚡  **Niveles de confianza**
-🟢  Normal  82-87% — señal sólida
-🔥  Fuerte  88-93% — alta convicción
-⚡  Excepcional  94%+ — todo alineado
+🟢  Normal 82-87% — señal sólida
+🔥  Fuerte 88-93% — alta convicción
+⚡  Excepcional 94%+ — todo alineado
 
-📅  **Resumen semanal**
-Cada domingo a las 10:00 recibirás en **#aciertos-bot** el resultado de todas las predicciones de la semana.
-
-🎯  **Pedir análisis manual**
+🎯  **Análisis manual**
 Escribe en **#solicitud-en-concreto**:
-`!analizar TICKER`
-Ejemplo: `!analizar NVDA`
-El bot te responde en segundos con el análisis completo.
-
-📡  **Canales**
+`!analizar NVDA`
+El bot responde en segundos."""
+    msg2 = """━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📡  **CANALES**
 **#stock-alerts** — alertas automáticas
-**#log-bot** — actividad interna del bot
-**#aciertos-bot** — resumen semanal de resultados
+**#aciertos-bot** — resumen cada domingo 10:00
 **#solicitud-en-concreto** — análisis bajo demanda
+**#log-bot** — actividad interna
 **#status** — estado del bot en tiempo real
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
-    _post(DISCORD_INSTRUCCIONES_ID, msg)
+    _post(DISCORD_INSTRUCCIONES_ID, msg1)
+    time.sleep(1)
+    _post(DISCORD_INSTRUCCIONES_ID, msg2)
 
 # ═══════════════════════════════════════════════════════
 # PERSISTENCIA
@@ -929,7 +928,7 @@ def deep_analyze(ticker, name, sector, urgency=0):
         print(f"    {ticker}: venta descartada (limite diario)")
         return None
 
-    if conf >= CONF_FUERTE and conf < CONF_EXCEPCIONAL and fuertes_today() >= MAX_FUERTES_DIA:
+    if conf >= CONF_FUERTE and conf < CONF_EXCEPCIONAL and fuertes_enviados >= MAX_FUERTES_DIA:
         print(f"    {ticker}: señal fuerte descartada (limite diario de fuertes)")
         return None
 
@@ -1078,8 +1077,9 @@ def watch_cycle():
         alert_count += 1
 
         nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
+        if conf >= CONF_FUERTE and conf < CONF_EXCEPCIONAL:
+            fuertes_enviados += 1
         print(f"    {ticker}: ALERTA {nivel} ({signal}, {conf}%)")
-        send_log(f"✅ Alerta {nivel}: {ticker} — {signal} — Confianza {conf}%")
         time.sleep(3)
 
     if alert_count > 0:
@@ -1196,6 +1196,14 @@ def send_weekly_summary():
 # ═══════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════
+def reset_daily_counters():
+    global fuertes_enviados, alerts_sent
+    fuertes_enviados = 0
+    # Limpiar alertas de mas de 24h
+    now = datetime.now()
+    alerts_sent = {t: dt for t, dt in alerts_sent.items() if (now - dt).total_seconds() < 86400}
+    print("  Contadores diarios reseteados")
+
 def main():
     load_state()
     now = datetime.now(SPAIN_TZ)
@@ -1213,6 +1221,7 @@ def main():
     schedule.every(5).minutes.do(watch_cycle)
     schedule.every().sunday.at("10:00").do(weekly_aciertos_report)
     schedule.every().day.at("09:00").do(update_market_context)
+    schedule.every().day.at("00:01").do(reset_daily_counters)
     schedule.every().monday.at("09:00").do(send_weekly_summary)
     schedule.every().thursday.at("09:00").do(send_weekly_summary)
 
