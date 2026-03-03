@@ -17,6 +17,13 @@ NEWS_API_KEY = os.environ.get("NEWS_API_KEY")
 SPAIN_TZ = pytz.timezone("Europe/Madrid")
 NY_TZ = pytz.timezone("America/New_York")
 
+# Listas de acciones por indice
+SP500 = ["MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A","APD","AKAM","ALK","ALB","ARE","ALGN","ALLE","LNT","ALL","GOOGL","GOOG","MO","AMZN","AMCR","AEE","AAL","AEP","AXP","AIG","AMT","AWK","AMP","AME","AMGN","APH","ADI","ANSS","AON","APA","AAPL","AMAT","APTV","ACGL","ADM","ANET","AJG","AIZ","T","ATO","ADSK","AZO","AVB","AVY","AXON","BKR","BALL","BAC","BK","BBWI","BAX","BDX","BRK-B","BBY","BIO","TECH","BIIB","BLK","BX","BA","BCR","BMY","AVGO","BR","BRO","BF-B","BLDR","BG","CDNS","CZR","CPT","CPB","COF","CAH","KMX","CCL","CARR","CTLT","CAT","CBOE","CBRE","CDW","CE","COR","CNC","CNX","CDAY","CF","CRL","SCHW","CHTR","CVX","CMG","CB","CHD","CI","CINF","CTAS","CSCO","C","CFG","CLX","CME","CMS","KO","CTSH","CL","CMCSA","CMA","CAG","COP","ED","STZ","CEG","COO","CPRT","GLW","CTVA","CSGP","COST","CTRA","CCI","CSX","CMI","CVS","DHI","DHR","DRI","DVA","DAY","DE","DAL","XRAY","DVN","DXCM","FANG","DLR","DFS","DG","DLTR","D","DPZ","DOV","DOW","LLY","EMN","ETN","EBAY","ECL","EIX","EW","EA","ELV","LLY","EMR","ENPH","ETR","EOG","EPAM","EQT","EFX","EQIX","EQR","ESS","EL","ETSY","EG","EVRG","ES","EXC","EXPE","EXPD","EXR","XOM","FFIV","FDS","FICO","FAST","FRT","FDX","FIS","FITB","FSLR","FE","FI","FLT","FMC","F","FTNT","FTV","FOXA","FOX","BEN","FCX","GRMN","IT","GE","GEHC","GEV","GEN","GNRC","GD","GIS","GM","GPC","GILD","GPN","GL","GDDY","GS","HAL","HIG","HAS","HCA","DOC","HSIC","HSY","HES","HPE","HLT","HOLX","HD","HON","HRL","HST","HWM","HPQ","HUBB","HUM","HBAN","HII","IBM","IEX","IDXX","ITW","INCY","IR","PODD","INTC","ICE","IFF","IP","IPG","INTU","ISRG","IVZ","INVH","IQV","IRM","JBHT","JBL","JKHY","J","JNJ","JCI","JPM","JNPR","K","KVUE","KDP","KEY","KEYS","KMB","KIM","KMI","KLAC","KHC","KR","LHX","LH","LRCX","LW","LVS","LDOS","LEN","LNC","LIN","LYV","LKQ","LMT","L","LOW","LULU","LYB","MTB","MRO","MPC","MKTX","MAR","MMC","MLM","MAS","MA","MTCH","MKC","MCD","MCK","MDT","MRK","META","MET","MTD","MGM","MCHP","MU","MSFT","MAA","MRNA","MHK","MOH","TAP","MDLZ","MPWR","MNST","MCO","MS","MOS","MSI","MSCI","NDAQ","NTAP","NFLX","NWS","NWSA","NEE","NKE","NI","NDSN","NSC","NTRS","NOC","NCLH","NRG","NUE","NVDA","NVR","NXPI","ORLY","OXY","ODFL","OMC","ON","OKE","ORCL","OTIS","PCAR","PKG","PLTR","PH","PAYX","PAYC","PYPL","PNR","PEP","PFE","PCG","PM","PSX","PNW","PXD","PNC","POOL","PPG","PPL","PFG","PG","PGR","PLD","PRU","PEG","PTC","PSA","PHM","QRVO","PWR","QCOM","DGX","RL","RJF","RTX","O","REG","REGN","RF","RSG","RMD","RVTY","ROK","ROL","ROP","ROST","RCL","SPGI","CRM","SBAC","SLB","STX","SRE","NOW","SHW","SPG","SWKS","SJM","SNA","SOLV","SO","LUV","SWK","SBUX","STT","STLD","STE","SYK","SMCI","SYF","SNPS","SYY","TMUS","TROW","TTWO","TPR","TRGP","TGT","TEL","TDY","TFX","TER","TSLA","TXN","TXT","TMO","TJX","TSCO","TT","TDG","TRV","TRMB","TFC","TYL","TSN","USB","UBER","UDR","UHS","UNP","UAL","UPS","URI","UNH","UHS","VLO","VTR","VRSN","VRSK","VZ","VRTX","VLTO","VMC","WRB","GWW","WAB","WBA","WMT","DIS","WBD","WM","WAT","WEC","WFC","WELL","WST","WDC","WRK","WY","WHR","WMB","WTW","WYNN","XEL","XYL","YUM","ZBRA","ZBH","ZTS"]
+
+NASDAQ100 = ["ADBE","AMD","ABNB","GOOGL","GOOG","AMZN","AMGN","AEP","AAPL","ARM","ASML","TEAM","ADSK","AZN","ATVI","BKR","BIIB","BKNG","AVGO","CDNS","CDW","CHTR","CTAS","CSCO","CTSH","CMCSA","CEG","CPRT","CSGP","COST","CRWD","CSX","DDOG","DXCM","FANG","DLTR","EA","ENPH","EXC","FAST","FTNT","GEHC","GILD","GFS","HON","IDXX","ILMN","INTC","INTU","ISRG","KDP","KLAC","KHC","LRCX","LCID","LULU","MAR","MRVL","MELI","META","MCHP","MU","MSFT","MRNA","MDLZ","MDB","MNST","NFLX","NVDA","NXPI","ORLY","ODFL","ON","PCAR","PANW","PAYX","PYPL","PDD","QCOM","REGN","ROP","ROST","SGEN","SIRI","SBUX","SNPS","TTWO","TMUS","TSLA","TXN","VRSK","VRTX","WBA","WBD","WDAY","XEL","ZS","ZM"]
+
+RUSSELL_SAMPLE = ["AADI","AAGR","AAME","AANA","AAOI","AAPB","AATC","ABAT","ABCB","ABCL","ABEO","ABIO","ABMD","ABNB","ABOS","ABSI","ABST","ABUS","ABVX","ACAB","ACAD","ACAH","ACEL","ACGB","ACHI","ACHL","ACHR","ACHV","ACIC","ACII","ACIU","ACIX","ACKN","ACLS","ACMR","ACNB","ACNT","ACON","ACOR","ACRS","ACRX","ACST","ACTA","ACTG","ACVA","ACWI","ADAP","ADBE","ADER","ADEX","ADIL","ADIN","ADMA","ADMS","ADMT","ADNOC","ADNT","ADOC","ADPT","ADRT","ADSE","ADTN","ADTX","ADUS","ADVM","ADXN","AEAC","AEAE","AEAG","AEHR","AEIS","AEMD","AENA","AENZ","AERI","AESE","AEYE","AFAR","AFBI","AFCG","AFIB","AFMD","AFRI","AFTR","AFYA","AGAC","AGEN","AGFS","AGFY","AGIL","AGIO","AGMH","AGNG","AGOS","AGRI","AGRO","AGRX","AGTI","AGUS","AGYS","AHCO","AHED","AHGP","AHPA","AHPI","AHRN","AHRNW","AIBOU","AIFU","AIGI","AIHS","AILE","AILG","AIMD","AINC","AINV","AIRC","AIRI","AIRJ","AIRSP","AIRT","AIRTP","AISA","AISG","AIUS","AIVA","AIVE","AIXI","AJRD","AKAM","AKAN","AKBA","AKCA","AKER","AKESW","AKLI","AKOM","AKRO","AKTS","AKTX","AKUS","AKYA","ALBT","ALCC","ALCO","ALCY","ALDX","ALEC","ALEX","ALGM","ALGN","ALGS","ALGT","ALHC","ALIM","ALIO","ALJJ","ALKS","ALLG","ALLK","ALLO","ALLR","ALLT","ALNY","ALOT","ALPA","ALPC","ALPN","ALRM","ALRN","ALRS","ALSA","ALSN","ALTO","ALUR","ALUS","ALVR","ALVO","ALXO","ALYA","ALZN","AMAL","AMAM","AMAO","AMBC","AMBI","AMBO","AMBP","AMCX","AMED","AMEH","AMER","AMGN","AMHC","AMIX","AMKR","AMMO","AMNB","AMNI","AMOR","AMOT","AMPE","AMPH","AMPI","AMPX","AMPY","AMRK","AMRN","AMRS","AMRX","AMSC","AMSF","AMST","AMSWA","AMTB","AMTD","AMTI","AMTX","AMWD","AMWL","AMXT","ANAB","ANDE","ANEB","ANET","ANGH","ANGI","ANGL","ANGN","ANIK","ANIP","ANIX","ANNX","ANPC","ANSS","ANTE","ANTX","ANVI","ANVS","AOSL","AOTG","APAC","APAM","APCA","APCX","APDN","APEI","APEN","APEX","APGE","APGN","APHA","APLD","APLE","APLS","APLT","APM","APMI","APOG","APRE","APRL","APRN","APRO","APRT","APTO","APTY","APVO","APWC","APXI","APYX","AQMS","AQNA","AQNB","AQST","AQXP","ARAV","ARAY","ARBB","ARBE","ARBEW","ARBO","ARCC","ARCE","ARCH","ARCT","ARCY","ARDC","ARDS","ARDX","AREB","AREC","AREN","ARES","ARGAN","ARGX","ARHS","ARKO","ARKOW","ARKT","ARLO","ARMP","ARNC","AROC","AROW","ARQT","ARQTW","ARRY","ARTE","ARTL","ARTNA","ARTW","ARVL","ARVN","ARWR","ARYD","ARYE","ARZN","ASAI","ASAQ","ASBP","ASCA","ASDN","ASET","ASLE","ASLN","ASMB","ASML","ASND","ASPN","ASPS","ASPU","ASRT","ASRV","ASTC","ASTE","ASTL","ASTR","ASTU","ASUR","ASYS","ATAI","ATAQ","ATAT","ATCX","ATEC","ATEX","ATHA","ATHE","ATHX","ATIF","ATIP","ATIS","ATLA","ATLC","ATLO","ATMC","ATMU","ATNF","ATNI","ATNM","ATOM","ATOS","ATPC","ATPL","ATRE","ATRI","ATRO","ATSG","ATSPC","ATVI","ATXG","ATXI","ATXS","ATYR","AUBN","AUDC","AUGX","AUID","AUMN","AUPH","AURC","AURE","AURX","AUUD","AUVI","AVAH","AVAV","AVBP","AVDL","AVDX","AVEAW","AVEO","AVGO","AVGR","AVHD","AVIR","AVNW","AVPT","AVRO","AVRE","AVRO","AVTA","AVTE","AVTR","AVXL","AVYA","AWRE","AXGN","AXIL","AXLA","AXNX","AXON","AXSM","AXTA","AXTI","AXXN","AYRO","AYTU","AZEK","AZIO","AZPN","AZTA","AZUL","AZYO","BACK","BADG","BAFN","BAIN","BALY","BANC","BAND","BANF","BANL","BANR","BANT","BAOS","BARK","BASE","BATL","BATRA","BATRK","BBAI","BBCP","BBGI","BBLG","BBLN","BBSI","BBucl","BBWI","BCAB","BCAL","BCBP","BCDA","BCEL","BCLI","BCML","BCNB","BCOV","BCOW","BCPC","BCRX","BCSA","BCSAW","BCYC","BDSX","BDTX","BEAM","BEAT","BECN","BEDU","BELFA","BELFB","BENF","BERN","BERY","BEST","BFAC","BFAM","BFIN","BFLY","BFOR","BFRI","BFRIW","BGFV","BGRY","BGSF","BHIL","BHVN","BIDU","BIMI","BIOA","BIOC","BIOL","BIOR","BIOS","BIOX","BIPV","BIRD","BIRK","BITE","BIVI","BJDX","BJRI","BKFC","BKNG","BKSC","BKSY","BKTI","BKUT","BLAB","BLBD","BLBX","BLCM","BLCN","BLDP","BLEG","BLEU","BLFS","BLFY","BLIN","BLKB","BLMN","BLND","BLNK","BLPH","BLRX","BLSA","BLTE","BLUE","BLVI","BLVT","BLZE","BMEA","BMGN","BMRA","BMRC","BMTC","BNAI","BNED","BNGO","BNIX","BNR","BNRE","BNRG","BNSO","BNTC","BNTX","BOAS","BOCN","BOF","BOLT","BOMN","BOOM","BOOT","BORR","BOSC","BOTJ","BOWL","BPMC","BPOP","BPRN","BPTH","BPTS","BPYPM","BPYPN","BPYPO","BPYPP","BRBS","BRCN","BRDS","BREC","BREZ","BREZW","BRFH","BRID","BRKH","BRKS","BRLIR","BRLT","BRMK","BROG","BROW","BRPM","BRPMU","BRRR","BRSH","BRTX","BSFC","BSGM","BSIO","BSKYW","BSRR","BSVN","BTAI","BTBT","BTCS","BTCM","BTCW","BTCY","BTDR","BTEL","BTEK","BTFM","BTMD","BTRE","BTTX","BTUS","BTWN","BURL","BUSE","BVFL","BVRN","BWAY","BWEN","BWMN","BWXT","BXRX","BYFC","BYND","BYRN","BYSI","BZFD","BZUN"]
+
 MIN_PRICE = 5.0
 MIN_VOLUME = 500_000
 MIN_CONFIDENCE = 75
@@ -303,23 +310,30 @@ def get_trending_tickers():
             print(f"  Error screener: {e}")
         time.sleep(1)
 
-    # Metodo 2: Si los screeners fallan usar watchlist de respaldo
-    if len(tickers) == 0:
-        print("  Screeners fallaron, usando watchlist de respaldo...")
-        WATCHLIST = [
-            "AAPL","TSLA","NVDA","MSFT","AMZN","META","GOOGL","AMD","NFLX","PLTR",
-            "SOFI","RIVN","COIN","MSTR","HOOD","RBLX","SNAP","UBER","LYFT","ABNB",
-            "SHOP","SQ","PYPL","ROKU","SPOT","TWLO","DDOG","NET","CRWD","ZS",
-            "PANW","SMCI","ARM","AVGO","QCOM","MU","INTC","TSM","ORCL","CRM",
-            "NOW","SNOW","OKTA","ZM","DOCU","AFRM","GME","MARA","RIOT","CLSK"
-        ]
-        for symbol in WATCHLIST:
+    # Metodo 2: Siempre añadir SP500 + Nasdaq100 como base solida
+    base_list = list(set(SP500 + NASDAQ100))
+    added = 0
+    for symbol in base_list:
+        if symbol not in tickers:
             tickers[symbol] = {
                 "price": 0, "change_pct": 0,
                 "volume": MIN_VOLUME + 1, "avg_volume": MIN_VOLUME,
                 "name": symbol, "sector": "Unknown", "market_cap": 0,
             }
-        print(f"  Watchlist de respaldo cargada: {len(tickers)} acciones")
+            added += 1
+    print(f"  Añadidas {added} acciones de SP500+Nasdaq100")
+
+    # Metodo 3: Añadir muestra de Russell 2000 para pequeñas empresas
+    russell_added = 0
+    for symbol in RUSSELL_SAMPLE:
+        if symbol not in tickers:
+            tickers[symbol] = {
+                "price": 0, "change_pct": 0,
+                "volume": MIN_VOLUME + 1, "avg_volume": MIN_VOLUME,
+                "name": symbol, "sector": "Unknown", "market_cap": 0,
+            }
+            russell_added += 1
+    print(f"  Añadidas {russell_added} acciones de Russell 2000")
 
     print(f"  Total tickers a analizar: {len(tickers)}")
     return tickers
@@ -915,12 +929,15 @@ def scan_market():
             continue
 
         data = get_stock_data(ticker)
-        if data and data['signals'] >= 2:
-            candidates.append(data)
+        if data:
+            if data['signals'] >= 1:
+                candidates.append(data)
+            else:
+                print(f"    {ticker}: score {data['signals']} | RSI {data['rsi']} | vol {data['vol_ratio']}x | {data['change_pct']}% — descartado")
         time.sleep(0.3)
 
     candidates.sort(key=lambda x: (x['signals'], x['vol_ratio']), reverse=True)
-    print(f"  {len(candidates)} candidatas con señales múltiples")
+    print(f"  {len(candidates)} candidatas con señales")
 
     found = 0
     for data in candidates[:12]:
