@@ -71,13 +71,17 @@ def send_acierto(msg): _post(DISCORD_ACIERTOS_ID, msg)
 def update_status(msg):
     global status_message_id
     try:
-        # Cargar ID guardado si no lo tenemos en memoria
+        # Si no tenemos ID en memoria, buscar el último mensaje del bot en #status
         if not status_message_id:
-            try:
-                if os.path.exists(STATUS_FILE):
-                    with open(STATUS_FILE) as f:
-                        status_message_id = json.load(f).get("message_id")
-            except: pass
+            r = requests.get(
+                f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages?limit=10",
+                headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=10)
+            if r.status_code == 200:
+                for m in r.json():
+                    if m.get("author", {}).get("bot"):
+                        status_message_id = m["id"]
+                        print(f"  Status: encontrado mensaje existente {status_message_id}")
+                        break
 
         if status_message_id:
             r = requests.patch(
@@ -86,10 +90,9 @@ def update_status(msg):
                 headers={"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"},
                 timeout=10)
             if r.status_code in (200, 201): return
-            # Si falla el patch (mensaje borrado), crear uno nuevo
             status_message_id = None
 
-        # Crear mensaje nuevo
+        # Solo crear nuevo si no existe ninguno
         r = requests.post(
             f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages",
             json={"content": msg},
@@ -97,10 +100,7 @@ def update_status(msg):
             timeout=10)
         if r.status_code in (200, 201):
             status_message_id = r.json().get("id")
-            try:
-                with open(STATUS_FILE, "w") as f:
-                    json.dump({"message_id": status_message_id}, f)
-            except: pass
+            print(f"  Status: nuevo mensaje creado {status_message_id}")
     except Exception as e:
         print(f"Status err: {e}")
 
@@ -1015,43 +1015,48 @@ def listen_solicitudes(init=False):
             # Ignorar bots
             if author.get("bot"): continue
 
-            # Solo procesar !analizar
-            if not text.lower().startswith("!analizar"): continue
+            # Procesar cada línea del mensaje buscando !analizar
+            tickers_to_analyze = []
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line.lower().startswith("!analizar"): continue
+                parts = line.split()
+                if len(parts) < 2: continue
+                ticker = parts[1].upper().strip()
+                if ticker not in tickers_to_analyze:
+                    tickers_to_analyze.append(ticker)
 
-            parts = text.split()
-            if len(parts) < 2:
-                _post(DISCORD_SOLICITUD_ID, "⚠️  Uso correcto: `!analizar NVDA`")
-                continue
+            if not tickers_to_analyze: continue
 
-            ticker = parts[1].upper().strip()
-            print(f"  Solicitud: !analizar {ticker}")
+            for ticker in tickers_to_analyze:
+                print(f"  Solicitud: !analizar {ticker}")
+                _post(DISCORD_SOLICITUD_ID, f"🔍  Analizando **{ticker}**... dame unos segundos.")
+                update_status(f"🔍  Analizando {ticker} bajo demanda...")
 
-            _post(DISCORD_SOLICITUD_ID, f"🔍  Analizando **{ticker}**... dame unos segundos.")
-            update_status(f"🔍  Analizando {ticker} bajo demanda...")
+                result = deep_analyze(ticker, ticker, "Unknown", urgency=5)
+                now = datetime.now(SPAIN_TZ)
 
-            result = deep_analyze(ticker, ticker, "Unknown", urgency=5)
-            now = datetime.now(SPAIN_TZ)
+                if not result:
+                    no_signal_msg = (
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔎  **{ticker}**\n"
+                        "Sin señal clara en este momento.\n"
+                        "Las 6 capas no encuentran convergencia suficiente.\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🕐  {now.strftime('%H:%M  %d/%m/%Y')} hora España"
+                    )
+                    _post(DISCORD_SOLICITUD_ID, no_signal_msg)
+                else:
+                    session = get_session(now)
+                    alert_msg = format_alert(result["tech"], result["analysis"], session)
+                    _post(DISCORD_SOLICITUD_ID, alert_msg)
+                    tech = result["tech"]
+                    add_prediction(ticker, result["signal"], tech["price"],
+                                   tech["price"]*1.15, tech["price"]*1.20, tech["price"]*1.30,
+                                   tech["price"]*0.93, result["conf"], 14)
 
-            if not result:
-                no_signal_msg = (
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔎  **{ticker}**\n"
-                    "Sin señal clara en este momento.\n"
-                    "Las 6 capas no encuentran convergencia suficiente.\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐  {now.strftime('%H:%M  %d/%m/%Y')} hora España"
-                )
-                _post(DISCORD_SOLICITUD_ID, no_signal_msg)
-            else:
-                session = get_session(now)
-                alert_msg = format_alert(result["tech"], result["analysis"], session)
-                _post(DISCORD_SOLICITUD_ID, alert_msg)
-                tech = result["tech"]
-                add_prediction(ticker, result["signal"], tech["price"],
-                               tech["price"]*1.15, tech["price"]*1.20, tech["price"]*1.30,
-                               tech["price"]*0.93, result["conf"], 14)
-
-            update_status("🟢  Activo — vigilando mercado\n🕐  " + now.strftime("%H:%M  %d/%m/%Y"))
+                update_status("🟢  Activo — vigilando mercado\n🕐  " + now.strftime("%H:%M  %d/%m/%Y"))
+                time.sleep(2)
 
         # Actualizar último mensaje procesado
         _last_solicitud_msg = messages[0]["id"]
