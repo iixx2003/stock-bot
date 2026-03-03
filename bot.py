@@ -904,14 +904,17 @@ def format_alert(tech, analysis, session, alert_num=None):
 # ═══════════════════════════════════════════════════════
 # ANÁLISIS PROFUNDO
 # ═══════════════════════════════════════════════════════
-def deep_analyze(ticker, name, sector, urgency=0):
+def deep_analyze(ticker, name, sector, urgency=0, force=False):
     """Análisis completo con las 6 capas."""
     global fuertes_enviados
     print(f"  Análisis profundo: {ticker}...")
 
     # Obtener todos los datos
     tech = get_technical_data(ticker)
-    if not tech or tech["score"] < 2:
+    if not tech:
+        print(f"    {ticker}: sin datos técnicos")
+        return None
+    if tech["score"] < 2 and not force:
         print(f"    {ticker}: score técnico insuficiente")
         return None
 
@@ -943,7 +946,7 @@ def deep_analyze(ticker, name, sector, urgency=0):
             break
     conf = min(conf + confidence_boost, 99)
 
-    if conf < CONF_NORMAL:
+    if conf < CONF_NORMAL and not force:
         print(f"    {ticker}: confianza {conf}% insuficiente")
         return None
 
@@ -958,7 +961,7 @@ def deep_analyze(ticker, name, sector, urgency=0):
         print(f"    {ticker}: venta descartada (limite diario)")
         return None
 
-    if conf >= CONF_FUERTE and conf < CONF_EXCEPCIONAL and fuertes_enviados >= MAX_FUERTES_DIA:
+    if conf >= CONF_FUERTE and conf < CONF_EXCEPCIONAL and fuertes_enviados >= MAX_FUERTES_DIA and not force:
         print(f"    {ticker}: señal fuerte descartada (limite diario de fuertes)")
         return None
 
@@ -1042,27 +1045,26 @@ def listen_solicitudes(init=False):
                 _post(DISCORD_SOLICITUD_ID, f"🔍  Analizando **{ticker}**... dame unos segundos.")
                 update_status(f"🔍  Analizando {ticker} bajo demanda...")
 
-                result = deep_analyze(ticker, ticker, "Unknown", urgency=5)
+                result = deep_analyze(ticker, ticker, "Unknown", urgency=5, force=True)
                 now = datetime.now(SPAIN_TZ)
 
                 if not result:
-                    no_signal_msg = (
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🔎  **{ticker}**\n"
-                        "Sin señal clara en este momento.\n"
-                        "Las 6 capas no encuentran convergencia suficiente.\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🕐  {now.strftime('%H:%M  %d/%m/%Y')} hora España"
-                    )
-                    _post(DISCORD_SOLICITUD_ID, no_signal_msg)
+                    # No hay datos técnicos — ticker inválido
+                    _post(DISCORD_SOLICITUD_ID,
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"❓  **{ticker}** no encontrado\n"
+                        f"Verifica que el ticker sea correcto.\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━")
                 else:
                     session = get_session(now)
                     alert_msg = format_alert(result["tech"], result["analysis"], session)
                     _post(DISCORD_SOLICITUD_ID, alert_msg)
-                    tech = result["tech"]
-                    add_prediction(ticker, result["signal"], tech["price"],
-                                   tech["price"]*1.15, tech["price"]*1.20, tech["price"]*1.30,
-                                   tech["price"]*0.93, result["conf"], 14)
+                    # Solo guardar predicción si hay señal real
+                    if result["conf"] >= CONF_NORMAL:
+                        tech = result["tech"]
+                        add_prediction(ticker, result["signal"], tech["price"],
+                                       tech["price"]*1.15, tech["price"]*1.20, tech["price"]*1.30,
+                                       tech["price"]*0.93, result["conf"], 14)
 
                 update_status("🟢  Activo — vigilando mercado\n🕐  " + now.strftime("%H:%M  %d/%m/%Y"))
                 time.sleep(2)
