@@ -1207,20 +1207,51 @@ def reset_daily_counters():
     print("  Contadores diarios reseteados")
 
 def main():
+    global status_message_id
     load_state()
     now = datetime.now(SPAIN_TZ)
     print(f"StockBot Pro v2 iniciado — {now.strftime('%H:%M %d/%m/%Y')}")
+
+    # STATUS: arrancando
+    print("  Actualizando status...")
+    update_status(f"⚙️  **Arrancando...**\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
+
+    # Macro
+    update_status(f"⚙️  **Calentando motores...**\n📡 Cargando contexto macro...")
+    update_market_context()
+
+    fg = market_context['fear_greed']
+    fg_label = ("PÁNICO EXTREMO" if fg<20 else "Miedo" if fg<40 else "Neutral" if fg<60 else "Codicia" if fg<80 else "EUFORIA")
+
+    # Log arranque
     send_log(
-        f"🤖 **StockBot Pro v2 activado** — {now.strftime('%H:%M %d/%m/%Y')}\n"
-        f"📡 Vigilancia cada 5 min | Análisis profundo solo cuando hay señal\n"
-        f"⚡ 6 capas: Macro + Técnico + Fundamental + Sentimiento + Institucional + IA\n"
-        f"🟢 Normal {CONF_NORMAL}%+ | 🔥 Fuerte {CONF_FUERTE}%+ | ⚡ Excepcional {CONF_EXCEPCIONAL}%+"
+        f"🤖 **StockBot Pro v2** — {now.strftime('%H:%M %d/%m/%Y')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚙️ Calentando motores...\n"
+        f"   ✅ Conexión Yahoo Finance\n"
+        f"   ✅ Contexto macro cargado\n"
+        f"   ✅ Fear&Greed: {fg} ({fg_label})\n"
+        f"   ✅ Universo: 1.200+ acciones listas\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Listo. Vigilancia activa cada 5 min"
     )
 
-    update_market_context()
+    # Instrucciones
+    print("  Publicando instrucciones...")
+    post_instrucciones()
+    print("  Instrucciones publicadas")
+
+    # STATUS: activo
+    update_status(
+        f"🟢  **Activo** — vigilando mercado\n"
+        f"📡 Fear&Greed: {fg} ({fg_label}) | VIX: {market_context['vix']}\n"
+        f"🕐  {now.strftime('%H:%M  %d/%m/%Y')}"
+    )
+
     watch_cycle()
 
     schedule.every(5).minutes.do(watch_cycle)
+    schedule.every(5).minutes.do(listen_solicitudes)
     schedule.every().sunday.at("10:00").do(weekly_aciertos_report)
     schedule.every().day.at("09:00").do(update_market_context)
     schedule.every().day.at("00:01").do(reset_daily_counters)
