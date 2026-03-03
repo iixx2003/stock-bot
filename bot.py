@@ -979,9 +979,11 @@ def deep_analyze(ticker, name, sector, urgency=0):
 _last_solicitud_msg = None
 _bot_start_time = None
 
+_processed_msg_ids = set()  # IDs ya procesados en esta sesión
+
 def listen_solicitudes(init=False):
     """Revisa el canal #solicitud-en-concreto buscando comandos !analizar TICKER"""
-    global _last_solicitud_msg, _bot_start_time
+    global _last_solicitud_msg, _processed_msg_ids
     try:
         params = {"limit": 10}
         if _last_solicitud_msg:
@@ -1000,22 +1002,29 @@ def listen_solicitudes(init=False):
         messages = r.json()
         if not messages: return
 
-        # Al arrancar: marcar todos como vistos, solo escuchar desde ahora
+        # Actualizar puntero al mensaje más reciente
+        _last_solicitud_msg = messages[0]["id"]
+
+        # Al arrancar: marcar todos como vistos sin procesar
         if init:
-            _last_solicitud_msg = messages[0]["id"]
-            print(f"  Solicitudes listas — escuchando nuevos mensajes")
+            for m in messages:
+                _processed_msg_ids.add(m["id"])
+            print(f"  Solicitudes listas — {len(messages)} mensajes previos ignorados")
             return
 
-        # Procesar mensajes nuevos
+        # Procesar solo mensajes nuevos no procesados
         for msg in reversed(messages):
             msg_id = msg.get("id")
+            if msg_id in _processed_msg_ids: continue
+            _processed_msg_ids.add(msg_id)
+
             text   = msg.get("content", "").strip()
             author = msg.get("author", {})
-
-            # Ignorar bots
             if author.get("bot"): continue
 
-            # Procesar cada línea del mensaje buscando !analizar
+            print(f"  Nuevo mensaje en solicitudes: {text[:50]}")
+
+            # Procesar cada línea buscando !analizar
             tickers_to_analyze = []
             for line in text.split("\n"):
                 line = line.strip()
