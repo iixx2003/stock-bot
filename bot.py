@@ -264,12 +264,20 @@ def update_market_context():
 # ═══════════════════════════════════════
 def get_trending_tickers():
     tickers = {}
+
+    # Metodo 1: Yahoo Finance screeners
     screeners = [
         "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=50",
         "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=50",
         "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_losers&count=50",
+        "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=50",
     ]
-    headers = {"User-Agent": "Mozilla/5.0 Chrome/120.0.0.0", "Accept": "application/json"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://finance.yahoo.com",
+    }
     for url in screeners:
         try:
             resp = requests.get(url, headers=headers, timeout=15)
@@ -289,9 +297,31 @@ def get_trending_tickers():
                             "sector": q.get("sector", "Unknown"),
                             "market_cap": q.get("marketCap", 0),
                         }
+                if quotes:
+                    print(f"  Screener OK: {len(quotes)} acciones")
         except Exception as e:
             print(f"  Error screener: {e}")
         time.sleep(1)
+
+    # Metodo 2: Si los screeners fallan usar watchlist de respaldo
+    if len(tickers) == 0:
+        print("  Screeners fallaron, usando watchlist de respaldo...")
+        WATCHLIST = [
+            "AAPL","TSLA","NVDA","MSFT","AMZN","META","GOOGL","AMD","NFLX","PLTR",
+            "SOFI","RIVN","COIN","MSTR","HOOD","RBLX","SNAP","UBER","LYFT","ABNB",
+            "SHOP","SQ","PYPL","ROKU","SPOT","TWLO","DDOG","NET","CRWD","ZS",
+            "PANW","SMCI","ARM","AVGO","QCOM","MU","INTC","TSM","ORCL","CRM",
+            "NOW","SNOW","OKTA","ZM","DOCU","AFRM","GME","MARA","RIOT","CLSK"
+        ]
+        for symbol in WATCHLIST:
+            tickers[symbol] = {
+                "price": 0, "change_pct": 0,
+                "volume": MIN_VOLUME + 1, "avg_volume": MIN_VOLUME,
+                "name": symbol, "sector": "Unknown", "market_cap": 0,
+            }
+        print(f"  Watchlist de respaldo cargada: {len(tickers)} acciones")
+
+    print(f"  Total tickers a analizar: {len(tickers)}")
     return tickers
 
 def get_stock_data(ticker):
