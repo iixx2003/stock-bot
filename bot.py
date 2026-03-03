@@ -877,6 +877,7 @@ def format_alert(tech, analysis, session, alert_num=None):
 # ═══════════════════════════════════════════════════════
 def deep_analyze(ticker, name, sector, urgency=0):
     """Análisis completo con las 6 capas."""
+    global fuertes_enviados
     print(f"  Análisis profundo: {ticker}...")
 
     # Obtener todos los datos
@@ -1018,6 +1019,7 @@ def get_session(now):
 
 def watch_cycle():
     """Ciclo rápido cada 5 minutos. Solo vigilancia, sin IA."""
+    global fuertes_enviados
     now = datetime.now(SPAIN_TZ)
     if now.hour < 9 or now.hour >= 23: return
 
