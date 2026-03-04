@@ -1,279 +1,436 @@
+"""
+StockBot Pro v3 — Reescritura limpia
+─────────────────────────────────────
+Arquitectura de 6 capas:
+  1. quick_scan()        — screeners Yahoo, sin IA, detecta movimiento
+  2. get_market_data()   — datos técnicos completos (diario, semanal, mensual)
+  3. get_fundamentals()  — P/E, short interest, earnings, insiders (1 petición)
+  4. get_sentiment()     — noticias NewsAPI + RSS Yahoo + ETF sectorial
+  5. get_inst_signal()   — infiere actividad institucional desde volumen/OBV
+  6. call_ai()           — Claude sintetiza y decide señal o NO_SIGNAL
+
+Flujo automático:  quick_scan → analyze_ticker (force=False) → send_alert
+Flujo manual:      !analizar TICKER → analyze_ticker (force=True) → send_solicitud
+"""
+
 import os, time, json, random, schedule, requests, feedparser, anthropic
 from datetime import datetime, timedelta
-from collections import defaultdict
 import pytz
 
-# ═══════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════
-DISCORD_TOKEN     = os.environ.get("DISCORD_TOKEN")
-DISCORD_ALERTS_ID = os.environ.get("DISCORD_CHANNEL_ID")
-DISCORD_LOG_ID        = "1478113089093374034"
-DISCORD_ACIERTOS_ID   = "1478461406251847812"
-DISCORD_SOLICITUD_ID  = "1478470481693900841"
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN
+# ═══════════════════════════════════════════════════════════════════════
+
+DISCORD_TOKEN            = os.environ.get("DISCORD_TOKEN")
+DISCORD_ALERTS_ID        = os.environ.get("DISCORD_CHANNEL_ID")
+DISCORD_LOG_ID           = "1478113089093374034"
+DISCORD_ACIERTOS_ID      = "1478461406251847812"
+DISCORD_SOLICITUD_ID     = "1478470481693900841"
 DISCORD_INSTRUCCIONES_ID = "1478470715509440748"
-DISCORD_STATUS_ID     = "1478471477568475248"
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-NEWS_API_KEY      = os.environ.get("NEWS_API_KEY")
+DISCORD_STATUS_ID        = "1478471477568475248"
+ANTHROPIC_API_KEY        = os.environ.get("ANTHROPIC_API_KEY")
+NEWS_API_KEY             = os.environ.get("NEWS_API_KEY")
 
 SPAIN_TZ = pytz.timezone("Europe/Madrid")
 
 # Umbrales de confianza
-CONF_NORMAL      = 82
-CONF_FUERTE      = 88
-CONF_EXCEPCIONAL = 94
-MAX_FUERTES_DIA  = 2
-MAX_SELLS_DIA    = 1
+CONF_NORMAL      = 82   # mínimo para enviar alerta automática
+CONF_FUERTE      = 88   # máx. 2 por día
+CONF_EXCEPCIONAL = 94   # sin límite, siempre se envía
 
-# Estado global
-alerts_sent      = {}   # {ticker: datetime}
-fuertes_enviados = 0   # contador diario reset cada dia
-predictions      = []
-failed_patterns  = {}
-market_context   = {"fear_greed":50,"sp500_change":0,"vix":15,"macro_news":[],"economic_events":[],"updated_at":None}
-watch_signals    = {}   # {ticker: {"score": X, "last_analyzed": datetime, "developing": bool}}
-status_message_id = None  # ID del mensaje de status para editarlo
+# Límites diarios
+MAX_FUERTES_DIA = 2
+MAX_VENTAS_DIA  = 1
+MAX_AI_POR_CICLO = 4   # máx llamadas IA por ciclo de 5 min
 
-PREDICTIONS_FILE  = "/app/predictions.json"
-WATCHSTATE_FILE   = "/app/watchstate.json"
-STATUS_FILE       = "/app/status.json"
+# Archivos de persistencia (Railway tiene /app con disco persistente)
+PREDICTIONS_FILE = "/app/predictions.json"
+WATCHSTATE_FILE  = "/app/watchstate.json"
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 # UNIVERSO DE ACCIONES
-# ═══════════════════════════════════════════════════════
-SP500 = ["MMM","ABT","ABBV","ACN","ADBE","AMD","AFL","GOOGL","GOOG","MO","AMZN","AAL","AEP","AXP","AIG","AMT","AWK","AMGN","APH","ADI","AAPL","AMAT","ANET","T","ADSK","AZO","BKR","BAC","BK","BAX","BIIB","BLK","BX","BA","BMY","AVGO","CDNS","COF","KMX","CCL","CAT","CBRE","CNC","SCHW","CHTR","CVX","CMG","CB","CI","CTAS","CSCO","C","CLX","CME","KO","CL","CMCSA","COP","STZ","CPRT","GLW","COST","CCI","CSX","CMI","CVS","DHI","DHR","DE","DAL","DVN","DXCM","DLR","DFS","DG","DLTR","D","DOV","DOW","LLY","ETN","EBAY","ECL","EW","EA","ELV","EMR","ENPH","EOG","EFX","EQIX","EL","ETSY","EXC","EXPE","XOM","FDS","FAST","FRT","FDX","FIS","FITB","FSLR","FI","FLT","F","FTNT","FCX","GE","GD","GIS","GM","GILD","GS","HAL","HIG","HCA","HD","HON","HRL","HPQ","HUBB","HUM","IBM","IDXX","ITW","INTC","ICE","INTU","ISRG","JNJ","JPM","KDP","KEY","KMB","KMI","KLAC","KHC","KR","LHX","LH","LRCX","LIN","LMT","LOW","LULU","MTB","MPC","MAR","MMC","MAS","MA","MCD","MCK","MDT","MRK","META","MET","MGM","MCHP","MU","MSFT","MRNA","MDLZ","MNST","MCO","MS","MSI","NDAQ","NTAP","NFLX","NEE","NKE","NSC","NTRS","NOC","NCLH","NVDA","NXPI","ORLY","OXY","ODFL","ON","OKE","ORCL","PCAR","PLTR","PH","PAYX","PYPL","PEP","PFE","PM","PSX","PNC","PPG","PPL","PG","PGR","PLD","PRU","PEG","PSA","QCOM","RTX","O","REGN","RF","RMD","ROK","ROP","ROST","RCL","SPGI","CRM","SLB","SRE","NOW","SHW","SPG","SJM","SNA","SO","SWK","SBUX","STT","STLD","SYK","SMCI","SNPS","SYY","TMUS","TROW","TTWO","TGT","TEL","TSLA","TXN","TMO","TJX","TSCO","TT","TRV","TFC","TSN","USB","UBER","UNP","UAL","UPS","URI","UNH","VLO","VTR","VRSN","VRSK","VZ","VRTX","VMC","WAB","WBA","WMT","DIS","WM","WAT","WEC","WFC","WELL","WDC","WY","WHR","WMB","WYNN","XEL","YUM","ZBH","ZTS"]
-NASDAQ100 = ["ADBE","AMD","ABNB","GOOGL","AMZN","AMGN","AAPL","ARM","ASML","ADSK","BKR","BIIB","BKNG","AVGO","CDNS","CHTR","CTAS","CSCO","CMCSA","CPRT","COST","CRWD","CSX","DDOG","DXCM","DLTR","EA","ENPH","EXC","FAST","FTNT","GILD","HON","IDXX","INTC","INTU","ISRG","KDP","KLAC","LRCX","LULU","MAR","MRVL","MELI","META","MCHP","MU","MSFT","MRNA","MDLZ","MDB","MNST","NFLX","NVDA","NXPI","ORLY","ODFL","ON","PCAR","PANW","PAYX","PYPL","QCOM","REGN","ROP","ROST","SBUX","SNPS","TTWO","TMUS","TSLA","TXN","VRSK","VRTX","WBA","WDAY","XEL","ZS","ZM"]
-EXTRAS = ["SOFI","RIVN","COIN","MSTR","HOOD","RBLX","SNAP","LYFT","SHOP","SQ","ROKU","SPOT","NET","PANW","SMCI","GME","MARA","RIOT","CLSK","LCID","NKLA","AFRM","UPST","DKNG","CHWY","BYND","NIO","XPEV","LI","GRAB","SEA","BIDU","RKT","RELY","STNE","IREN","PINS","CCL","NCLH","RCL","DAL","AAL","UAL"]
+# ═══════════════════════════════════════════════════════════════════════
+
+SP500 = [
+    "MMM","ABT","ABBV","ACN","ADBE","AMD","AFL","GOOGL","GOOG","MO","AMZN","AAL","AEP","AXP",
+    "AIG","AMT","AWK","AMGN","APH","ADI","AAPL","AMAT","ANET","T","ADSK","AZO","BKR","BAC",
+    "BK","BAX","BIIB","BLK","BX","BA","BMY","AVGO","CDNS","COF","KMX","CCL","CAT","CBRE",
+    "CNC","SCHW","CHTR","CVX","CMG","CB","CI","CTAS","CSCO","C","CLX","CME","KO","CL","CMCSA",
+    "COP","STZ","CPRT","GLW","COST","CCI","CSX","CMI","CVS","DHI","DHR","DE","DAL","DVN",
+    "DXCM","DLR","DFS","DG","DLTR","D","DOV","DOW","LLY","ETN","EBAY","ECL","EW","EA","ELV",
+    "EMR","ENPH","EOG","EFX","EQIX","EL","ETSY","EXC","EXPE","XOM","FDS","FAST","FRT","FDX",
+    "FIS","FITB","FSLR","FI","FLT","F","FTNT","FCX","GE","GD","GIS","GM","GILD","GS","HAL",
+    "HIG","HCA","HD","HON","HRL","HPQ","HUBB","HUM","IBM","IDXX","ITW","INTC","ICE","INTU",
+    "ISRG","JNJ","JPM","KDP","KEY","KMB","KMI","KLAC","KHC","KR","LHX","LH","LRCX","LIN",
+    "LMT","LOW","LULU","MTB","MPC","MAR","MMC","MAS","MA","MCD","MCK","MDT","MRK","META",
+    "MET","MGM","MCHP","MU","MSFT","MRNA","MDLZ","MNST","MCO","MS","MSI","NDAQ","NTAP",
+    "NFLX","NEE","NKE","NSC","NTRS","NOC","NCLH","NVDA","NXPI","ORLY","OXY","ODFL","ON",
+    "OKE","ORCL","PCAR","PLTR","PH","PAYX","PYPL","PEP","PFE","PM","PSX","PNC","PPG","PPL",
+    "PG","PGR","PLD","PRU","PEG","PSA","QCOM","RTX","O","REGN","RF","RMD","ROK","ROP","ROST",
+    "RCL","SPGI","CRM","SLB","SRE","NOW","SHW","SPG","SJM","SNA","SO","SWK","SBUX","STT",
+    "STLD","SYK","SMCI","SNPS","SYY","TMUS","TROW","TTWO","TGT","TEL","TSLA","TXN","TMO",
+    "TJX","TSCO","TT","TRV","TFC","TSN","USB","UBER","UNP","UAL","UPS","URI","UNH","VLO",
+    "VTR","VRSN","VRSK","VZ","VRTX","VMC","WAB","WBA","WMT","DIS","WM","WAT","WEC","WFC",
+    "WELL","WDC","WY","WHR","WMB","WYNN","XEL","YUM","ZBH","ZTS",
+]
+NASDAQ100 = [
+    "ADBE","AMD","ABNB","GOOGL","AMZN","AMGN","AAPL","ARM","ASML","ADSK","BKR","BIIB","BKNG",
+    "AVGO","CDNS","CHTR","CTAS","CSCO","CMCSA","CPRT","COST","CRWD","CSX","DDOG","DXCM","DLTR",
+    "EA","ENPH","EXC","FAST","FTNT","GILD","HON","IDXX","INTC","INTU","ISRG","KDP","KLAC",
+    "LRCX","LULU","MAR","MRVL","MELI","META","MCHP","MU","MSFT","MRNA","MDLZ","MDB","MNST",
+    "NFLX","NVDA","NXPI","ORLY","ODFL","ON","PCAR","PANW","PAYX","PYPL","QCOM","REGN","ROP",
+    "ROST","SBUX","SNPS","TTWO","TMUS","TSLA","TXN","VRSK","VRTX","WBA","WDAY","XEL","ZS","ZM",
+]
+EXTRAS = [
+    "SOFI","RIVN","COIN","MSTR","HOOD","RBLX","SNAP","LYFT","SHOP","SQ","ROKU","SPOT","NET",
+    "PANW","SMCI","GME","MARA","RIOT","CLSK","LCID","NKLA","AFRM","UPST","DKNG","CHWY","BYND",
+    "NIO","XPEV","LI","GRAB","SEA","BIDU","RKT","RELY","STNE","IREN","PINS","CCL","NCLH",
+    "RCL","DAL","AAL","UAL","ASTS","GTLB","PLTR","HOOD","DKNG",
+]
 UNIVERSE = list(set(SP500 + NASDAQ100 + EXTRAS))
 
-SECTOR_ETFS = {"Technology":"XLK","Healthcare":"XLV","Financials":"XLF","Energy":"XLE","Consumer Cyclical":"XLY","Industrials":"XLI","Communication Services":"XLC","Consumer Defensive":"XLP","Utilities":"XLU","Real Estate":"XLRE","Basic Materials":"XLB"}
+SECTOR_ETFS = {
+    "Technology": "XLK", "Healthcare": "XLV", "Financials": "XLF",
+    "Energy": "XLE", "Consumer Cyclical": "XLY", "Industrials": "XLI",
+    "Communication Services": "XLC", "Consumer Defensive": "XLP",
+    "Utilities": "XLU", "Real Estate": "XLRE", "Basic Materials": "XLB",
+}
 
-# ═══════════════════════════════════════════════════════
-# DISCORD
-# ═══════════════════════════════════════════════════════
-def _post(cid, msg):
-    if len(msg) > 1900: msg = msg[:1897] + "..."
+# ═══════════════════════════════════════════════════════════════════════
+# ESTADO GLOBAL
+# ═══════════════════════════════════════════════════════════════════════
+
+predictions   = []    # lista de predicciones guardadas en disco
+watch_signals = {}    # {ticker: {"last_analyzed": ISO, "developing": bool}}
+market_context = {    # actualizado al arrancar y cada mañana a las 09:00
+    "fear_greed": 50, "sp500_change": 0.0, "vix": 15.0,
+    "macro_news": [], "economic_events": [], "updated_at": None,
+}
+status_msg_id     = None   # ID del mensaje único en #status (se edita, nunca se crea duplicado)
+last_cmd_msg_id   = None   # último ID visto en #solicitud-en-concreto
+processed_cmd_ids = set()  # IDs ya procesados en esta sesión (evita reprocesar al reiniciar)
+
+# ═══════════════════════════════════════════════════════════════════════
+# PERSISTENCIA EN DISCO
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_state():
+    """Al arrancar: carga predictions y watch_signals desde disco."""
+    global predictions, watch_signals
+    try:
+        if os.path.exists(PREDICTIONS_FILE):
+            with open(PREDICTIONS_FILE) as f:
+                predictions = json.load(f)
+            print(f"  Estado cargado: {len(predictions)} predicciones")
+        else:
+            predictions = []
+            print("  Sin predictions.json previo — empezando desde cero")
+    except Exception as e:
+        predictions = []
+        print(f"  ERROR cargando predictions.json: {e}")
+
+    try:
+        if os.path.exists(WATCHSTATE_FILE):
+            with open(WATCHSTATE_FILE) as f:
+                watch_signals = json.load(f)
+        else:
+            watch_signals = {}
+    except Exception as e:
+        watch_signals = {}
+        print(f"  ERROR cargando watchstate.json: {e}")
+
+
+def save_state():
+    """Guarda predictions y watch_signals en disco."""
+    try:
+        with open(PREDICTIONS_FILE, "w") as f:
+            json.dump(predictions, f, indent=2)
+        with open(WATCHSTATE_FILE, "w") as f:
+            json.dump(watch_signals, f, indent=2)
+    except Exception as e:
+        print(f"  ERROR guardando estado: {e}")
+
+
+def save_prediction(ticker, signal, entry, stop, conf):
+    """Registra una nueva predicción y guarda en disco."""
+    predictions.append({
+        "ticker":     ticker,
+        "signal":     signal,
+        "entry":      round(entry, 2),
+        "target":     round(entry * (1.15 if signal == "COMPRAR" else 0.85), 2),
+        "stop":       round(stop, 2),
+        "confidence": conf,
+        "date":       datetime.now(SPAIN_TZ).isoformat(),
+        "result":     "pending",
+        "exit_price": None,
+    })
+    save_state()
+
+# ═══════════════════════════════════════════════════════════════════════
+# LÍMITES DIARIOS — todo basado en predictions (persiste entre reinicios)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _preds_today():
+    """Predicciones de hoy según zona horaria España."""
+    today = datetime.now(SPAIN_TZ).date()
+    result = []
+    for p in predictions:
+        try:
+            d = datetime.fromisoformat(p["date"])
+            if d.tzinfo is not None:
+                d = d.astimezone(SPAIN_TZ)
+            if d.date() == today:
+                result.append(p)
+        except Exception:
+            pass
+    return result
+
+
+def already_alerted_today(ticker):
+    """True si ya se envió alerta de este ticker hoy."""
+    return any(p["ticker"] == ticker for p in _preds_today())
+
+
+def fuertes_hoy():
+    """Alertas Fuerte (88-93%) enviadas hoy."""
+    return sum(1 for p in _preds_today() if CONF_FUERTE <= p["confidence"] < CONF_EXCEPCIONAL)
+
+
+def ventas_hoy():
+    """Alertas de venta enviadas hoy."""
+    return sum(1 for p in _preds_today() if p["signal"] == "VENDER")
+
+
+def alertas_hoy():
+    """Total de alertas enviadas hoy."""
+    return len(_preds_today())
+
+# ═══════════════════════════════════════════════════════════════════════
+# DISCORD — ENVÍO Y GESTIÓN DE MENSAJES
+# ═══════════════════════════════════════════════════════════════════════
+
+def _discord_post(channel_id, text):
+    """Envía un mensaje a un canal Discord. Trunca si supera 1900 chars."""
+    if len(text) > 1900:
+        text = text[:1897] + "..."
     try:
         r = requests.post(
-            f"https://discord.com/api/v10/channels/{cid}/messages",
-            json={"content": msg},
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            json={"content": text},
             headers={"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"},
-            timeout=10)
+            timeout=10,
+        )
         if r.status_code not in (200, 201):
-            print(f"Discord {r.status_code}")
+            print(f"  Discord POST {r.status_code}: {r.text[:120]}")
     except Exception as e:
-        print(f"Discord err: {e}")
+        print(f"  Discord POST excepción: {e}")
 
-def send_alert(msg):   _post(DISCORD_ALERTS_ID, msg)
-def send_log(msg):     _post(DISCORD_LOG_ID, msg)
-def send_acierto(msg): _post(DISCORD_ACIERTOS_ID, msg)
 
-def update_status(msg):
-    global status_message_id
+def send_alert(text):      _discord_post(DISCORD_ALERTS_ID, text)
+def send_log(text):        _discord_post(DISCORD_LOG_ID, text)
+def send_acierto(text):    _discord_post(DISCORD_ACIERTOS_ID, text)
+def send_solicitud(text):  _discord_post(DISCORD_SOLICITUD_ID, text)
+
+
+def update_status(text):
+    """
+    Edita el mensaje único de #status.
+    Si no existe en memoria, busca el último del bot en el canal.
+    Si no hay ninguno, crea uno nuevo.
+    Así nunca hay mensajes duplicados de status.
+    """
+    global status_msg_id
+    auth = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
     try:
-        # Si no tenemos ID en memoria, buscar el último mensaje del bot en #status
-        if not status_message_id:
+        # Buscar mensaje existente del bot si no lo tenemos en memoria
+        if not status_msg_id:
             r = requests.get(
-                f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages?limit=10",
-                headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=10)
+                f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages?limit=20",
+                headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=10,
+            )
             if r.status_code == 200:
                 for m in r.json():
                     if m.get("author", {}).get("bot"):
-                        status_message_id = m["id"]
-                        print(f"  Status: encontrado mensaje existente {status_message_id}")
+                        status_msg_id = m["id"]
+                        print(f"  Status: reutilizando mensaje {status_msg_id}")
                         break
 
-        if status_message_id:
+        # Editar si existe
+        if status_msg_id:
             r = requests.patch(
-                f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages/{status_message_id}",
-                json={"content": msg},
-                headers={"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"},
-                timeout=10)
-            if r.status_code in (200, 201): return
-            status_message_id = None
+                f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages/{status_msg_id}",
+                json={"content": text}, headers=auth, timeout=10,
+            )
+            if r.status_code in (200, 201):
+                return
+            # Falló (borrado externamente), limpiar y crear nuevo
+            print(f"  Status PATCH falló ({r.status_code}) — creando nuevo")
+            status_msg_id = None
 
-        # Solo crear nuevo si no existe ninguno
+        # Crear nuevo mensaje
         r = requests.post(
             f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages",
-            json={"content": msg},
-            headers={"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"},
-            timeout=10)
+            json={"content": text}, headers=auth, timeout=10,
+        )
         if r.status_code in (200, 201):
-            status_message_id = r.json().get("id")
-            print(f"  Status: nuevo mensaje creado {status_message_id}")
+            status_msg_id = r.json().get("id")
+            print(f"  Status: nuevo mensaje creado {status_msg_id}")
     except Exception as e:
-        print(f"Status err: {e}")
+        print(f"  Status error: {e}")
+
 
 def post_instrucciones():
-    # Borrar mensajes anteriores del bot en #instrucciones
+    """
+    Borra los mensajes anteriores del bot en #instrucciones
+    y publica las instrucciones actualizadas.
+    Solo se llama al arrancar.
+    """
+    # Borrar mensajes previos del bot
     try:
         r = requests.get(
             f"https://discord.com/api/v10/channels/{DISCORD_INSTRUCCIONES_ID}/messages?limit=20",
-            headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=10)
+            headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=10,
+        )
         if r.status_code == 200:
             for m in r.json():
                 if m.get("author", {}).get("bot"):
                     requests.delete(
                         f"https://discord.com/api/v10/channels/{DISCORD_INSTRUCCIONES_ID}/messages/{m['id']}",
-                        headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=5)
+                        headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=5,
+                    )
                     time.sleep(0.5)
-    except: pass
+    except Exception as e:
+        print(f"  Error borrando instrucciones anteriores: {e}")
 
-    msg1 = """━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    _discord_post(DISCORD_INSTRUCCIONES_ID, """━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📖  **CÓMO FUNCIONA STOCKBOT PRO**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍  **Análisis automático**
-Vigila +1.200 acciones cada 5 min. Cuando detecta señal real la analiza con 6 capas y avisa en **#stock-alerts**.
+Vigila +1.200 acciones cada 5 min.
+Cuando detecta señal real, analiza con 6 capas y avisa en **#stock-alerts**.
 
 ⚡  **Niveles de confianza**
 🟢  Normal 82-87% — señal sólida
-🔥  Fuerte 88-93% — alta convicción
-⚡  Excepcional 94%+ — todo alineado
+🔥  Fuerte 88-93% — máx. 2 por día
+⚡  Excepcional 94%+ — siempre envía
 
-🎯  **Análisis manual**
+🎯  **Análisis bajo demanda**
 Escribe en **#solicitud-en-concreto**:
 `!analizar NVDA`
-El bot responde en segundos."""
-    msg2 = """━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Respuesta en menos de 30 segundos.""")
+
+    time.sleep(1)
+
+    _discord_post(DISCORD_INSTRUCCIONES_ID, """━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📡  **CANALES**
 **#stock-alerts** — alertas automáticas
 **#aciertos-bot** — resumen cada domingo 10:00
 **#solicitud-en-concreto** — análisis bajo demanda
 **#log-bot** — actividad interna
 **#status** — estado del bot en tiempo real
-━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
-    _post(DISCORD_INSTRUCCIONES_ID, msg1)
-    time.sleep(1)
-    _post(DISCORD_INSTRUCCIONES_ID, msg2)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━""")
 
-# ═══════════════════════════════════════════════════════
-# PERSISTENCIA
-# ═══════════════════════════════════════════════════════
-def load_state():
-    global predictions, watch_signals
-    try:
-        if os.path.exists(PREDICTIONS_FILE):
-            with open(PREDICTIONS_FILE) as f: predictions = json.load(f)
-    except: predictions = []
-    try:
-        if os.path.exists(WATCHSTATE_FILE):
-            with open(WATCHSTATE_FILE) as f: watch_signals = json.load(f)
-    except: watch_signals = {}
+# ═══════════════════════════════════════════════════════════════════════
+# CONTEXTO MACRO — actualizado al arrancar y cada mañana a las 09:00
+# ═══════════════════════════════════════════════════════════════════════
 
-def save_state():
-    try:
-        with open(PREDICTIONS_FILE, "w") as f: json.dump(predictions, f)
-        with open(WATCHSTATE_FILE, "w") as f: json.dump(watch_signals, f)
-    except: pass
+def _fg_label(fg):
+    """Etiqueta textual para el índice Fear & Greed."""
+    if fg < 20: return "PÁNICO EXTREMO"
+    if fg < 40: return "Miedo"
+    if fg < 60: return "Neutral"
+    if fg < 80: return "Codicia"
+    return "EUFORIA"
 
-def add_prediction(ticker, signal, entry, target_short, target_mid, target_long, stop, conf, days):
-    predictions.append({
-        "ticker": ticker, "signal": signal, "entry": entry,
-        "target_short": target_short, "target_mid": target_mid, "target_long": target_long,
-        "stop": stop, "confidence": conf, "days": days,
-        "date": datetime.now().isoformat(), "result": "pending", "exit_price": None
-    })
-    save_state()
 
-def already_alerted(ticker):
-    # Primero checar en memoria
-    if ticker in alerts_sent:
-        if datetime.now() - alerts_sent[ticker] < timedelta(hours=24):
-            return True
-    # Luego checar en predictions persistidas (sobrevive reinicios)
-    today = datetime.now(SPAIN_TZ).date()
-    for p in predictions:
-        if p["ticker"] == ticker and datetime.fromisoformat(p["date"]).date() == today:
-            return True
-    return False
-
-def alertas_today():
-    today = datetime.now(SPAIN_TZ).date()
-    return sum(1 for p in predictions
-               if datetime.fromisoformat(p["date"]).date() == today)
-
-def fuertes_today():
-    today = datetime.now(SPAIN_TZ).date()
-    return sum(1 for p in predictions
-               if p["confidence"] >= CONF_FUERTE
-               and p["confidence"] < CONF_EXCEPCIONAL
-               and datetime.fromisoformat(p["date"]).date() == today)
-
-def sells_today():
-    today = datetime.now(SPAIN_TZ).date()
-    return sum(1 for p in predictions
-               if p["signal"] == "VENDER"
-               and datetime.fromisoformat(p["date"]).date() == today)
-
-# ═══════════════════════════════════════════════════════
-# CONTEXTO MACRO
-# ═══════════════════════════════════════════════════════
 def update_market_context():
+    """
+    Actualiza Fear&Greed, S&P500, VIX y noticias macro.
+    Se llama al arrancar y por schedule cada día a las 09:00.
+    """
     global market_context
     print("  Actualizando contexto macro...")
+
+    # Fear & Greed Index
     fg = 50
     try:
         r = requests.get("https://api.alternative.me/fng/", timeout=8)
-        if r.status_code == 200: fg = int(r.json()["data"][0]["value"])
-    except: pass
+        if r.status_code == 200:
+            fg = int(r.json()["data"][0]["value"])
+    except Exception as e:
+        print(f"    Fear&Greed error: {e}")
 
-    sp500, vix = 0, 15
-    for ticker, key in [("SPY", "sp"), ("^VIX", "vix")]:
+    # S&P500 y VIX desde Yahoo Finance
+    sp500_change, vix = 0.0, 15.0
+    for symbol, key in [("SPY", "sp500"), ("^VIX", "vix")]:
         try:
             r = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d",
-                headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+            )
             if r.status_code == 200:
                 closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
                 if len(closes) >= 2:
-                    if key == "sp": sp500 = round(((closes[-1]-closes[-2])/closes[-2])*100, 2)
-                    else: vix = round(closes[-1], 1)
+                    if key == "sp500":
+                        sp500_change = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 2)
+                    else:
+                        vix = round(closes[-1], 1)
             time.sleep(0.5)
+        except Exception as e:
+            print(f"    {symbol} error: {e}")
+
+    # Noticias macro desde NewsAPI (opcional, no falla si no hay clave)
+    macro_news, econ_events = [], []
+    if NEWS_API_KEY:
+        try:
+            r = requests.get(
+                f"https://newsapi.org/v2/top-headlines?category=business&language=en&pageSize=6&apiKey={NEWS_API_KEY}",
+                timeout=10,
+            )
+            if r.status_code == 200:
+                macro_news = [a.get("title", "") for a in r.json().get("articles", [])[:6]]
+        except: pass
+        try:
+            r = requests.get(
+                f"https://newsapi.org/v2/everything?q=Federal+Reserve+OR+CPI+OR+inflation&language=en&sortBy=publishedAt&pageSize=4&apiKey={NEWS_API_KEY}",
+                timeout=10,
+            )
+            if r.status_code == 200:
+                econ_events = [a.get("title", "") for a in r.json().get("articles", [])[:4]]
         except: pass
 
-    macro_news = []
-    try:
-        r = requests.get(
-            f"https://newsapi.org/v2/top-headlines?category=business&language=en&pageSize=8&apiKey={NEWS_API_KEY}",
-            timeout=10)
-        if r.status_code == 200:
-            macro_news = [a.get("title", "") for a in r.json().get("articles", [])[:8]]
-    except: pass
-
-    econ = []
-    try:
-        r = requests.get(
-            f"https://newsapi.org/v2/everything?q=Federal+Reserve+OR+CPI+OR+inflation&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}",
-            timeout=10)
-        if r.status_code == 200:
-            econ = [a.get("title", "") for a in r.json().get("articles", [])[:5]]
-    except: pass
-
     market_context = {
-        "fear_greed": fg, "sp500_change": sp500, "vix": vix,
-        "macro_news": macro_news, "economic_events": econ,
-        "updated_at": datetime.now(SPAIN_TZ).strftime("%H:%M")
+        "fear_greed":      fg,
+        "sp500_change":    sp500_change,
+        "vix":             vix,
+        "macro_news":      macro_news,
+        "economic_events": econ_events,
+        "updated_at":      datetime.now(SPAIN_TZ).strftime("%H:%M"),
     }
-    fg_label = ("PANICO EXTREMO" if fg < 20 else "Miedo" if fg < 40
-                else "Neutral" if fg < 60 else "Codicia" if fg < 80 else "EUFORIA")
-    print(f"  Fear&Greed: {fg} ({fg_label}) | S&P500: {sp500}% | VIX: {vix}")
-    send_log(f"📊 Macro — Fear&Greed: {fg} ({fg_label}) | S&P500: {'+' if sp500>=0 else ''}{sp500}% | VIX: {vix}")
 
-# ═══════════════════════════════════════════════════════
-# CAPA 1 — VIGILANCIA RÁPIDA (sin IA, sin coste)
-# ═══════════════════════════════════════════════════════
+    fg_str = _fg_label(fg)
+    print(f"  Fear&Greed: {fg} ({fg_str}) | S&P500: {sp500_change:+.2f}% | VIX: {vix}")
+    send_log(f"📊 Macro — Fear&Greed: {fg} ({fg_str}) | S&P500: {sp500_change:+.2f}% | VIX: {vix}")
+
+# ═══════════════════════════════════════════════════════════════════════
+# CAPA 1 — QUICK SCAN (sin IA, sin coste)
+# ═══════════════════════════════════════════════════════════════════════
+
 def quick_scan():
-    """Escaneo rápido cada 5 min. Solo precio y volumen. Sin IA."""
-    now = datetime.now(SPAIN_TZ)
-    if now.hour < 9 or now.hour >= 23: return
-
-    urgent = []
+    """
+    Escanea los screeners de Yahoo Finance buscando acciones con
+    movimiento real de precio y volumen anómalo.
+    No llama a la IA. No tiene coste.
+    Devuelve lista de candidatos ordenados por urgencia, sin duplicados.
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json", "Referer": "https://finance.yahoo.com"
+        "Accept": "application/json",
+        "Referer": "https://finance.yahoo.com",
     }
+    seen       = set()
+    candidates = []
 
-    # Screeners de Yahoo para acciones con movimiento real hoy
     for url in [
         "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=50",
         "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=50",
@@ -281,406 +438,407 @@ def quick_scan():
     ]:
         try:
             r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 200:
-                quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
-                for q in quotes:
-                    sym = q.get("symbol", "")
-                    price = q.get("regularMarketPrice", 0)
-                    vol = q.get("regularMarketVolume", 0)
-                    avg_vol = max(q.get("averageDailyVolume3Month", 1), 1)
-                    change = abs(q.get("regularMarketChangePercent", 0))
-                    vol_ratio = vol / avg_vol
+            if r.status_code != 200:
+                continue
+            quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+            for q in quotes:
+                sym       = q.get("symbol", "")
+                price     = q.get("regularMarketPrice", 0)
+                vol       = q.get("regularMarketVolume", 0)
+                avg_vol   = max(q.get("averageDailyVolume3Month", 1), 1)
+                change    = abs(q.get("regularMarketChangePercent", 0))
+                vol_ratio = vol / avg_vol
 
-                    if not sym or "." in sym or len(sym) > 5: continue
-                    if price < 5 or vol < 500_000: continue
-                    if already_alerted(sym): continue
+                # Filtros de calidad mínima
+                if not sym or "." in sym or len(sym) > 5:  continue
+                if price < 5 or vol < 500_000:              continue
+                if sym in seen:                             continue
+                if already_alerted_today(sym):              continue
 
-                    # Marcar como urgente si hay movimiento significativo
-                    urgency_score = 0
-                    if change > 8: urgency_score += 3
-                    elif change > 5: urgency_score += 2
-                    elif change > 3: urgency_score += 1
-                    if vol_ratio > 3: urgency_score += 3
-                    elif vol_ratio > 2: urgency_score += 2
-                    elif vol_ratio > 1.5: urgency_score += 1
+                # Score de urgencia: movimiento de precio + volumen anómalo
+                score = 0
+                if change > 8:      score += 3
+                elif change > 5:    score += 2
+                elif change > 3:    score += 1
+                if vol_ratio > 3:   score += 3
+                elif vol_ratio > 2: score += 2
+                elif vol_ratio > 1.5: score += 1
 
-                    if urgency_score >= 2:
-                        urgent.append({
-                            "ticker": sym, "price": price,
-                            "change": q.get("regularMarketChangePercent", 0),
-                            "vol_ratio": round(vol_ratio, 2),
-                            "urgency": urgency_score,
-                            "name": q.get("longName", sym),
-                            "sector": q.get("sector", "Unknown"),
-                            "market_cap": q.get("marketCap", 0),
-                        })
+                if score >= 2:
+                    seen.add(sym)
+                    candidates.append({
+                        "ticker":    sym,
+                        "name":      q.get("longName", sym),
+                        "sector":    q.get("sector", "Unknown"),
+                        "price":     price,
+                        "change":    q.get("regularMarketChangePercent", 0),
+                        "vol_ratio": round(vol_ratio, 2),
+                        "score":     score,
+                    })
             time.sleep(0.5)
         except Exception as e:
-            print(f"  Quick scan err: {e}")
+            print(f"  Quick scan error: {e}")
 
-    # Ordenar por urgencia
-    urgent.sort(key=lambda x: x["urgency"], reverse=True)
+    # Añadir acciones en desarrollo de ciclos anteriores
+    developing = [
+        {"ticker": t, "name": t, "sector": "Unknown", "price": 0, "change": 0, "vol_ratio": 0, "score": 1}
+        for t, s in watch_signals.items()
+        if s.get("developing") and not already_alerted_today(t) and t not in seen
+    ]
 
-    # Añadir acciones con señal en desarrollo de ciclos anteriores
-    developing = [t for t, s in watch_signals.items()
-                  if s.get("developing") and not already_alerted(t)]
+    all_candidates = sorted(candidates, key=lambda x: x["score"], reverse=True) + developing
+    print(f"  Quick scan: {len(candidates)} urgentes + {len(developing)} en desarrollo")
+    return all_candidates[:20]
 
-    print(f"  Quick scan: {len(urgent)} urgentes + {len(developing)} en desarrollo")
-    return urgent[:20], developing[:10]
+# ═══════════════════════════════════════════════════════════════════════
+# CAPA 2 — DATOS DE MERCADO (Yahoo Finance, 3 timeframes)
+# ═══════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════
-# CAPA 2 — DATOS TÉCNICOS COMPLETOS
-# ═══════════════════════════════════════════════════════
-def get_technical_data(ticker):
-    """Obtiene datos técnicos completos en 3 timeframes."""
+def get_market_data(ticker):
+    """
+    Obtiene datos técnicos completos para un ticker.
+    Hace 3 peticiones a Yahoo: diario (1y), semanal (1y), mensual (3y).
+    Calcula RSI, MACD, Estocástico, ATR, Fibonacci, OBV, estructura de precio.
+    Devuelve dict con todos los indicadores, o None si falla.
+    """
     try:
         ua = random.choice([
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
         ])
-        hdrs = {"User-Agent": ua, "Accept": "application/json",
-                "Referer": f"https://finance.yahoo.com/quote/{ticker}/"}
-
-        # Timeframe diario (1 año)
-        s = requests.Session()
-        s.get(f"https://finance.yahoo.com/quote/{ticker}/", headers=hdrs, timeout=8)
+        hdrs = {
+            "User-Agent": ua,
+            "Accept":     "application/json",
+            "Referer":    f"https://finance.yahoo.com/quote/{ticker}/",
+        }
         host = random.choice(["query1", "query2"])
+        s    = requests.Session()
+        s.get(f"https://finance.yahoo.com/quote/{ticker}/", headers=hdrs, timeout=8)
+
+        # ── Diario (1 año) ──────────────────────────────────────────────
         r = s.get(
             f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y",
-            headers=hdrs, timeout=15)
+            headers=hdrs, timeout=15,
+        )
         if r.status_code != 200:
-            print(f"    Yahoo HTTP {r.status_code} para {ticker}")
+            print(f"    {ticker}: Yahoo HTTP {r.status_code}")
             return None
 
-        result = r.json().get("chart", {}).get("result", [])
-        if not result:
-            print(f"    Yahoo sin resultado para {ticker}: {r.json().get("chart",{}).get("error","unknown")}")
+        chart = r.json().get("chart", {}).get("result", [])
+        if not chart:
+            print(f"    {ticker}: sin datos en Yahoo")
             return None
-        result = result[0]
-        meta = result.get("meta", {})
-        q = result["indicators"]["quote"][0]
 
+        res     = chart[0]
+        meta    = res.get("meta", {})
+        q       = res["indicators"]["quote"][0]
         closes  = [c for c in q.get("close",  []) if c is not None]
         volumes = [v for v in q.get("volume", []) if v is not None]
         highs   = [h for h in q.get("high",   []) if h is not None]
         lows    = [l for l in q.get("low",    []) if l is not None]
 
-        if len(closes) < 50: return None
+        if len(closes) < 50:
+            return None
 
-        price = closes[-1]
+        price      = closes[-1]
         change_pct = ((price - closes[-2]) / closes[-2]) * 100
 
-        # === MEDIAS MÓVILES ===
-        sma20  = sum(closes[-20:])  / 20
-        sma50  = sum(closes[-50:])  / 50
+        # Medias móviles
+        sma20  = sum(closes[-20:]) / 20
+        sma50  = sum(closes[-50:]) / 50
         sma200 = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
-        ema12  = closes[-1]
-        ema26  = closes[-1]
-        for i in range(min(26, len(closes))):
-            k12 = 2/(12+1); k26 = 2/(26+1)
-            ema12 = closes[-(i+1)] * k12 + ema12 * (1-k12)
-            ema26 = closes[-(i+1)] * k26 + ema26 * (1-k26)
 
-        # === MACD ===
-        macd = ema12 - ema26
-        macd_signal = macd * 0.9
-        macd_hist = macd - macd_signal
+        # EMA 12 y 26 para MACD
+        ema12 = ema26 = closes[-1]
+        for i in range(min(26, len(closes))):
+            k12   = 2 / 13
+            k26   = 2 / 27
+            ema12 = closes[-(i + 1)] * k12 + ema12 * (1 - k12)
+            ema26 = closes[-(i + 1)] * k26 + ema26 * (1 - k26)
+        macd         = ema12 - ema26
+        macd_signal  = macd * 0.9
         macd_bullish = macd > macd_signal
 
-        # === RSI 14 ===
-        gains, losses = [], []
+        # RSI 14
+        gains, losses_list = [], []
         for i in range(1, 15):
-            d = closes[-i] - closes[-i-1]
-            (gains if d >= 0 else losses).append(abs(d))
-        avg_gain = sum(gains)/14 if gains else 0
-        avg_loss = sum(losses)/14 if losses else 0.001
-        rsi = 100 - (100 / (1 + avg_gain/avg_loss))
+            d = closes[-i] - closes[-i - 1]
+            (gains if d >= 0 else losses_list).append(abs(d))
+        avg_gain = sum(gains) / 14       if gains       else 0
+        avg_loss = sum(losses_list) / 14 if losses_list else 0.001
+        rsi      = 100 - (100 / (1 + avg_gain / avg_loss))
 
-        # === ESTOCÁSTICO ===
-        low14  = min(lows[-14:])  if len(lows)  >= 14 else min(lows)
-        high14 = max(highs[-14:]) if len(highs) >= 14 else max(highs)
+        rsi_zone = "neutral"
+        if rsi < 25:   rsi_zone = "oversold_extreme"
+        elif rsi < 32: rsi_zone = "oversold"
+        elif rsi > 75: rsi_zone = "overbought_extreme"
+        elif rsi > 68: rsi_zone = "overbought"
+
+        # Estocástico
+        low14   = min(lows[-14:])  if len(lows)  >= 14 else min(lows)
+        high14  = max(highs[-14:]) if len(highs) >= 14 else max(highs)
         stoch_k = ((price - low14) / (high14 - low14) * 100) if high14 != low14 else 50
-        stoch_d = stoch_k * 0.85
 
-        # === ROC (Rate of Change) ===
-        roc5  = ((price - closes[-5])  / closes[-5]  * 100) if len(closes) >= 5  else 0
-        roc10 = ((price - closes[-10]) / closes[-10] * 100) if len(closes) >= 10 else 0
-
-        # === VOLUMEN ===
+        # Volumen y OBV
         avg_vol20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
-        vol_ratio = volumes[-1] / avg_vol20 if avg_vol20 > 0 else 1
-
-        # OBV (On Balance Volume)
-        obv = 0
-        for i in range(1, min(20, len(closes))):
-            if closes[-i] > closes[-i-1]: obv += volumes[-i]
-            elif closes[-i] < closes[-i-1]: obv -= volumes[-i]
+        vol_ratio = volumes[-1] / avg_vol20  if avg_vol20 > 0    else 1
+        obv = sum(
+            volumes[-i] if closes[-i] > closes[-i - 1] else -volumes[-i]
+            for i in range(1, min(20, len(closes)))
+        )
         obv_trend = "ACUMULACION" if obv > 0 else "DISTRIBUCION"
 
         # VWAP aproximado (últimos 5 días)
         vwap = sum(closes[-5:]) / 5
 
-        # === ATR ===
-        atr_vals = []
-        for i in range(1, min(15, len(closes))):
-            hl = highs[-i] - lows[-i] if highs and lows else 0
-            atr_vals.append(max(hl,
-                abs(highs[-i]-closes[-i-1]) if highs else 0,
-                abs(lows[-i]-closes[-i-1])  if lows  else 0))
-        atr = sum(atr_vals)/len(atr_vals) if atr_vals else price*0.02
+        # ATR (Average True Range, 14 días)
+        atr_vals = [
+            max(highs[-i] - lows[-i],
+                abs(highs[-i] - closes[-i - 1]),
+                abs(lows[-i]  - closes[-i - 1]))
+            for i in range(1, min(15, len(closes)))
+            if highs and lows
+        ]
+        atr = sum(atr_vals) / len(atr_vals) if atr_vals else price * 0.02
 
-        # === FIBONACCI ===
+        # Fibonacci 52 semanas
         h52 = max(closes[-252:]) if len(closes) >= 252 else max(closes)
         l52 = min(closes[-252:]) if len(closes) >= 252 else min(closes)
         rng = h52 - l52
-        fib236 = round(h52 - rng*0.236, 2)
-        fib382 = round(h52 - rng*0.382, 2)
-        fib500 = round(h52 - rng*0.500, 2)
-        fib618 = round(h52 - rng*0.618, 2)
+        fib236 = round(h52 - rng * 0.236, 2)
+        fib382 = round(h52 - rng * 0.382, 2)
+        fib500 = round(h52 - rng * 0.500, 2)
+        fib618 = round(h52 - rng * 0.618, 2)
 
-        # === ESTRUCTURA DE PRECIO ===
-        # Máximos y mínimos crecientes (últimos 10 días)
-        recent_highs = highs[-10:] if len(highs) >= 10 else highs
-        recent_lows  = lows[-10:]  if len(lows)  >= 10 else lows
-        higher_highs = all(recent_highs[i] >= recent_highs[i-1] for i in range(1, len(recent_highs)))
-        higher_lows  = all(recent_lows[i]  >= recent_lows[i-1]  for i in range(1, len(recent_lows)))
-        lower_highs  = all(recent_highs[i] <= recent_highs[i-1] for i in range(1, len(recent_highs)))
-        lower_lows   = all(recent_lows[i]  <= recent_lows[i-1]  for i in range(1, len(recent_lows)))
-
-        if higher_highs and higher_lows: structure = "TENDENCIA ALCISTA CLARA"
-        elif lower_highs and lower_lows: structure = "TENDENCIA BAJISTA CLARA"
-        else: structure = "LATERAL / CONSOLIDACION"
-
-        # Soporte y resistencia probados
+        # Soporte y resistencia (últimos 20 días)
         rh = max(highs[-20:]) if len(highs) >= 20 else price
         rl = min(lows[-20:])  if len(lows)  >= 20 else price
-
-        # Cuántas veces rebotó en soporte actual
         support_touches = sum(1 for l in lows[-60:] if abs(l - rl) / rl < 0.02) if len(lows) >= 60 else 0
 
-        # === MOMENTUM ===
+        # Momentum temporal
         mom1m = ((price - closes[-22]) / closes[-22] * 100) if len(closes) >= 22 else 0
         mom3m = ((price - closes[-66]) / closes[-66] * 100) if len(closes) >= 66 else 0
-        mom6m = ((price - closes[-126])/ closes[-126]* 100) if len(closes) >= 126 else 0
-        vol20 = ((sum((c-sma20)**2 for c in closes[-20:])/20)**0.5)/price*100
 
-        # === TIMEFRAME SEMANAL ===
+        # Estructura de precio (máximos y mínimos últimos 10 días)
+        rh10 = highs[-10:] if len(highs) >= 10 else highs
+        rl10 = lows[-10:]  if len(lows)  >= 10 else lows
+        hh   = all(rh10[i] >= rh10[i - 1] for i in range(1, len(rh10)))
+        hl   = all(rl10[i] >= rl10[i - 1] for i in range(1, len(rl10)))
+        lh   = all(rh10[i] <= rh10[i - 1] for i in range(1, len(rh10)))
+        ll   = all(rl10[i] <= rl10[i - 1] for i in range(1, len(rl10)))
+        if hh and hl:   structure = "TENDENCIA ALCISTA CLARA"
+        elif lh and ll: structure = "TENDENCIA BAJISTA CLARA"
+        else:           structure = "LATERAL / CONSOLIDACION"
+
+        # Score técnico — combinaciones con sentido (no arbitrario)
+        tech_score = 0
+        if rsi_zone in ("oversold_extreme",):   tech_score += 4
+        elif rsi_zone == "oversold":             tech_score += 2
+        elif rsi_zone in ("overbought_extreme",):tech_score += 4
+        elif rsi_zone == "overbought":           tech_score += 2
+        if vol_ratio > 3:      tech_score += 3
+        elif vol_ratio > 2:    tech_score += 2
+        elif vol_ratio > 1.5:  tech_score += 1
+        if abs(change_pct) > 8:   tech_score += 3
+        elif abs(change_pct) > 5: tech_score += 2
+        elif abs(change_pct) > 3: tech_score += 1
+        if macd_bullish and change_pct > 0:             tech_score += 2
+        if stoch_k < 20 or stoch_k > 80:                tech_score += 1
+        if obv_trend == "ACUMULACION" and change_pct > 0: tech_score += 2
+        if abs(mom1m) > 15:  tech_score += 2
+        elif abs(mom1m) > 8: tech_score += 1
+        if support_touches >= 3: tech_score += 2
+
+        # ── Semanal ─────────────────────────────────────────────────────
         weekly_trend = "N/D"
         try:
             rw = s.get(
                 f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1wk&range=1y",
-                headers=hdrs, timeout=10)
+                headers=hdrs, timeout=10,
+            )
             if rw.status_code == 200:
                 wc = [c for c in rw.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
                 if len(wc) >= 10:
-                    w_sma10 = sum(wc[-10:]) / 10
-                    weekly_trend = "ALCISTA" if wc[-1] > w_sma10 else "BAJISTA"
+                    weekly_trend = "ALCISTA" if wc[-1] > sum(wc[-10:]) / 10 else "BAJISTA"
         except: pass
 
-        # === TIMEFRAME MENSUAL ===
+        # ── Mensual ─────────────────────────────────────────────────────
         monthly_trend = "N/D"
         try:
             rm = s.get(
                 f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1mo&range=3y",
-                headers=hdrs, timeout=10)
+                headers=hdrs, timeout=10,
+            )
             if rm.status_code == 200:
                 mc = [c for c in rm.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
                 if len(mc) >= 6:
-                    m_sma6 = sum(mc[-6:]) / 6
-                    monthly_trend = "ALCISTA" if mc[-1] > m_sma6 else "BAJISTA"
+                    monthly_trend = "ALCISTA" if mc[-1] > sum(mc[-6:]) / 6 else "BAJISTA"
         except: pass
 
         # Confluencia de timeframes
         daily_trend = "ALCISTA" if price > sma50 else "BAJISTA"
-        tf_bullish = sum(1 for t in [daily_trend, weekly_trend, monthly_trend] if t == "ALCISTA")
-        tf_bearish = sum(1 for t in [daily_trend, weekly_trend, monthly_trend] if t == "BAJISTA")
-        if tf_bullish == 3: tf_confluence = "CONFLUENCIA ALCISTA TOTAL"
-        elif tf_bullish == 2: tf_confluence = "MAYORIA ALCISTA"
-        elif tf_bearish == 3: tf_confluence = "CONFLUENCIA BAJISTA TOTAL"
-        elif tf_bearish == 2: tf_confluence = "MAYORIA BAJISTA"
-        else: tf_confluence = "SIN CONFLUENCIA CLARA"
+        tf_bullish  = [daily_trend, weekly_trend, monthly_trend].count("ALCISTA")
+        tf_bearish  = [daily_trend, weekly_trend, monthly_trend].count("BAJISTA")
+        if tf_bullish == 3:   tf_conf = "CONFLUENCIA ALCISTA TOTAL"
+        elif tf_bullish == 2: tf_conf = "MAYORIA ALCISTA"
+        elif tf_bearish == 3: tf_conf = "CONFLUENCIA BAJISTA TOTAL"
+        elif tf_bearish == 2: tf_conf = "MAYORIA BAJISTA"
+        else:                 tf_conf = "SIN CONFLUENCIA CLARA"
 
-        # === SCORE TÉCNICO ===
-        score = 0
-        rsi_zone = "neutral"
-        if rsi < 25:   score += 4; rsi_zone = "oversold_extreme"
-        elif rsi < 32: score += 2; rsi_zone = "oversold"
-        elif rsi > 75: score += 4; rsi_zone = "overbought_extreme"
-        elif rsi > 68: score += 2; rsi_zone = "overbought"
-        if vol_ratio > 3:   score += 3
-        elif vol_ratio > 2: score += 2
-        elif vol_ratio > 1.5: score += 1
-        if abs(change_pct) > 8:  score += 3
-        elif abs(change_pct) > 5: score += 2
-        elif abs(change_pct) > 3: score += 1
-        if macd_bullish and change_pct > 0: score += 2
-        if stoch_k < 20 or stoch_k > 80: score += 1
-        if tf_bullish >= 2: score += 2
-        if tf_bearish >= 2: score += 2
-        if obv_trend == "ACUMULACION" and change_pct > 0: score += 2
-        if abs(mom1m) > 15: score += 2
-        elif abs(mom1m) > 8: score += 1
-        if support_touches >= 3: score += 2
-        sector = meta.get("sector", "Unknown")
-        pk = f"{'BUY' if change_pct > 0 else 'SELL'}_{rsi_zone}_{sector}"
-        if failed_patterns.get(pk, 0) >= 3: score -= 3
+        if tf_bullish >= 2: tech_score += 2
+        if tf_bearish >= 2: tech_score += 2
 
         return {
-            "ticker": ticker,
-            "name": meta.get("longName", ticker),
-            "sector": sector,
-            "price": round(price, 2),
-            "change_pct": round(change_pct, 2),
-            # Medias
-            "sma20": round(sma20, 2), "sma50": round(sma50, 2),
-            "sma200": round(sma200, 2) if sma200 else None,
-            "vwap": round(vwap, 2),
-            # Momentum
-            "rsi": round(rsi, 1), "rsi_zone": rsi_zone,
-            "macd": round(macd, 3), "macd_signal": round(macd_signal, 3),
-            "macd_hist": round(macd_hist, 3), "macd_bullish": macd_bullish,
-            "stoch_k": round(stoch_k, 1), "stoch_d": round(stoch_d, 1),
-            "roc5": round(roc5, 2), "roc10": round(roc10, 2),
-            # Volumen
-            "vol_ratio": round(vol_ratio, 2),
-            "obv_trend": obv_trend,
-            # ATR y estructura
-            "atr": round(atr, 2),
-            "structure": structure,
+            "ticker":          ticker,
+            "name":            meta.get("longName", ticker),
+            "sector":          meta.get("sector", "Unknown"),
+            "price":           round(price, 2),
+            "change_pct":      round(change_pct, 2),
+            "sma20":           round(sma20, 2),
+            "sma50":           round(sma50, 2),
+            "sma200":          round(sma200, 2) if sma200 else None,
+            "vwap":            round(vwap, 2),
+            "rsi":             round(rsi, 1),
+            "rsi_zone":        rsi_zone,
+            "macd":            round(macd, 3),
+            "macd_signal":     round(macd_signal, 3),
+            "macd_bullish":    macd_bullish,
+            "stoch_k":         round(stoch_k, 1),
+            "vol_ratio":       round(vol_ratio, 2),
+            "obv_trend":       obv_trend,
+            "atr":             round(atr, 2),
+            "h52":             round(h52, 2),
+            "l52":             round(l52, 2),
+            "dist_h":          round(((price - h52) / h52) * 100, 1),
+            "dist_l":          round(((price - l52) / l52) * 100, 1),
+            "fib236":          fib236,
+            "fib382":          fib382,
+            "fib500":          fib500,
+            "fib618":          fib618,
+            "rh":              round(rh, 2),
+            "rl":              round(rl, 2),
             "support_touches": support_touches,
-            # Fibonacci
-            "h52": round(h52, 2), "l52": round(l52, 2),
-            "fib236": fib236, "fib382": fib382,
-            "fib500": fib500, "fib618": fib618,
-            "rh": round(rh, 2), "rl": round(rl, 2),
-            "dist_h": round(((price-h52)/h52)*100, 1),
-            "dist_l": round(((price-l52)/l52)*100, 1),
-            # Momentum temporal
-            "mom1m": round(mom1m, 1), "mom3m": round(mom3m, 1), "mom6m": round(mom6m, 1),
-            "vol20": round(vol20, 1),
-            # Timeframes
-            "daily_trend": daily_trend,
-            "weekly_trend": weekly_trend,
-            "monthly_trend": monthly_trend,
-            "tf_confluence": tf_confluence,
-            # Score
-            "score": max(score, 0),
-            "rsi_zone": rsi_zone,
+            "mom1m":           round(mom1m, 1),
+            "mom3m":           round(mom3m, 1),
+            "structure":       structure,
+            "daily_trend":     daily_trend,
+            "weekly_trend":    weekly_trend,
+            "monthly_trend":   monthly_trend,
+            "tf_confluence":   tf_conf,
+            "tech_score":      max(tech_score, 0),
         }
+
     except Exception as e:
+        print(f"    {ticker}: error en datos de mercado — {e}")
         return None
 
-# ═══════════════════════════════════════════════════════
-# CAPA 3 — DATOS FUNDAMENTALES + SENTIMIENTO
-# ═══════════════════════════════════════════════════════
-def get_fundamental_data(ticker):
-    result = {}
-    headers = {"User-Agent": "Mozilla/5.0"}
+# ═══════════════════════════════════════════════════════════════════════
+# CAPA 3 — DATOS FUNDAMENTALES (1 petición a Yahoo quoteSummary)
+# ═══════════════════════════════════════════════════════════════════════
 
-    # P/E, deuda, crecimiento
+def get_fundamentals(ticker):
+    """
+    Obtiene P/E, short interest, earnings próximos, histórico de beats e
+    insiders. Todo en una sola petición a Yahoo Finance quoteSummary.
+    """
+    result = {
+        "pe_ratio":      None,
+        "short_interest": None,
+        "revenue_growth": None,
+        "profit_margins": None,
+        "rec_key":        "hold",
+        "analyst_target": None,
+        "analyst_upside": None,
+        "earnings_days":  None,
+        "earnings_beats": 0,
+        "insider_buys":   0,
+        "insider_sells":  0,
+    }
+    modules = "defaultKeyStatistics,financialData,calendarEvents,earningsHistory,insiderTransactions"
     try:
         r = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=defaultKeyStatistics,financialData,earningsTrend",
-            headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json().get("quoteSummary", {}).get("result", [{}])[0]
-            stats = data.get("defaultKeyStatistics", {})
-            fin   = data.get("financialData", {})
-            result["pe_ratio"]       = stats.get("forwardPE", {}).get("raw", 0)
-            result["short_interest"] = round(stats.get("shortPercentOfFloat", {}).get("raw", 0) * 100, 1)
-            result["revenue_growth"] = round(fin.get("revenueGrowth", {}).get("raw", 0) * 100, 1)
-            result["profit_margins"] = round(fin.get("profitMargins", {}).get("raw", 0) * 100, 1)
-            result["debt_equity"]    = round(fin.get("debtToEquity", {}).get("raw", 0), 2)
-            result["rec_mean"]       = fin.get("recommendationMean", {}).get("raw", 3)
-            result["rec_key"]        = fin.get("recommendationKey", "hold")
-    except: pass
+            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules={modules}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=12,
+        )
+        if r.status_code != 200:
+            return result
+        data  = r.json().get("quoteSummary", {}).get("result", [{}])[0]
+        stats = data.get("defaultKeyStatistics", {})
+        fin   = data.get("financialData", {})
 
-    # Earnings próximos
-    result["earnings_days"] = None
-    try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=calendarEvents",
-            headers=headers, timeout=10)
-        if r.status_code == 200:
-            dates = r.json().get("quoteSummary", {}).get("result", [{}])[0].get("calendarEvents", {}).get("earnings", {}).get("earningsDate", [])
-            if dates:
-                days = (datetime.fromtimestamp(dates[0]["raw"]) - datetime.now()).days
-                if 0 <= days <= 21: result["earnings_days"] = days
-    except: pass
+        def _raw(d, key, default=None):
+            return (d.get(key) or {}).get("raw", default)
 
-    # Historial de earnings beats
-    result["earnings_beats"] = 0
-    try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=earningsHistory",
-            headers=headers, timeout=10)
-        if r.status_code == 200:
-            history = r.json().get("quoteSummary", {}).get("result", [{}])[0].get("earningsHistory", {}).get("history", [])
-            beats = sum(1 for h in history[-4:]
-                       if h.get("surprisePercent", {}).get("raw", 0) > 0)
-            result["earnings_beats"] = beats
-    except: pass
+        result["pe_ratio"]       = _raw(stats, "forwardPE")
+        result["short_interest"] = round((_raw(stats, "shortPercentOfFloat", 0) or 0) * 100, 1)
+        result["revenue_growth"] = round((_raw(fin, "revenueGrowth", 0) or 0) * 100, 1)
+        result["profit_margins"] = round((_raw(fin, "profitMargins", 0) or 0) * 100, 1)
+        result["rec_key"]        = fin.get("recommendationKey", "hold")
 
-    # Insider activity
-    result["insider_buys"] = 0
-    result["insider_sells"] = 0
-    try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=insiderTransactions",
-            headers=headers, timeout=10)
-        if r.status_code == 200:
-            txns = r.json().get("quoteSummary", {}).get("result", [{}])[0].get("insiderTransactions", {}).get("transactions", [])
-            for t in txns[:10]:
-                days_ago = (datetime.now() - datetime.fromtimestamp(t.get("startDate", {}).get("raw", 0))).days
-                if days_ago <= 30:
-                    if "Purchase" in t.get("transactionText", ""): result["insider_buys"] += 1
-                    elif "Sale" in t.get("transactionText", ""):   result["insider_sells"] += 1
-    except: pass
+        target  = _raw(fin, "targetMeanPrice", 0) or 0
+        current = _raw(fin, "currentPrice", 0)    or 0
+        if target and current:
+            result["analyst_target"] = round(target, 2)
+            result["analyst_upside"] = round(((target - current) / current) * 100, 1)
 
-    # Precio objetivo de analistas
-    result["analyst_target"] = None
-    result["analyst_upside"] = None
-    try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=financialData",
-            headers=headers, timeout=10)
-        if r.status_code == 200:
-            fin = r.json().get("quoteSummary", {}).get("result", [{}])[0].get("financialData", {})
-            target = fin.get("targetMeanPrice", {}).get("raw", 0)
-            current = fin.get("currentPrice", {}).get("raw", 0)
-            if target and current:
-                result["analyst_target"] = round(target, 2)
-                result["analyst_upside"] = round(((target - current) / current) * 100, 1)
-    except: pass
+        # Earnings próximos
+        dates = data.get("calendarEvents", {}).get("earnings", {}).get("earningsDate", [])
+        if dates:
+            days = (datetime.fromtimestamp(dates[0]["raw"]) - datetime.now()).days
+            if 0 <= days <= 21:
+                result["earnings_days"] = days
+
+        # Histórico de beats (últimos 4 trimestres)
+        history = data.get("earningsHistory", {}).get("history", [])
+        result["earnings_beats"] = sum(
+            1 for h in history[-4:]
+            if (_raw(h, "surprisePercent", 0) or 0) > 0
+        )
+
+        # Insider transactions (últimos 30 días)
+        for t in data.get("insiderTransactions", {}).get("transactions", [])[:10]:
+            days_ago = (datetime.now() - datetime.fromtimestamp(_raw(t, "startDate", 0) or 0)).days
+            if days_ago <= 30:
+                txt = t.get("transactionText", "")
+                if "Purchase" in txt: result["insider_buys"]  += 1
+                elif "Sale"  in txt:  result["insider_sells"] += 1
+
+    except Exception as e:
+        print(f"    {ticker}: fundamentales error — {e}")
 
     return result
 
-# ═══════════════════════════════════════════════════════
-# CAPA 4 — NOTICIAS Y SENTIMIENTO
-# ═══════════════════════════════════════════════════════
-def get_sentiment_data(ticker, sector):
-    news_items = []
-    sentiment_score = 0
+# ═══════════════════════════════════════════════════════════════════════
+# CAPA 4 — SENTIMIENTO Y NOTICIAS
+# ═══════════════════════════════════════════════════════════════════════
 
-    # Noticias específicas de la acción
-    try:
-        r = requests.get(
-            f"https://newsapi.org/v2/everything?q={ticker}&language=en&sortBy=publishedAt&pageSize=8&apiKey={NEWS_API_KEY}",
-            timeout=10)
-        if r.status_code == 200:
-            for a in r.json().get("articles", [])[:6]:
-                title = a.get("title", "")
-                news_items.append(title)
-                # Sentimiento básico por palabras clave
-                positive = ["beat", "surge", "jump", "upgrade", "buy", "strong", "growth", "record", "partnership", "contract"]
-                negative = ["miss", "fall", "drop", "downgrade", "sell", "weak", "loss", "cut", "investigation", "lawsuit"]
-                title_lower = title.lower()
-                for w in positive:
-                    if w in title_lower: sentiment_score += 1
-                for w in negative:
-                    if w in title_lower: sentiment_score -= 1
-    except: pass
+def get_sentiment(ticker, sector):
+    """
+    Obtiene noticias recientes (NewsAPI + RSS Yahoo Finance),
+    calcula sentimiento básico por palabras clave y el rendimiento
+    del ETF sectorial correspondiente.
+    """
+    news_items      = []
+    sentiment_score = 0
+    positive_words  = ["beat","surge","jump","upgrade","buy","strong","growth","record","partnership","contract"]
+    negative_words  = ["miss","fall","drop","downgrade","sell","weak","loss","cut","investigation","lawsuit"]
+
+    # NewsAPI
+    if NEWS_API_KEY:
+        try:
+            r = requests.get(
+                f"https://newsapi.org/v2/everything?q={ticker}&language=en&sortBy=publishedAt&pageSize=6&apiKey={NEWS_API_KEY}",
+                timeout=10,
+            )
+            if r.status_code == 200:
+                for a in r.json().get("articles", [])[:6]:
+                    title = a.get("title", "")
+                    news_items.append(title)
+                    tl = title.lower()
+                    sentiment_score += sum(1 for w in positive_words if w in tl)
+                    sentiment_score -= sum(1 for w in negative_words if w in tl)
+        except: pass
 
     # RSS Yahoo Finance
     try:
@@ -689,737 +847,708 @@ def get_sentiment_data(ticker, sector):
             news_items.append(e.title)
     except: pass
 
-    # Rendimiento del ETF sectorial
+    # ETF sectorial
     sector_perf = None
     etf = SECTOR_ETFS.get(sector)
     if etf:
         try:
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{etf}?interval=1d&range=5d",
-                headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+            )
             if r.status_code == 200:
                 closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
                 if len(closes) >= 2:
-                    sector_perf = round(((closes[-1]-closes[-2])/closes[-2])*100, 2)
+                    sector_perf = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 2)
         except: pass
 
-    sentiment_label = "POSITIVO" if sentiment_score > 2 else "NEGATIVO" if sentiment_score < -2 else "NEUTRAL"
-
     return {
-        "news": news_items[:8],
+        "news":            news_items[:8],
         "sentiment_score": sentiment_score,
-        "sentiment_label": sentiment_label,
-        "sector_perf": sector_perf,
+        "sentiment_label": "POSITIVO" if sentiment_score > 2 else "NEGATIVO" if sentiment_score < -2 else "NEUTRAL",
+        "sector_perf":     sector_perf,
     }
 
-# ═══════════════════════════════════════════════════════
-# CAPA 5 — MOMENTUM INSTITUCIONAL
-# ═══════════════════════════════════════════════════════
-def get_institutional_data(tech_data):
-    """Infiere actividad institucional desde volumen y precio."""
-    institutional_signal = "NEUTRAL"
-    confidence_boost = 0
+# ═══════════════════════════════════════════════════════════════════════
+# CAPA 5 — MOMENTUM INSTITUCIONAL (sin coste, sin IA)
+# ═══════════════════════════════════════════════════════════════════════
 
-    vol_ratio = tech_data.get("vol_ratio", 1)
-    obv_trend = tech_data.get("obv_trend", "NEUTRAL")
-    change_pct = tech_data.get("change_pct", 0)
-    price = tech_data.get("price", 0)
-    vwap = tech_data.get("vwap", price)
+def get_inst_signal(tech):
+    """
+    Infiere actividad institucional desde volumen, precio y OBV.
+    Devuelve (señal textual, boost de confianza).
+    """
+    vol_ratio  = tech.get("vol_ratio", 1)
+    obv_trend  = tech.get("obv_trend", "NEUTRAL")
+    change_pct = tech.get("change_pct", 0)
+    price      = tech.get("price", 0)
+    vwap       = tech.get("vwap", price)
+    boost      = 0
+    signal     = "NEUTRAL"
 
-    # Volumen masivo con precio subiendo = institucional comprando
-    if vol_ratio > 2.5 and change_pct > 3:
-        institutional_signal = "COMPRA INSTITUCIONAL PROBABLE"
-        confidence_boost += 5
-    # Volumen masivo con precio bajando = institucional vendiendo
-    elif vol_ratio > 2.5 and change_pct < -3:
-        institutional_signal = "VENTA INSTITUCIONAL PROBABLE"
-        confidence_boost += 5
-    # Precio por encima de VWAP con volumen alto = presión compradora
-    elif price > vwap and vol_ratio > 1.5 and change_pct > 0:
-        institutional_signal = "PRESION COMPRADORA"
-        confidence_boost += 3
-    elif price < vwap and vol_ratio > 1.5 and change_pct < 0:
-        institutional_signal = "PRESION VENDEDORA"
-        confidence_boost += 3
+    if   vol_ratio > 2.5 and change_pct > 3:   signal = "COMPRA INSTITUCIONAL PROBABLE";  boost = 5
+    elif vol_ratio > 2.5 and change_pct < -3:   signal = "VENTA INSTITUCIONAL PROBABLE";   boost = 5
+    elif price > vwap and vol_ratio > 1.5 and change_pct > 0: signal = "PRESION COMPRADORA"; boost = 3
+    elif price < vwap and vol_ratio > 1.5 and change_pct < 0: signal = "PRESION VENDEDORA";  boost = 3
 
-    # OBV confirma dirección
-    if obv_trend == "ACUMULACION" and change_pct > 0:
-        confidence_boost += 2
-    elif obv_trend == "DISTRIBUCION" and change_pct < 0:
-        confidence_boost += 2
+    if obv_trend == "ACUMULACION" and change_pct > 0:  boost += 2
+    elif obv_trend == "DISTRIBUCION" and change_pct < 0: boost += 2
 
-    return {
-        "institutional_signal": institutional_signal,
-        "confidence_boost": confidence_boost,
-    }
+    return signal, boost
 
-# ═══════════════════════════════════════════════════════
-# CAPA 6 — IA SINTETIZA CON CONVICCIÓN
-# ═══════════════════════════════════════════════════════
-def analyze_with_ai(tech, fund, sent, inst):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ═══════════════════════════════════════════════════════════════════════
+# CAPA 6 — IA (Claude Sonnet)
+# ═══════════════════════════════════════════════════════════════════════
 
-    fg = market_context["fear_greed"]
-    fg_label = ("PANICO EXTREMO" if fg < 20 else "Miedo" if fg < 40
-                else "Neutral" if fg < 60 else "Codicia" if fg < 80 else "EUFORIA")
+def call_ai(prompt, max_tokens=700):
+    """Llama a la API de Claude. Devuelve texto o None si falla."""
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg    = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        print(f"    IA error: {e}")
+        return None
 
-    news_text  = "\n".join(f"- {h}" for h in sent.get("news", [])[:6]) if sent.get("news") else "- Sin noticias"
-    macro_text = "\n".join(f"- {h}" for h in market_context.get("macro_news", [])[:5])
-    econ_text  = "\n".join(f"- {h}" for h in market_context.get("economic_events", [])[:3])
 
-    rec_map = {"strongBuy": "COMPRA FUERTE", "buy": "COMPRAR", "hold": "MANTENER",
-               "sell": "VENDER", "strongSell": "VENTA FUERTE"}
-    rec_text = rec_map.get(fund.get("rec_key", "hold"), "MANTENER")
+def _build_auto_prompt(tech, fund, sent, inst_signal):
+    """Prompt para análisis automático. Solo llama si score técnico >= 5."""
+    fg       = market_context["fear_greed"]
+    sp500    = market_context["sp500_change"]
+    vix      = market_context["vix"]
+    fg_str   = _fg_label(fg)
+    news_txt  = "\n".join(f"- {h}" for h in sent["news"][:5]) or "- Sin noticias"
+    macro_txt = "\n".join(f"- {h}" for h in market_context.get("macro_news", [])[:4]) or "- Sin noticias macro"
+    econ_txt  = "\n".join(f"- {h}" for h in market_context.get("economic_events", [])[:3]) or "- Sin eventos"
 
-    analyst_text = (f"Precio objetivo analistas: ${fund.get('analyst_target')} "
-                    f"({'+'if (fund.get('analyst_upside') or 0)>=0 else ''}{fund.get('analyst_upside')}% upside)"
-                    if fund.get("analyst_target") else "Sin precio objetivo disponible")
+    rec_map  = {"strongBuy":"COMPRA FUERTE","buy":"COMPRAR","hold":"MANTENER","sell":"VENDER","strongSell":"VENTA FUERTE"}
+    rec_txt  = rec_map.get(fund.get("rec_key", "hold"), "MANTENER")
+    tgt_txt  = (f"Precio objetivo analistas: ${fund['analyst_target']} ({fund['analyst_upside']:+.1f}% upside)"
+                if fund.get("analyst_target") else "Sin precio objetivo disponible")
+    earn_txt = (f"EARNINGS EN {fund['earnings_days']} DÍAS — {fund.get('earnings_beats',0)}/4 últimos beats"
+                if fund.get("earnings_days") is not None else "Sin earnings próximos")
 
-    earnings_text = (f"EARNINGS EN {fund['earnings_days']} DIAS — "
-                     f"Ha batido estimaciones {fund.get('earnings_beats',0)}/4 ultimos trimestres"
-                     if fund.get("earnings_days") is not None else "Sin earnings proximos")
+    return f"""Eres el mejor analista cuantitativo del mundo. Analiza esta acción buscando la señal con mayor convicción.
 
-    insider_text = (f"{fund.get('insider_buys',0)} compras / {fund.get('insider_sells',0)} ventas insiders (30d)")
+MACRO
+Fear&Greed: {fg}/100 — {fg_str}
+S&P500: {sp500:+.2f}% | VIX: {vix} {'— ALTA VOLATILIDAD' if vix > 25 else '— mercado tranquilo'}
+Noticias macro: {macro_txt}
+Eventos económicos: {econ_txt}
 
-    prompt = f"""Eres el mejor analista cuantitativo del mundo. Tu objetivo es predecir con maxima precision la direccion, precio objetivo y timing de esta accion.
-
-PRIORIDAD 1: Acertar la direccion (sube o baja)
-PRIORIDAD 2: Acertar el precio objetivo
-PRIORIDAD 3: Acertar el timing
-PRIORIDAD 4: Stop loss preciso
-
-Confianza minima para recomendar: {CONF_NORMAL}%. Si no hay conviction real: NO_SIGNAL.
-
-━━━ CAPA 1: CONTEXTO MACRO ━━━
-Fear & Greed: {fg}/100 — {fg_label}
-S&P500 hoy: {'+' if market_context['sp500_change']>=0 else ''}{market_context['sp500_change']}%
-VIX: {market_context['vix']} {'— ALTA VOLATILIDAD' if market_context['vix'] > 25 else '— mercado calmado'}
-Macro: {macro_text}
-Eventos economicos: {econ_text}
-
-━━━ CAPA 2: TECNICO COMPLETO — {tech['ticker']} ({tech['name']}) ━━━
-Precio: ${tech['price']} ({'+' if tech['change_pct']>=0 else ''}{tech['change_pct']}% hoy)
-Sector: {tech['sector']} | ETF sectorial: {sent.get('sector_perf','N/D')}% hoy
-
-TENDENCIAS:
-Diario ({tech['daily_trend']}) | Semanal ({tech['weekly_trend']}) | Mensual ({tech['monthly_trend']})
-Confluencia: {tech['tf_confluence']}
-Estructura de precio: {tech['structure']}
-
-MEDIAS MOVILES:
-SMA20: ${tech['sma20']} | SMA50: ${tech['sma50']} | SMA200: ${tech.get('sma200','N/D')}
-VWAP: ${tech['vwap']} | Precio {'SOBRE' if tech['price']>tech['vwap'] else 'BAJO'} VWAP
-
-MOMENTUM:
+TÉCNICO — {tech['ticker']} ({tech['name']})
+Precio: ${tech['price']} ({tech['change_pct']:+.2f}% hoy) | Sector: {tech['sector']} | ETF sectorial: {sent.get('sector_perf','N/D')}%
+Tendencias: Diario {tech['daily_trend']} | Semanal {tech['weekly_trend']} | Mensual {tech['monthly_trend']}
+Confluencia: {tech['tf_confluence']} | Estructura: {tech['structure']}
+SMA20: ${tech['sma20']} | SMA50: ${tech['sma50']} | SMA200: ${tech.get('sma200','N/D')} | VWAP: ${tech['vwap']} ({'SOBRE' if tech['price'] > tech['vwap'] else 'BAJO'} VWAP)
 RSI(14): {tech['rsi']} {'— SOBREVENTA EXTREMA' if tech['rsi']<25 else '— sobreventa' if tech['rsi']<32 else '— SOBRECOMPRA EXTREMA' if tech['rsi']>75 else '— sobrecompra' if tech['rsi']>68 else ''}
-MACD: {tech['macd']} vs Signal {tech['macd_signal']} — {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'}
-Estocástico K:{tech['stoch_k']} D:{tech['stoch_d']} {'— SOBREVENTA' if tech['stoch_k']<20 else '— SOBRECOMPRA' if tech['stoch_k']>80 else ''}
-ROC 5d: {'+' if tech['roc5']>=0 else ''}{tech['roc5']}% | ROC 10d: {'+' if tech['roc10']>=0 else ''}{tech['roc10']}%
-Momentum 1m: {'+' if tech['mom1m']>=0 else ''}{tech['mom1m']}% | 3m: {'+' if tech['mom3m']>=0 else ''}{tech['mom3m']}% | 6m: {'+' if tech['mom6m']>=0 else ''}{tech['mom6m']}%
-
-VOLUMEN:
-Ratio vs media: {tech['vol_ratio']}x {'— INSTITUCIONAL MASIVO' if tech['vol_ratio']>3 else '— elevado' if tech['vol_ratio']>1.5 else ''}
-OBV: {tech['obv_trend']}
-ATR diario: ${tech['atr']} | Volatilidad: {tech['vol20']}%
-
-NIVELES CLAVE:
+MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Estocástico K: {tech['stoch_k']} {'— SOBREVENTA' if tech['stoch_k']<20 else '— SOBRECOMPRA' if tech['stoch_k']>80 else ''}
+Volumen: {tech['vol_ratio']}x media {'— INSTITUCIONAL MASIVO' if tech['vol_ratio']>3 else '— elevado' if tech['vol_ratio']>1.5 else ''} | OBV: {tech['obv_trend']} | ATR: ${tech['atr']}
+Momentum: 1m {tech['mom1m']:+.1f}% | 3m {tech['mom3m']:+.1f}%
 Fibonacci: 23.6%=${tech['fib236']} | 38.2%=${tech['fib382']} | 50%=${tech['fib500']} | 61.8%=${tech['fib618']}
-Soporte probado: ${tech['rl']} ({tech['support_touches']} toques) | Resistencia: ${tech['rh']}
-Min 52s: ${tech['l52']} ({'+' if tech['dist_l']>=0 else ''}{tech['dist_l']}%) | Max 52s: ${tech['h52']} ({tech['dist_h']}%)
+Soporte: ${tech['rl']} ({tech['support_touches']} toques) | Resistencia: ${tech['rh']}
+Mín 52s: ${tech['l52']} ({tech['dist_l']:+.1f}%) | Máx 52s: ${tech['h52']} ({tech['dist_h']:+.1f}%)
 
-━━━ CAPA 3: FUNDAMENTAL ━━━
-P/E Forward: {fund.get('pe_ratio',0)} | Deuda/Equity: {fund.get('debt_equity',0)}
-Crecimiento ingresos: {'+' if (fund.get('revenue_growth') or 0)>=0 else ''}{fund.get('revenue_growth',0)}%
-Margen beneficio: {fund.get('profit_margins',0)}%
-Short interest: {fund.get('short_interest',0)}% {'— POSIBLE SHORT SQUEEZE' if (fund.get('short_interest') or 0)>20 else ''}
-{earnings_text}
-{insider_text}
+FUNDAMENTAL
+P/E Forward: {fund.get('pe_ratio','N/D')} | Margen: {fund.get('profit_margins','N/D')}% | Short: {fund.get('short_interest',0)}% {'— POSIBLE SHORT SQUEEZE' if (fund.get('short_interest') or 0) > 20 else ''}
+{earn_txt}
+Insiders: {fund.get('insider_buys',0)} compras / {fund.get('insider_sells',0)} ventas (30d)
 
-━━━ CAPA 4: SENTIMIENTO ━━━
-Sentimiento noticias: {sent.get('sentiment_label','NEUTRAL')} (score: {sent.get('sentiment_score',0)})
-Recomendacion analistas: {rec_text}
-{analyst_text}
-Noticias recientes:
-{news_text}
+SENTIMIENTO
+Noticias: {sent['sentiment_label']} (score {sent['sentiment_score']}) | Analistas: {rec_txt}
+{tgt_txt}
+{news_txt}
 
-━━━ CAPA 5: MOMENTUM INSTITUCIONAL ━━━
-{inst['institutional_signal']}
+INSTITUCIONAL
+{inst_signal}
 
-━━━ INSTRUCCIONES ━━━
-Analiza las capas buscando CONVERGENCIA internamente. NO muestres las capas en tu respuesta.
-Usa ATR para calcular plazos realistas. Ancla objetivos en niveles de Fibonacci o soportes/resistencias.
-
-Si hay oportunidad responde EXACTAMENTE asi, sin ningun texto adicional, sin explicar capas:
+INSTRUCCIONES
+Analiza internamente buscando CONVERGENCIA entre capas. NO expliques el proceso ni las capas.
+Confianza mínima para señal: {CONF_NORMAL}%. Si no hay convicción real: NO_SIGNAL.
+Responde EXACTAMENTE en este formato, sin texto adicional:
 
 SEÑAL: COMPRAR o VENDER
 CONFIANZA: [X]%
 🎯 ENTRADA ÓPTIMA: $[precio exacto]
-📈 OBJETIVO: [+/-X%] → $[precio] en [X dias o X semanas] — [razon en 5 palabras]
+📈 OBJETIVO: [+/-X%] → $[precio] en [X días/semanas] — [razón en 5 palabras]
 🛑 STOP LOSS: $[precio en soporte/Fibonacci] — prob. stop: [X]%
 ⚖️ RATIO R/B: [X]:1
-💬 POR QUÉ: [2-3 frases simples. Qué pasa, por qué va a moverse, por qué ahora]
-⚡ CATALIZADOR: [factor concreto mas importante]
-❌ INVALIDACIÓN: [precio o evento exacto]
+💬 POR QUÉ: [2-3 frases concretas. Qué pasa técnica/fundamentalmente, por qué ahora]
+⚡ CATALIZADOR: [factor más importante que moverá el precio]
+❌ INVALIDACIÓN: [precio o evento exacto que cancela la tesis]
 
-Si no hay oportunidad clara: NO_SIGNAL"""
-
-    try:
-        msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=800,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return msg.content[0].text.strip()
-    except Exception as e:
-        print(f"    Error IA: {e}")
-        return "NO_SIGNAL"
-
-# ═══════════════════════════════════════════════════════
-# FORMATO ALERTAS DISCORD
-# ═══════════════════════════════════════════════════════
-def format_alert(tech, analysis, session, alert_num=None):
-    now = datetime.now(SPAIN_TZ)
-    signal = "COMPRAR"
-    for line in analysis.split("\n"):
-        if line.startswith("SEÑAL:"):
-            signal = "VENDER" if "VENDER" in line else "COMPRAR"
-            break
-
-    conf_val = 0
-    for line in analysis.split("\n"):
-        if "CONFIANZA:" in line:
-            try: conf_val = int(''.join(filter(str.isdigit, line)))
-            except: pass
-            break
-
-    is_buy = signal == "COMPRAR"
-    if conf_val >= CONF_EXCEPCIONAL: emoji = "⚡" if is_buy else "💀"
-    elif conf_val >= CONF_FUERTE:    emoji = "🔥" if is_buy else "🔴"
-    else:                             emoji = "🟢" if is_buy else "🔴"
-
-    sign = "+" if tech["change_pct"] >= 0 else ""
-    session_tag = f"  [{session}]" if session != "MERCADO" else ""
-    num_tag = f"  │  {alert_num}" if alert_num else ""
-
-    # Limpiar respuesta: quitar SEÑAL y CONFIANZA del cuerpo (ya están en el header)
-    skip = {"SEÑAL:", "CONFIANZA:"}
-    clean = "\n".join(l for l in analysis.split("\n")
-                       if not any(l.startswith(s) for s in skip)).strip()
-
-    return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{emoji}  **{signal}  —  {tech['ticker']}**{session_tag}{num_tag}
-{tech['name']}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰  **${tech['price']}**  ({sign}{tech['change_pct']}% hoy)  ·  {conf_val}% confianza
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{clean}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🕐  {now.strftime('%H:%M  %d/%m/%Y')} hora España"""
-
-# ═══════════════════════════════════════════════════════
-# ANÁLISIS PROFUNDO
-# ═══════════════════════════════════════════════════════
-def deep_analyze(ticker, name, sector, urgency=0, force=False):
-    """Análisis completo con las 6 capas."""
-    global fuertes_enviados
-    print(f"  Análisis profundo: {ticker}...")
-
-    # Obtener todos los datos
-    tech = get_technical_data(ticker)
-    if not tech:
-        print(f"    {ticker}: sin datos técnicos")
-        return None
-    if tech["score"] < 5 and not force:
-        print(f"    {ticker}: score técnico insuficiente")
-        return None
-
-    fund = get_fundamental_data(ticker)
-    sent = get_sentiment_data(ticker, sector)
-    inst = get_institutional_data(tech)
-
-    # Boost de confianza por momentum institucional
-    confidence_boost = inst.get("confidence_boost", 0)
-
-    analysis = analyze_with_ai(tech, fund, sent, inst)
-
-    if "NO_SIGNAL" in analysis:
-        # Marcar como analizada pero sin señal
-        watch_signals[ticker] = {
-            "score": tech["score"],
-            "last_analyzed": datetime.now().isoformat(),
-            "developing": False
-        }
-        save_state()
-        return None
-
-    # Extraer confianza y ajustar con boost
-    conf = CONF_NORMAL
-    for line in analysis.split("\n"):
-        if "CONFIANZA:" in line:
-            try: conf = int(''.join(filter(str.isdigit, line)))
-            except: pass
-            break
-    conf = min(conf + confidence_boost, 99)
-
-    if conf < CONF_NORMAL and not force:
-        print(f"    {ticker}: confianza {conf}% insuficiente")
-        return None
-
-    # Control de niveles
-    signal = "COMPRAR"
-    for line in analysis.split("\n"):
-        if line.startswith("SEÑAL:"):
-            signal = "VENDER" if "VENDER" in line else "COMPRAR"
-            break
-
-    if signal == "VENDER" and sells_today() >= MAX_SELLS_DIA:
-        print(f"    {ticker}: venta descartada (limite diario)")
-        return None
-
-    if conf >= CONF_FUERTE and conf < CONF_EXCEPCIONAL and fuertes_today() >= MAX_FUERTES_DIA and not force:
-        print(f"    {ticker}: señal fuerte descartada (limite diario de fuertes)")
-        return None
-
-    # Actualizar estado de vigilancia
-    watch_signals[ticker] = {
-        "score": tech["score"],
-        "last_analyzed": datetime.now().isoformat(),
-        "developing": conf >= CONF_FUERTE
-    }
-    save_state()
-
-    return {"tech": tech, "analysis": analysis, "conf": conf, "signal": signal}
+Si no hay convicción: NO_SIGNAL"""
 
 
-# ═══════════════════════════════════════════════════════
-# COMANDO !analizar — ESCUCHA SOLICITUDES
-# ═══════════════════════════════════════════════════════
-_last_solicitud_msg = None
-_bot_start_time = None
+def _build_manual_prompt(tech, fund, sent):
+    """Prompt para !analizar — siempre da respuesta completa aunque sea NEUTRAL."""
+    fg     = market_context["fear_greed"]
+    fg_str = _fg_label(fg)
+    return f"""Eres el mejor analista del mundo. El usuario solicita análisis de {tech['ticker']} ({tech['name']}).
+Da SIEMPRE análisis completo. Si no hay señal clara di NEUTRAL con toda la info igualmente.
+NO expliques el proceso. Ve directo al resultado.
 
-
-def analyze_manual(ticker):
-    """Análisis completo para solicitudes manuales — siempre devuelve resultado."""
-    tech = get_technical_data(ticker)
-    if not tech:
-        return None
-
-    fund = get_fundamental_data(ticker)
-    sent = get_sentiment_data(ticker, tech.get("sector","Unknown"))
-    inst = get_institutional_data(tech)
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    fg = market_context["fear_greed"]
-    fg_label = ("PÁNICO EXTREMO" if fg<20 else "Miedo" if fg<40 else "Neutral" if fg<60 else "Codicia" if fg<80 else "EUFORIA")
-
-    prompt = f"""Eres el mejor analista del mundo. El usuario quiere saber el estado actual de {ticker} ({tech['name']}).
-Da SIEMPRE un análisis completo aunque no haya señal clara. NO muestres capas. Ve directo al resultado.
-
-DATOS:
-Precio: ${tech['price']} ({'+' if tech['change_pct']>=0 else ''}{tech['change_pct']}% hoy)
+Precio: ${tech['price']} ({tech['change_pct']:+.2f}% hoy)
 RSI: {tech['rsi']} | MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Volumen: {tech['vol_ratio']}x
 SMA20: ${tech['sma20']} | SMA50: ${tech['sma50']} | VWAP: ${tech['vwap']}
+Tendencia: {tech['daily_trend']} diario | {tech['weekly_trend']} semanal | {tech['tf_confluence']}
 Soporte: ${tech['rl']} | Resistencia: ${tech['rh']}
-Tendencia diaria: {tech['daily_trend']} | Semanal: {tech['weekly_trend']}
-Fear&Greed: {fg}/100 ({fg_label}) | VIX: {market_context['vix']}
-P/E: {fund.get('pe_ratio','N/D')} | Short interest: {fund.get('short_interest','N/D')}%
-Sentimiento noticias: {sent.get('sentiment_label','NEUTRAL')}
+Fib 38.2%: ${tech['fib382']} | 61.8%: ${tech['fib618']}
+Fear&Greed: {fg}/100 ({fg_str}) | VIX: {market_context['vix']}
+P/E: {fund.get('pe_ratio','N/D')} | Short: {fund.get('short_interest','N/D')}% | Analistas: {fund.get('rec_key','N/D')}
+Sentimiento noticias: {sent['sentiment_label']}
 
-Responde EXACTAMENTE asi:
+Responde EXACTAMENTE así, sin texto adicional:
 SEÑAL: COMPRAR / VENDER / NEUTRAL
 CONFIANZA: [X]%
-📊 SITUACIÓN: [1 frase — dónde está la acción ahora mismo]
+📊 SITUACIÓN: [1 frase — dónde está la acción ahora y por qué es relevante]
 🎯 ENTRADA ÓPTIMA: $[precio]
-📈 OBJETIVO: [+/-X%] → $[precio] en [X dias o semanas] — [razón]
+📈 OBJETIVO: [+/-X%] → $[precio] en [plazo] — [razón]
 🛑 STOP LOSS: $[precio] — prob. stop: [X]%
 ⚖️ RATIO R/B: [X]:1
 💬 POR QUÉ: [2-3 frases concretas]
 ⚡ CATALIZADOR: [factor principal]
 ❌ INVALIDACIÓN: [precio o evento]"""
 
-    try:
-        msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=600,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return {"tech": tech, "analysis": msg.content[0].text.strip(), "conf": 0, "signal": "NEUTRAL"}
-    except Exception as e:
-        import traceback
-        print(f"    Error análisis manual: {e}")
-        print(traceback.format_exc())
+# ═══════════════════════════════════════════════════════════════════════
+# FORMATEO DE ALERTAS DISCORD
+# ═══════════════════════════════════════════════════════════════════════
+
+def format_alert(tech, ai_response, session_tag=""):
+    """
+    Formatea la respuesta de la IA en mensaje Discord limpio.
+    Extrae SEÑAL y CONFIANZA para el header.
+    El cuerpo muestra todo lo demás sin repetir esos campos.
+    Devuelve (texto_formateado, señal, confianza).
+    """
+    # Extraer señal
+    signal = "COMPRAR"
+    for line in ai_response.splitlines():
+        if line.startswith("SEÑAL:"):
+            signal = "VENDER" if "VENDER" in line else "COMPRAR"
+            break
+
+    # Extraer confianza
+    conf = 0
+    for line in ai_response.splitlines():
+        if "CONFIANZA:" in line:
+            digits = "".join(c for c in line if c.isdigit())
+            if digits:
+                conf = int(digits[:3])
+            break
+
+    # Emoji por nivel y dirección
+    is_buy = signal == "COMPRAR"
+    if conf >= CONF_EXCEPCIONAL:
+        emoji = "⚡" if is_buy else "💀"
+    elif conf >= CONF_FUERTE:
+        emoji = "🔥" if is_buy else "🔴"
+    else:
+        emoji = "🟢" if is_buy else "🔴"
+
+    # Cuerpo: quitar SEÑAL y CONFIANZA (ya están en el header)
+    body = "\n".join(
+        line for line in ai_response.splitlines()
+        if not line.startswith("SEÑAL:") and not line.startswith("CONFIANZA:")
+    ).strip()
+
+    sign = "+" if tech["change_pct"] >= 0 else ""
+    sess = f"  [{session_tag}]" if session_tag and session_tag != "MERCADO" else ""
+    now  = datetime.now(SPAIN_TZ).strftime("%H:%M  %d/%m/%Y")
+
+    text = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji}  **{signal}  —  {tech['ticker']}**{sess}\n"
+        f"{tech['name']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰  **${tech['price']}**  ({sign}{tech['change_pct']}% hoy)  ·  {conf}% confianza\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{body}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐  {now} hora España"
+    )
+    return text, signal, conf
+
+# ═══════════════════════════════════════════════════════════════════════
+# ANÁLISIS COMPLETO (automático y manual comparten esta función)
+# ═══════════════════════════════════════════════════════════════════════
+
+def analyze_ticker(ticker, name="", sector="Unknown", force=False):
+    """
+    Análisis completo con las 6 capas para un ticker.
+
+    force=False (automático):
+        - Respeta score técnico mínimo (5)
+        - Respeta límites diarios (fuertes, ventas)
+        - Rechaza NO_SIGNAL de la IA
+        - Devuelve None si no hay señal válida
+
+    force=True (manual, !analizar):
+        - Sin filtros de score
+        - Sin límites diarios
+        - Siempre devuelve resultado (aunque sea NEUTRAL)
+
+    Retorna (texto_alerta, señal, confianza, tech) o None si no hay señal.
+    """
+    print(f"  Analizando {ticker}...")
+
+    # Capa 2 — datos técnicos
+    tech = get_market_data(ticker)
+    if not tech:
+        print(f"    {ticker}: sin datos de mercado")
         return None
 
-_processed_msg_ids = set()  # IDs ya procesados en esta sesión
+    # Filtro de score (solo automático)
+    if not force and tech["tech_score"] < 5:
+        print(f"    {ticker}: score {tech['tech_score']} insuficiente")
+        return None
 
-def listen_solicitudes(init=False):
-    """Revisa el canal #solicitud-en-concreto buscando comandos !analizar TICKER"""
-    global _last_solicitud_msg, _processed_msg_ids
+    # Capas 3, 4, 5
+    fund         = get_fundamentals(ticker)
+    sent         = get_sentiment(ticker, sector or tech["sector"])
+    inst_signal, boost = get_inst_signal(tech)
+
+    # Capa 6 — IA
+    prompt      = _build_manual_prompt(tech, fund, sent) if force else _build_auto_prompt(tech, fund, sent, inst_signal)
+    ai_response = call_ai(prompt, max_tokens=650 if force else 800)
+    if not ai_response:
+        return None
+
+    # Automático: rechazar NO_SIGNAL
+    if not force and "NO_SIGNAL" in ai_response:
+        watch_signals[ticker] = {"last_analyzed": datetime.now().isoformat(), "developing": False}
+        save_state()
+        return None
+
+    # Formatear alerta
+    session_tag = _session_label(datetime.now(SPAIN_TZ))
+    text, signal, conf = format_alert(tech, ai_response, session_tag)
+
+    # Aplicar boost institucional
+    conf = min(conf + boost, 99)
+
+    # Límites diarios (solo automático)
+    if not force:
+        if conf < CONF_NORMAL:
+            print(f"    {ticker}: confianza {conf}% insuficiente")
+            return None
+        if signal == "VENDER" and ventas_hoy() >= MAX_VENTAS_DIA:
+            print(f"    {ticker}: límite de ventas diario alcanzado")
+            return None
+        if CONF_FUERTE <= conf < CONF_EXCEPCIONAL and fuertes_hoy() >= MAX_FUERTES_DIA:
+            print(f"    {ticker}: límite de fuertes diario alcanzado")
+            return None
+
+    # Actualizar watch_signals
+    watch_signals[ticker] = {
+        "last_analyzed": datetime.now().isoformat(),
+        "developing":    conf >= CONF_FUERTE,
+    }
+    save_state()
+
+    nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
+    print(f"    {ticker}: {nivel} {signal} {conf}%")
+
+    return text, signal, conf, tech
+
+# ═══════════════════════════════════════════════════════════════════════
+# CICLO AUTOMÁTICO DE VIGILANCIA — cada 5 minutos
+# ═══════════════════════════════════════════════════════════════════════
+
+def watch_cycle():
+    """
+    1. quick_scan() — detecta candidatos sin IA
+    2. Para los mejores candidatos, analyze_ticker()
+    3. Envía alertas respetando todos los límites
+    No se ejecuta fuera del horario 09:00-23:00 hora España.
+    """
+    now = datetime.now(SPAIN_TZ)
+    if now.hour < 9 or now.hour >= 23:
+        return
+
+    candidates = quick_scan()
+    if not candidates:
+        return
+
+    # Añadir muestra aleatoria del universo para rotación diaria
+    not_analyzed = [
+        t for t in UNIVERSE
+        if not already_alerted_today(t)
+        and (t not in watch_signals
+             or (datetime.now() - datetime.fromisoformat(watch_signals[t].get("last_analyzed", "2000-01-01"))).total_seconds() > 86400)
+    ]
+    rotation = random.sample(not_analyzed, min(6, len(not_analyzed)))
+    seen_in_candidates = {c["ticker"] for c in candidates}
+    rotation_items = [
+        {"ticker": t, "name": t, "sector": "Unknown", "score": 0}
+        for t in rotation
+        if t not in seen_in_candidates
+    ]
+
+    to_analyze = candidates + rotation_items
+    print(f"\n[{now.strftime('%H:%M')} ES] {len(to_analyze)} candidatos para análisis profundo")
+
+    alerts_this_cycle = 0
+
+    for item in to_analyze:
+        if alerts_this_cycle >= MAX_AI_POR_CICLO:
+            break
+
+        ticker = item["ticker"]
+
+        if already_alerted_today(ticker):
+            continue
+
+        # No re-analizar si fue analizado hace menos de 1 hora
+        last = watch_signals.get(ticker, {}).get("last_analyzed")
+        if last:
+            elapsed = (datetime.now() - datetime.fromisoformat(last)).total_seconds()
+            if elapsed < 3600:
+                continue
+
+        result = analyze_ticker(ticker, item.get("name", ticker), item.get("sector", "Unknown"))
+        if not result:
+            time.sleep(1)
+            continue
+
+        text, signal, conf, tech = result
+        send_alert(text)
+        save_prediction(ticker, signal, tech["price"], tech["rl"], conf)
+        alerts_this_cycle += 1
+
+        nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
+        print(f"    → Alerta enviada: {ticker} {nivel} ({signal}, {conf}%)")
+        time.sleep(3)
+
+    if alerts_this_cycle > 0:
+        print(f"  {alerts_this_cycle} alerta(s) enviada(s) este ciclo")
+
+# ═══════════════════════════════════════════════════════════════════════
+# COMANDOS MANUALES — escucha !analizar cada 30 segundos
+# ═══════════════════════════════════════════════════════════════════════
+
+def listen_commands(init=False):
+    """
+    Revisa #solicitud-en-concreto buscando comandos !analizar TICKER.
+
+    init=True (al arrancar):
+        Marca todos los mensajes existentes como vistos sin procesarlos.
+        Evita re-procesar comandos antiguos tras un reinicio.
+
+    init=False (loop normal):
+        Procesa solo mensajes nuevos no vistos.
+    """
+    global last_cmd_msg_id, processed_cmd_ids
+
     try:
         params = {"limit": 10}
-        if _last_solicitud_msg:
-            params["after"] = _last_solicitud_msg
+        if last_cmd_msg_id:
+            params["after"] = last_cmd_msg_id
 
         r = requests.get(
             f"https://discord.com/api/v10/channels/{DISCORD_SOLICITUD_ID}/messages",
             params=params,
             headers={"Authorization": f"Bot {DISCORD_TOKEN}"},
-            timeout=10)
-
+            timeout=10,
+        )
         if r.status_code != 200:
-            print(f"  Solicitud err: {r.status_code}")
+            print(f"  listen_commands error {r.status_code}")
             return
 
         messages = r.json()
-        if not messages: return
-
-        # Actualizar puntero al mensaje más reciente
-        _last_solicitud_msg = messages[0]["id"]
-
-        # Al arrancar: marcar todos como vistos sin procesar
-        if init:
-            for m in messages:
-                _processed_msg_ids.add(m["id"])
-            print(f"  Solicitudes listas — {len(messages)} mensajes previos ignorados")
+        if not messages:
             return
 
-        # Procesar solo mensajes nuevos no procesados
+        # Actualizar puntero al mensaje más reciente
+        last_cmd_msg_id = messages[0]["id"]
+
+        # Al arrancar: marcar todo como visto sin procesar
+        if init:
+            for m in messages:
+                processed_cmd_ids.add(m["id"])
+            print(f"  Comandos: {len(messages)} mensajes previos ignorados")
+            return
+
+        # Procesar mensajes nuevos en orden cronológico (del más antiguo al más nuevo)
         for msg in reversed(messages):
             msg_id = msg.get("id")
-            if msg_id in _processed_msg_ids: continue
-            _processed_msg_ids.add(msg_id)
+            if msg_id in processed_cmd_ids:
+                continue
+            processed_cmd_ids.add(msg_id)
 
-            text   = msg.get("content", "").strip()
-            author = msg.get("author", {})
-            if author.get("bot"): continue
+            if msg.get("author", {}).get("bot"):
+                continue
 
-            print(f"  Nuevo mensaje en solicitudes: {text[:50]}")
+            text = msg.get("content", "").strip()
+            print(f"  Mensaje en solicitudes: {text[:60]}")
 
-            # Procesar cada línea buscando !analizar
-            tickers_to_analyze = []
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line.lower().startswith("!analizar"): continue
+            # Extraer tickers de líneas con !analizar
+            tickers = []
+            for line in text.splitlines():
+                line = line.strip().lower()
+                if not line.startswith("!analizar"):
+                    continue
                 parts = line.split()
-                if len(parts) < 2: continue
-                ticker = parts[1].upper().strip()
-                if ticker not in tickers_to_analyze:
-                    tickers_to_analyze.append(ticker)
+                if len(parts) >= 2:
+                    t = parts[1].upper().strip()
+                    if t not in tickers:
+                        tickers.append(t)
 
-            if not tickers_to_analyze: continue
+            if not tickers:
+                continue
 
-            for ticker in tickers_to_analyze:
-                print(f"  Solicitud: !analizar {ticker}")
-                _post(DISCORD_SOLICITUD_ID, f"🔍  Analizando **{ticker}**... dame unos segundos.")
-                update_status(f"🔍  Analizando {ticker} bajo demanda...")
+            for ticker in tickers:
+                print(f"  !analizar {ticker}")
+                send_solicitud(f"🔍  Analizando **{ticker}**... dame unos segundos.")
+                update_status(f"🔍  Analizando **{ticker}** bajo demanda...")
 
-                result = analyze_manual(ticker)
-                now = datetime.now(SPAIN_TZ)
+                result = analyze_ticker(ticker, ticker, "Unknown", force=True)
+                now_es = datetime.now(SPAIN_TZ)
 
                 if not result:
-                    _post(DISCORD_SOLICITUD_ID,
+                    send_solicitud(
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"❓  **{ticker}** no encontrado\n"
                         f"Verifica que el ticker sea correcto (ej: NVDA, AAPL)\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    )
                 else:
-                    session = get_session(now)
-                    alert_msg = format_alert(result["tech"], result["analysis"], session)
-                    _post(DISCORD_SOLICITUD_ID, alert_msg)
+                    text_alert, signal, conf, tech = result
+                    send_solicitud(text_alert)
 
-                update_status("🟢  Activo — vigilando mercado\n🕐  " + now.strftime("%H:%M  %d/%m/%Y"))
+                update_status(
+                    f"🟢  **Activo** — vigilando mercado\n"
+                    f"📡 Fear&Greed: {market_context['fear_greed']} ({_fg_label(market_context['fear_greed'])}) | VIX: {market_context['vix']}\n"
+                    f"🕐  Última actualización: {now_es.strftime('%H:%M')} — si esto no cambia en 10 min el bot está caído"
+                )
                 time.sleep(2)
-
-        # Actualizar último mensaje procesado
-        _last_solicitud_msg = messages[0]["id"]
 
     except Exception as e:
         import traceback
-        print(f"  Solicitud err: {e}")
+        print(f"  listen_commands excepción: {e}")
         print(traceback.format_exc())
 
-# ═══════════════════════════════════════════════════════
-# CICLO DE VIGILANCIA RÁPIDA (cada 5 min)
-# ═══════════════════════════════════════════════════════
-def get_session(now):
-    m = now.hour * 60 + now.minute
-    if 900 <= m < 930:   return "PREMARKET"
-    if 930 <= m < 1380:  return "MERCADO"
-    if 1380 <= m < 1440: return "AFTERHOURS"
-    return "MERCADO"
+# ═══════════════════════════════════════════════════════════════════════
+# RESUMEN DOMINICAL — #aciertos-bot (cada domingo 10:00)
+# ═══════════════════════════════════════════════════════════════════════
 
-def watch_cycle():
-    """Ciclo rápido cada 5 minutos. Solo vigilancia, sin IA."""
-    global fuertes_enviados
+def weekly_report():
+    """
+    Revisa todas las predicciones, compara precios actuales con objetivos
+    y stops, y publica un resumen visual en #aciertos-bot.
+    """
     now = datetime.now(SPAIN_TZ)
-    if now.hour < 9 or now.hour >= 23: return
-
-    result = quick_scan()
-    if not result: return
-    urgent, developing = result
-
-    session = get_session(now)
-    to_analyze = []
-    seen_tickers = set()
-
-    # Añadir urgentes que no hayan sido analizados hoy
-    for item in urgent:
-        ticker = item["ticker"]
-        if ticker in seen_tickers: continue
-        last = watch_signals.get(ticker, {}).get("last_analyzed")
-        if last:
-            last_dt = datetime.fromisoformat(last)
-            if (datetime.now() - last_dt).seconds < 3600: continue
-        seen_tickers.add(ticker)
-        to_analyze.append((ticker, item.get("name", ticker), item.get("sector", "Unknown"), item.get("urgency", 0)))
-
-    # Añadir acciones con señal en desarrollo
-    for ticker in developing:
-        if ticker not in seen_tickers:
-            seen_tickers.add(ticker)
-            to_analyze.append((ticker, ticker, "Unknown", 0))
-
-    # Añadir acciones del universo que llevan más de 24h sin analizar (rotación)
-    not_analyzed = [t for t in UNIVERSE
-                    if t not in watch_signals or
-                    (datetime.now() - datetime.fromisoformat(watch_signals[t].get("last_analyzed", "2000-01-01"))).total_seconds() > 86400]
-    sample = random.sample(not_analyzed, min(10, len(not_analyzed)))
-    for ticker in sample:
-        if ticker not in seen_tickers:
-            seen_tickers.add(ticker)
-            to_analyze.append((ticker, ticker, "Unknown", 0))
-
-    if not to_analyze:
-        return
-
-    print(f"\n[{now.strftime('%H:%M')} ES] Analizando {len(to_analyze)} acciones en profundidad...")
-
-    alert_count = 0
-    for ticker, name, sector, urgency in to_analyze[:4]:  # Max 4 análisis profundos por ciclo
-        if already_alerted(ticker): continue
-
-        result = deep_analyze(ticker, name, sector, urgency)
-        if not result:
-            time.sleep(1)
-            continue
-
-        tech     = result["tech"]
-        analysis = result["analysis"]
-        conf     = result["conf"]
-        signal   = result["signal"]
-
-        msg = format_alert(tech, analysis, session)
-        send_alert(msg)
-        alerts_sent[ticker] = datetime.now()
-        # Guardar en predictions para persistir entre reinicios
-        add_prediction(ticker, signal, tech["price"],
-                       tech["price"]*1.10, tech["price"]*1.18, tech["price"]*1.28,
-                       tech["price"]*0.93, conf, 14)
-        alert_count += 1
-
-        nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
-        if conf >= CONF_FUERTE and conf < CONF_EXCEPCIONAL:
-            fuertes_enviados += 1
-        print(f"    {ticker}: ALERTA {nivel} ({signal}, {conf}%)")
-        time.sleep(3)
-
-    if alert_count > 0:
-        print(f"  {alert_count} alertas enviadas")
-
-
-# ═══════════════════════════════════════════════════════
-# CANAL ACIERTOS — RESUMEN DOMINICAL
-# ═══════════════════════════════════════════════════════
-def weekly_aciertos_report():
-    """Cada domingo a las 10:00 revisa todas las predicciones y publica resumen visual."""
-    now = datetime.now(SPAIN_TZ)
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    wins = []; losses = []; pending = []
+    wins, losses, pending = [], [], []
 
     for p in predictions:
         ticker      = p["ticker"]
         entry       = p.get("entry", 0)
-        target      = p.get("target_short") or p.get("target", entry * 1.1)
-        stop        = p.get("stop", entry * 0.93)
+        target      = p.get("target", entry * 1.15)
+        stop        = p.get("stop",   entry * 0.93)
         signal      = p.get("signal", "COMPRAR")
-        date        = datetime.fromisoformat(p["date"])
-        days_passed = (datetime.now() - date).days
-        conf        = p.get("confidence", 0)
+        days_passed = (datetime.now() - datetime.fromisoformat(p["date"])).days
 
-        # Obtener precio actual
+        # Precio actual
         current = entry
         try:
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d",
-                headers=headers, timeout=8)
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=8,
+            )
             if r.status_code == 200:
-                closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close",[]) if c]
-                if closes: current = closes[-1]
+                closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
+                if closes:
+                    current = closes[-1]
         except: pass
 
-        change = ((current - entry) / entry) * 100 if entry else 0
+        change     = ((current - entry) / entry) * 100 if entry else 0
         hit_target = (signal == "COMPRAR" and current >= target) or (signal == "VENDER" and current <= target)
         hit_stop   = (signal == "COMPRAR" and current <= stop)   or (signal == "VENDER" and current >= stop)
 
         if p["result"] == "win" or hit_target:
             if p["result"] != "win":
                 p["result"] = "win"; p["exit_price"] = current; save_state()
-            wins.append({"ticker": ticker, "change": change, "days": days_passed, "conf": conf})
+            wins.append({"ticker": ticker, "change": change, "days": days_passed})
         elif p["result"] == "loss" or hit_stop:
             if p["result"] != "loss":
                 p["result"] = "loss"; p["exit_price"] = current; save_state()
-            losses.append({"ticker": ticker, "change": change, "days": days_passed, "conf": conf})
+            losses.append({"ticker": ticker, "change": change, "days": days_passed})
         elif p["result"] == "pending" and days_passed >= 1:
-            pending.append({"ticker": ticker, "change": change, "days": days_passed, "conf": conf, "current": current})
+            pending.append({"ticker": ticker, "change": change, "days": days_passed})
 
         time.sleep(0.3)
 
-    total_closed = len(wins) + len(losses)
-    win_rate = round(len(wins) / total_closed * 100) if total_closed > 0 else 0
+    total    = len(wins) + len(losses)
+    win_rate = round(len(wins) / total * 100) if total > 0 else 0
     avg_win  = round(sum(w["change"] for w in wins)   / len(wins),   1) if wins   else 0
     avg_loss = round(sum(l["change"] for l in losses) / len(losses), 1) if losses else 0
 
-    # Construir mensaje visual
     week_start = (now - timedelta(days=7)).strftime("%d/%m")
     week_end   = now.strftime("%d/%m/%Y")
 
     lines = [
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊  **RESUMEN SEMANAL**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "📊  **RESUMEN SEMANAL**",
         f"Semana del {week_start} al {week_end}",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
-
-    if wins:
-        for w in sorted(wins, key=lambda x: x["change"], reverse=True):
-            sign = "+" if w["change"] >= 0 else ""
-            lines.append(f"✅  **{w['ticker']}**  {sign}{w['change']:.1f}%  en {w['days']} días")
-    if losses:
-        for l in sorted(losses, key=lambda x: x["change"]):
-            lines.append(f"❌  **{l['ticker']}**  {l['change']:.1f}%  stop activado en {l['days']} días")
-    if pending:
-        for p in pending:
-            sign = "+" if p["change"] >= 0 else ""
-            lines.append(f"⏳  **{p['ticker']}**  {sign}{p['change']:.1f}% hasta ahora  —  pendiente")
-
+    for w in sorted(wins,   key=lambda x: x["change"], reverse=True):
+        lines.append(f"✅  **{w['ticker']}**  {w['change']:+.1f}%  en {w['days']} días")
+    for l in sorted(losses, key=lambda x: x["change"]):
+        lines.append(f"❌  **{l['ticker']}**  {l['change']:+.1f}%  stop en {l['days']} días")
+    for p in pending:
+        lines.append(f"⏳  **{p['ticker']}**  {p['change']:+.1f}% — pendiente")
     if not wins and not losses and not pending:
         lines.append("Sin predicciones esta semana")
 
     lines += [
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🎯  Aciertos: {len(wins)}/{total_closed}  —  {win_rate}%",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🎯  Aciertos: {len(wins)}/{total}  —  {win_rate}%",
     ]
     if wins:   lines.append(f"💰  Ganancia media: +{avg_win}%")
     if losses: lines.append(f"📉  Pérdida media: {avg_loss}%")
-    lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     send_acierto("\n".join(lines))
-    send_log(f"📊 Resumen dominical enviado a #aciertos-bot — {len(wins)} aciertos / {len(losses)} stops / {len(pending)} pendientes")
+    send_log(f"📊 Resumen dominical: {len(wins)} aciertos / {len(losses)} stops / {len(pending)} pendientes")
 
-# ═══════════════════════════════════════════════════════
-# RESUMEN SEMANAL
-# ═══════════════════════════════════════════════════════
-def send_weekly_summary():
-    now = datetime.now(SPAIN_TZ)
+# ═══════════════════════════════════════════════════════════════════════
+# RESUMEN PERIÓDICO — #log-bot (lunes y jueves 09:00)
+# ═══════════════════════════════════════════════════════════════════════
+
+def weekly_summary():
+    now     = datetime.now(SPAIN_TZ)
     total   = len([p for p in predictions if p["result"] != "pending"])
     wins    = len([p for p in predictions if p["result"] == "win"])
     losses  = len([p for p in predictions if p["result"] == "loss"])
     pending = len([p for p in predictions if p["result"] == "pending"])
-    rate    = round(wins/total*100, 1) if total > 0 else 0
-    send_log(f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 RESUMEN StockBot — {now.strftime('%d/%m/%Y')}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Acertadas: {wins}  ❌ Falladas: {losses}  ⏳ Pendientes: {pending}
-🎯 Tasa de acierto: {rate}%
-━━━━━━━━━━━━━━━━━━━━━━━━━━━""")
-
-# ═══════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════
-def reset_daily_counters():
-    global fuertes_enviados, alerts_sent
-    fuertes_enviados = 0
-    # Limpiar alertas de mas de 24h
-    now = datetime.now()
-    alerts_sent = {t: dt for t, dt in alerts_sent.items() if (now - dt).total_seconds() < 86400}
-    print("  Contadores diarios reseteados")
-
-def main():
-    global status_message_id
-    load_state()
-    now = datetime.now(SPAIN_TZ)
-    print(f"StockBot Pro v2 iniciado — {now.strftime('%H:%M %d/%m/%Y')}")
-
-    # STATUS: arrancando
-    print("  Actualizando status...")
-    update_status(f"⚙️  **Arrancando...**\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
-
-    # Macro
-    update_status(f"⚙️  **Calentando motores...**\n📡 Cargando contexto macro...")
-    update_market_context()
-
-    fg = market_context['fear_greed']
-    fg_label = ("PÁNICO EXTREMO" if fg<20 else "Miedo" if fg<40 else "Neutral" if fg<60 else "Codicia" if fg<80 else "EUFORIA")
-
-    # Log arranque
-    total_hoy = alertas_today()
-    fuertes_hoy = fuertes_today()
+    rate    = round(wins / total * 100, 1) if total > 0 else 0
     send_log(
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 **StockBot arrancado** — {now.strftime('%H:%M %d/%m/%Y')}\n"
+        f"📊 RESUMEN — {now.strftime('%d/%m/%Y')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 Fear&Greed: {fg}/100 ({fg_label})\n"
-        f"📈 S&P500: {'+' if market_context['sp500_change']>=0 else ''}{market_context['sp500_change']}%  |  VIX: {market_context['vix']}\n"
+        f"✅ Acertadas: {wins}  ❌ Falladas: {losses}  ⏳ Pendientes: {pending}\n"
+        f"🎯 Tasa de acierto: {rate}%\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+# ═══════════════════════════════════════════════════════════════════════
+# RESET DIARIO — 00:01
+# ═══════════════════════════════════════════════════════════════════════
+
+def reset_daily_counters():
+    """
+    Los límites diarios se calculan dinámicamente desde predictions
+    (fecha de hoy), así que no hay nada que resetear en memoria.
+    Simplemente logueamos el nuevo día.
+    """
+    print("  Nuevo día — contadores basados en predictions, sin reset necesario")
+    send_log("🔄 Nuevo día — límites diarios reseteados automáticamente")
+
+# ═══════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+
+def _session_label(now):
+    m = now.hour * 60 + now.minute
+    if  900 <= m < 930:  return "PREMARKET"
+    if  930 <= m < 1380: return "MERCADO"
+    if 1380 <= m < 1440: return "AFTERHOURS"
+    return "FUERA DE MERCADO"
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN — arranca todo y mantiene el loop
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    now = datetime.now(SPAIN_TZ)
+    print(f"StockBot Pro v3 — {now.strftime('%H:%M %d/%m/%Y')}")
+
+    # 1. Cargar estado desde disco
+    load_state()
+
+    # 2. Status: arrancando
+    update_status(f"⚙️  **Arrancando...**\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
+
+    # 3. Contexto macro
+    update_status("⚙️  **Cargando contexto macro...**")
+    update_market_context()
+
+    fg      = market_context["fear_greed"]
+    fg_str  = _fg_label(fg)
+    sp500   = market_context["sp500_change"]
+    vix     = market_context["vix"]
+    total_h = alertas_hoy()
+    fuertes = fuertes_hoy()
+
+    # 4. Log de arranque en #log-bot
+    send_log(
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Alertas hoy: {total_hoy}  |  Fuertes: {fuertes_hoy}/{MAX_FUERTES_DIA}\n"
+        f"🤖 **StockBot v3 arrancado** — {now.strftime('%H:%M %d/%m/%Y')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 Fear&Greed: {fg}/100 ({fg_str})\n"
+        f"📈 S&P500: {sp500:+.2f}%  |  VIX: {vix}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Alertas hoy: {total_h}  |  Fuertes: {fuertes}/{MAX_FUERTES_DIA}\n"
         f"🟢 Vigilancia activa cada 5 min"
     )
 
-    # Instrucciones
+    # 5. Instrucciones en Discord (borra duplicados)
     print("  Publicando instrucciones...")
     post_instrucciones()
     print("  Instrucciones publicadas")
 
-    # STATUS: activo
+    # 6. Status: activo
     update_status(
         f"🟢  **Activo** — vigilando mercado\n"
-        f"📡 Fear&Greed: {fg} ({fg_label}) | VIX: {market_context['vix']}\n"
+        f"📡 Fear&Greed: {fg} ({fg_str}) | VIX: {vix}\n"
         f"🕐  {now.strftime('%H:%M  %d/%m/%Y')}"
     )
 
+    # 7. Primer ciclo de análisis inmediato al arrancar
     watch_cycle()
-    listen_solicitudes(init=True)  # Marcar mensajes existentes como vistos
 
+    # 8. Marcar mensajes existentes como vistos (evita reprocesar al reiniciar)
+    listen_commands(init=True)
+
+    # 9. Schedules
     schedule.every(5).minutes.do(watch_cycle)
-    schedule.every().sunday.at("10:00").do(weekly_aciertos_report)
     schedule.every().day.at("09:00").do(update_market_context)
     schedule.every().day.at("00:01").do(reset_daily_counters)
-    schedule.every().monday.at("09:00").do(send_weekly_summary)
-    schedule.every().thursday.at("09:00").do(send_weekly_summary)
+    schedule.every().sunday.at("10:00").do(weekly_report)
+    schedule.every().monday.at("09:00").do(weekly_summary)
+    schedule.every().thursday.at("09:00").do(weekly_summary)
 
-    # Loop principal
-    last_solicitud_check = 0
-    last_status_update = 0
+    # 10. Loop principal
+    last_cmd_check    = 0.0
+    last_status_check = 0.0
+
     while True:
         schedule.run_pending()
-        now_ts = time.time()
-        # Revisar solicitudes cada 30 segundos
-        if now_ts - last_solicitud_check >= 30:
-            listen_solicitudes()
-            last_solicitud_check = now_ts
-        # Actualizar status cada 5 minutos
-        if now_ts - last_status_update >= 300:
-            now = datetime.now(SPAIN_TZ)
-            fg = market_context["fear_greed"]
-            fg_label = ("PÁNICO EXTREMO" if fg<20 else "Miedo" if fg<40 else "Neutral" if fg<60 else "Codicia" if fg<80 else "EUFORIA")
+        ts = time.time()
+
+        # Comandos manuales cada 30 segundos
+        if ts - last_cmd_check >= 30:
+            listen_commands()
+            last_cmd_check = ts
+
+        # Heartbeat de status cada 5 minutos
+        if ts - last_status_check >= 300:
+            now_loop = datetime.now(SPAIN_TZ)
+            fg_loop  = market_context["fear_greed"]
             update_status(
                 f"🟢  **Activo** — vigilando mercado\n"
-                f"📡 Fear&Greed: {fg} ({fg_label}) | VIX: {market_context['vix']}\n"
-                f"🕐  Última actualización: {now.strftime('%H:%M')} — si esto no cambia en 10 min el bot está caído"
+                f"📡 Fear&Greed: {fg_loop} ({_fg_label(fg_loop)}) | VIX: {market_context['vix']}\n"
+                f"🕐  Última actualización: {now_loop.strftime('%H:%M')} — si esto no cambia en 10 min el bot está caído"
             )
-            last_status_update = now_ts
+            last_status_check = ts
+
         time.sleep(5)
+
 
 if __name__ == "__main__":
     main()
