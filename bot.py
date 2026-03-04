@@ -515,6 +515,7 @@ def get_market_data(ticker):
         host = random.choice(["query1", "query2"])
         s    = requests.Session()
         s.get(f"https://finance.yahoo.com/quote/{ticker}/", headers=hdrs, timeout=8)
+        time.sleep(0.8)
 
         # ── Diario (1 año) ──────────────────────────────────────────────
         r = s.get(
@@ -1212,7 +1213,7 @@ def watch_cycle():
 
         result = analyze_ticker(ticker, item.get("name", ticker), item.get("sector", "Unknown"))
         if not result:
-            time.sleep(1)
+            time.sleep(2)
             continue
 
         text, signal, conf, tech = result
