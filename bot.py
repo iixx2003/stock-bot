@@ -176,9 +176,21 @@ def add_prediction(ticker, signal, entry, target_short, target_mid, target_long,
     save_state()
 
 def already_alerted(ticker):
+    # Primero checar en memoria
     if ticker in alerts_sent:
-        return datetime.now() - alerts_sent[ticker] < timedelta(hours=24)
+        if datetime.now() - alerts_sent[ticker] < timedelta(hours=24):
+            return True
+    # Luego checar en predictions persistidas (sobrevive reinicios)
+    today = datetime.now(SPAIN_TZ).date()
+    for p in predictions:
+        if p["ticker"] == ticker and datetime.fromisoformat(p["date"]).date() == today:
+            return True
     return False
+
+def alertas_today():
+    today = datetime.now(SPAIN_TZ).date()
+    return sum(1 for p in predictions
+               if datetime.fromisoformat(p["date"]).date() == today)
 
 def fuertes_today():
     today = datetime.now(SPAIN_TZ).date()
@@ -830,11 +842,10 @@ Noticias recientes:
 {inst['institutional_signal']}
 
 ━━━ INSTRUCCIONES ━━━
-Analiza las 5 capas buscando CONVERGENCIA. Cuantas mas capas apunten en la misma direccion, mayor la confianza.
-Usa ATR para calcular plazos realistas. Ancla objetivos en niveles de Fibonacci o soportes/resistencias probados.
-Da 3 plazos concretos en dias o semanas (no etiquetas como "corto" o "largo").
+Analiza las capas buscando CONVERGENCIA internamente. NO muestres las capas en tu respuesta.
+Usa ATR para calcular plazos realistas. Ancla objetivos en niveles de Fibonacci o soportes/resistencias.
 
-Si hay oportunidad responde EXACTAMENTE asi (sin explicar las capas, solo el resultado):
+Si hay oportunidad responde EXACTAMENTE asi, sin ningun texto adicional, sin explicar capas:
 
 SEÑAL: COMPRAR o VENDER
 CONFIANZA: [X]%
@@ -961,7 +972,7 @@ def deep_analyze(ticker, name, sector, urgency=0, force=False):
         print(f"    {ticker}: venta descartada (limite diario)")
         return None
 
-    if conf >= CONF_FUERTE and conf < CONF_EXCEPCIONAL and fuertes_enviados >= MAX_FUERTES_DIA and not force:
+    if conf >= CONF_FUERTE and conf < CONF_EXCEPCIONAL and fuertes_today() >= MAX_FUERTES_DIA and not force:
         print(f"    {ticker}: señal fuerte descartada (limite diario de fuertes)")
         return None
 
@@ -981,6 +992,57 @@ def deep_analyze(ticker, name, sector, urgency=0, force=False):
 # ═══════════════════════════════════════════════════════
 _last_solicitud_msg = None
 _bot_start_time = None
+
+
+def analyze_manual(ticker):
+    """Análisis completo para solicitudes manuales — siempre devuelve resultado."""
+    tech = get_technical_data(ticker)
+    if not tech:
+        return None
+
+    fund = get_fundamental_data(ticker)
+    sent = get_sentiment_data(ticker, tech.get("sector","Unknown"))
+    inst = get_institutional_data(tech)
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    fg = market_context["fear_greed"]
+    fg_label = ("PÁNICO EXTREMO" if fg<20 else "Miedo" if fg<40 else "Neutral" if fg<60 else "Codicia" if fg<80 else "EUFORIA")
+
+    prompt = f"""Eres el mejor analista del mundo. El usuario quiere saber el estado actual de {ticker} ({tech['name']}).
+Da SIEMPRE un análisis completo aunque no haya señal clara. NO muestres capas. Ve directo al resultado.
+
+DATOS:
+Precio: ${tech['price']} ({'+' if tech['change_pct']>=0 else ''}{tech['change_pct']}% hoy)
+RSI: {tech['rsi']} | MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Volumen: {tech['vol_ratio']}x
+SMA20: ${tech['sma20']} | SMA50: ${tech['sma50']} | VWAP: ${tech['vwap']}
+Soporte: ${tech['rl']} | Resistencia: ${tech['rh']}
+Tendencia diaria: {tech['daily_trend']} | Semanal: {tech['weekly_trend']}
+Fear&Greed: {fg}/100 ({fg_label}) | VIX: {market_context['vix']}
+P/E: {fund.get('pe_ratio','N/D')} | Short interest: {fund.get('short_interest','N/D')}%
+Sentimiento noticias: {sent.get('sentiment_label','NEUTRAL')}
+
+Responde EXACTAMENTE asi:
+SEÑAL: COMPRAR / VENDER / NEUTRAL
+CONFIANZA: [X]%
+📊 SITUACIÓN: [1 frase — dónde está la acción ahora mismo]
+🎯 ENTRADA ÓPTIMA: $[precio]
+📈 OBJETIVO: [+/-X%] → $[precio] en [X dias o semanas] — [razón]
+🛑 STOP LOSS: $[precio] — prob. stop: [X]%
+⚖️ RATIO R/B: [X]:1
+💬 POR QUÉ: [2-3 frases concretas]
+⚡ CATALIZADOR: [factor principal]
+❌ INVALIDACIÓN: [precio o evento]"""
+
+    try:
+        msg = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return {"tech": tech, "analysis": msg.content[0].text.strip(), "conf": 0, "signal": "NEUTRAL"}
+    except Exception as e:
+        print(f"    Error análisis manual: {e}")
+        return None
 
 _processed_msg_ids = set()  # IDs ya procesados en esta sesión
 
@@ -1045,26 +1107,19 @@ def listen_solicitudes(init=False):
                 _post(DISCORD_SOLICITUD_ID, f"🔍  Analizando **{ticker}**... dame unos segundos.")
                 update_status(f"🔍  Analizando {ticker} bajo demanda...")
 
-                result = deep_analyze(ticker, ticker, "Unknown", urgency=5, force=True)
+                result = analyze_manual(ticker)
                 now = datetime.now(SPAIN_TZ)
 
                 if not result:
-                    # No hay datos técnicos — ticker inválido
                     _post(DISCORD_SOLICITUD_ID,
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"❓  **{ticker}** no encontrado\n"
-                        f"Verifica que el ticker sea correcto.\n"
+                        f"Verifica que el ticker sea correcto (ej: NVDA, AAPL)\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━")
                 else:
                     session = get_session(now)
                     alert_msg = format_alert(result["tech"], result["analysis"], session)
                     _post(DISCORD_SOLICITUD_ID, alert_msg)
-                    # Solo guardar predicción si hay señal real
-                    if result["conf"] >= CONF_NORMAL:
-                        tech = result["tech"]
-                        add_prediction(ticker, result["signal"], tech["price"],
-                                       tech["price"]*1.15, tech["price"]*1.20, tech["price"]*1.30,
-                                       tech["price"]*0.93, result["conf"], 14)
 
                 update_status("🟢  Activo — vigilando mercado\n🕐  " + now.strftime("%H:%M  %d/%m/%Y"))
                 time.sleep(2)
@@ -1144,6 +1199,10 @@ def watch_cycle():
         msg = format_alert(tech, analysis, session, alert_num=alert_num)
         send_alert(msg)
         alerts_sent[ticker] = datetime.now()
+        # Guardar en predictions para persistir entre reinicios
+        add_prediction(ticker, signal, tech["price"],
+                       tech["price"]*1.10, tech["price"]*1.18, tech["price"]*1.28,
+                       tech["price"]*0.93, conf, 14)
         alert_count += 1
 
         nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
@@ -1292,16 +1351,17 @@ def main():
     fg_label = ("PÁNICO EXTREMO" if fg<20 else "Miedo" if fg<40 else "Neutral" if fg<60 else "Codicia" if fg<80 else "EUFORIA")
 
     # Log arranque
+    total_hoy = alertas_today()
+    fuertes_hoy = fuertes_today()
     send_log(
-        f"🤖 **StockBot Pro v2** — {now.strftime('%H:%M %d/%m/%Y')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚙️ Calentando motores...\n"
-        f"   ✅ Conexión Yahoo Finance\n"
-        f"   ✅ Contexto macro cargado\n"
-        f"   ✅ Fear&Greed: {fg} ({fg_label})\n"
-        f"   ✅ Universo: 1.200+ acciones listas\n"
+        f"🤖 **StockBot arrancado** — {now.strftime('%H:%M %d/%m/%Y')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 Listo. Vigilancia activa cada 5 min"
+        f"📡 Fear&Greed: {fg}/100 ({fg_label})\n"
+        f"📈 S&P500: {'+' if market_context['sp500_change']>=0 else ''}{market_context['sp500_change']}%  |  VIX: {market_context['vix']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Alertas hoy: {total_hoy}  |  Fuertes: {fuertes_hoy}/{MAX_FUERTES_DIA}\n"
+        f"🟢 Vigilancia activa cada 5 min"
     )
 
     # Instrucciones
