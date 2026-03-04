@@ -349,10 +349,14 @@ def get_technical_data(ticker):
         r = s.get(
             f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y",
             headers=hdrs, timeout=15)
-        if r.status_code != 200: return None
+        if r.status_code != 200:
+            print(f"    Yahoo HTTP {r.status_code} para {ticker}")
+            return None
 
         result = r.json().get("chart", {}).get("result", [])
-        if not result: return None
+        if not result:
+            print(f"    Yahoo sin resultado para {ticker}: {r.json().get("chart",{}).get("error","unknown")}")
+            return None
         result = result[0]
         meta = result.get("meta", {})
         q = result["indicators"]["quote"][0]
@@ -1204,8 +1208,7 @@ def watch_cycle():
         conf     = result["conf"]
         signal   = result["signal"]
 
-        alert_num = alert_count + 1
-        msg = format_alert(tech, analysis, session, alert_num=alert_num)
+        msg = format_alert(tech, analysis, session)
         send_alert(msg)
         alerts_sent[ticker] = datetime.now()
         # Guardar en predictions para persistir entre reinicios
