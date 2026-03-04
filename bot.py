@@ -925,7 +925,7 @@ def deep_analyze(ticker, name, sector, urgency=0, force=False):
     if not tech:
         print(f"    {ticker}: sin datos técnicos")
         return None
-    if tech["score"] < 2 and not force:
+    if tech["score"] < 5 and not force:
         print(f"    {ticker}: score técnico insuficiente")
         return None
 
@@ -1041,7 +1041,9 @@ CONFIANZA: [X]%
         )
         return {"tech": tech, "analysis": msg.content[0].text.strip(), "conf": 0, "signal": "NEUTRAL"}
     except Exception as e:
+        import traceback
         print(f"    Error análisis manual: {e}")
+        print(traceback.format_exc())
         return None
 
 _processed_msg_ids = set()  # IDs ya procesados en esta sesión
@@ -1128,7 +1130,9 @@ def listen_solicitudes(init=False):
         _last_solicitud_msg = messages[0]["id"]
 
     except Exception as e:
+        import traceback
         print(f"  Solicitud err: {e}")
+        print(traceback.format_exc())
 
 # ═══════════════════════════════════════════════════════
 # CICLO DE VIGILANCIA RÁPIDA (cada 5 min)
@@ -1152,19 +1156,23 @@ def watch_cycle():
 
     session = get_session(now)
     to_analyze = []
+    seen_tickers = set()
 
     # Añadir urgentes que no hayan sido analizados hoy
     for item in urgent:
         ticker = item["ticker"]
+        if ticker in seen_tickers: continue
         last = watch_signals.get(ticker, {}).get("last_analyzed")
         if last:
             last_dt = datetime.fromisoformat(last)
-            if (datetime.now() - last_dt).seconds < 3600: continue  # No re-analizar en menos de 1h
+            if (datetime.now() - last_dt).seconds < 3600: continue
+        seen_tickers.add(ticker)
         to_analyze.append((ticker, item.get("name", ticker), item.get("sector", "Unknown"), item.get("urgency", 0)))
 
     # Añadir acciones con señal en desarrollo
     for ticker in developing:
-        if ticker not in [t[0] for t in to_analyze]:
+        if ticker not in seen_tickers:
+            seen_tickers.add(ticker)
             to_analyze.append((ticker, ticker, "Unknown", 0))
 
     # Añadir acciones del universo que llevan más de 24h sin analizar (rotación)
@@ -1173,7 +1181,8 @@ def watch_cycle():
                     (datetime.now() - datetime.fromisoformat(watch_signals[t].get("last_analyzed", "2000-01-01"))).total_seconds() > 86400]
     sample = random.sample(not_analyzed, min(10, len(not_analyzed)))
     for ticker in sample:
-        if ticker not in [t[0] for t in to_analyze]:
+        if ticker not in seen_tickers:
+            seen_tickers.add(ticker)
             to_analyze.append((ticker, ticker, "Unknown", 0))
 
     if not to_analyze:
@@ -1182,7 +1191,7 @@ def watch_cycle():
     print(f"\n[{now.strftime('%H:%M')} ES] Analizando {len(to_analyze)} acciones en profundidad...")
 
     alert_count = 0
-    for ticker, name, sector, urgency in to_analyze[:8]:  # Max 8 análisis profundos por ciclo
+    for ticker, name, sector, urgency in to_analyze[:4]:  # Max 4 análisis profundos por ciclo
         if already_alerted(ticker): continue
 
         result = deep_analyze(ticker, name, sector, urgency)
