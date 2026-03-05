@@ -75,40 +75,54 @@ ECON_CALENDAR_FILE    = "/app/data/econ_calendar.json"
 # ═══════════════════════════════════════════════════════════════════════
 
 SP500 = [
-    "MMM","ABT","ABBV","ACN","ADBE","AMD","AFL","GOOGL","GOOG","MO","AMZN","AAL","AEP","AXP",
-    "AIG","AMT","AWK","AMGN","APH","ADI","AAPL","AMAT","ANET","T","ADSK","AZO","BKR","BAC",
-    "BK","BAX","BIIB","BLK","BX","BA","BMY","AVGO","CDNS","COF","KMX","CCL","CAT","CBRE",
-    "CNC","SCHW","CHTR","CVX","CMG","CB","CI","CTAS","CSCO","C","CLX","CME","KO","CL","CMCSA",
-    "COP","STZ","CPRT","GLW","COST","CCI","CSX","CMI","CVS","DHI","DHR","DE","DAL","DVN",
-    "DXCM","DLR","DFS","DG","DLTR","D","DOV","DOW","LLY","ETN","EBAY","ECL","EW","EA","ELV",
-    "EMR","ENPH","EOG","EFX","EQIX","EL","ETSY","EXC","EXPE","XOM","FDS","FAST","FRT","FDX",
-    "FIS","FITB","FSLR","FI","FLT","F","FTNT","FCX","GE","GD","GIS","GM","GILD","GS","HAL",
-    "HIG","HCA","HD","HON","HRL","HPQ","HUBB","HUM","IBM","IDXX","ITW","INTC","ICE","INTU",
-    "ISRG","JNJ","JPM","KDP","KEY","KMB","KMI","KLAC","KHC","KR","LHX","LH","LRCX","LIN",
-    "LMT","LOW","LULU","MTB","MPC","MAR","MMC","MAS","MA","MCD","MCK","MDT","MRK","META",
-    "MET","MGM","MCHP","MU","MSFT","MRNA","MDLZ","MNST","MCO","MS","MSI","NDAQ","NTAP",
-    "NFLX","NEE","NKE","NSC","NTRS","NOC","NCLH","NVDA","NXPI","ORLY","OXY","ODFL","ON",
-    "OKE","ORCL","PCAR","PLTR","PH","PAYX","PYPL","PEP","PFE","PM","PSX","PNC","PPG","PPL",
-    "PG","PGR","PLD","PRU","PEG","PSA","QCOM","RTX","O","REGN","RF","RMD","ROK","ROP","ROST",
-    "RCL","SPGI","CRM","SLB","SRE","NOW","SHW","SPG","SJM","SNA","SO","SWK","SBUX","STT",
-    "STLD","SYK","SMCI","SNPS","SYY","TMUS","TROW","TTWO","TGT","TEL","TSLA","TXN","TMO",
-    "TJX","TSCO","TT","TRV","TFC","TSN","USB","UBER","UNP","UAL","UPS","URI","UNH","VLO",
-    "VTR","VRSN","VRSK","VZ","VRTX","VMC","WAB","WBA","WMT","DIS","WM","WAT","WEC","WFC",
-    "WELL","WDC","WY","WHR","WMB","WYNN","XEL","YUM","ZBH","ZTS",
+    "A","AAL","AAPL","ABBV","ABNB","ABT","ACN","ADBE","ADI","ADP","ADSK","AEP","AES","AFL",
+    "AIG","AJG","AKAM","ALB","ALGN","ALL","ALLE","AMAT","AMCR","AMD","AME","AMGN","AMP","AMT",
+    "AMZN","ANET","ANSS","AON","AOS","APD","APH","APO","APTV","ARE","ATO","AVB","AVGO","AVY",
+    "AWK","AXON","AXP","AZO","BA","BAC","BAX","BBY","BDX","BIIB","BK","BKNG","BKR","BLK",
+    "BMY","BR","BSX","BX","BXP","C","CAG","CAH","CARR","CAT","CB","CBRE","CCI","CCL",
+    "CDNS","CDW","CEG","CF","CHRW","CHTR","CI","CINF","CL","CLF","CLX","CMA","CMCSA","CME",
+    "CMG","CMI","CMS","CNC","CNP","COF","COP","COST","CPB","CPRT","CPT","CRM","CSCO","CSGP",
+    "CSX","CTAS","CTSH","CTVA","CVS","CVX","D","DAL","DE","DECK","DFS","DG","DHI","DHR",
+    "DIS","DLR","DLTR","DOV","DOW","DPZ","DRI","DUK","DVA","DVN","DXCM","EA","EBAY","ECL",
+    "ED","EFX","EG","EIX","EL","ELV","EMN","EMR","ENPH","EOG","EQIX","ETN","ETR","ETSY",
+    "EVRG","EW","EXC","EXPE","EXR","F","FANG","FAST","FCX","FDS","FDX","FE","FFIV","FI",
+    "FIS","FITB","FLT","FMC","FOX","FOXA","FRT","FSLR","FTNT","FTV","GD","GE","GEHC","GEN",
+    "GILD","GIS","GL","GLW","GM","GNRC","GOOG","GOOGL","GPC","GPN","GS","GWW","HAL","HAS",
+    "HBAN","HCA","HD","HES","HIG","HII","HOLX","HON","HPE","HPQ","HRL","HSIC","HST","HSY",
+    "HUBB","HUM","HWM","IBM","ICE","IDXX","IEX","IFF","INTC","INTU","IP","IPG","IQV","IR",
+    "IRM","ISRG","ITW","JBHT","JCI","JKHY","JNJ","JPM","K","KDP","KEY","KHC","KIM","KLAC",
+    "KMB","KMI","KMX","KO","KR","KVUE","L","LEN","LH","LHX","LIN","LKQ","LLY","LMT",
+    "LNC","LNT","LOW","LRCX","LULU","LUV","LVS","LW","LYB","LYV","MA","MAR","MAS","MAT",
+    "MCD","MCHP","MCK","MCO","MDLZ","MDT","MET","META","MGM","MKTX","MLM","MMC","MMM","MNST",
+    "MO","MOH","MOS","MPC","MRK","MRNA","MRO","MS","MSFT","MSI","MTB","MTCH","MTD","MU",
+    "NCLH","NDAQ","NEE","NEM","NFLX","NI","NKE","NOC","NOV","NOW","NRG","NSC","NTAP","NTRS",
+    "NUE","NVDA","NVR","NWS","NWSA","NXPI","O","ODFL","OGN","OKE","OMC","ON","ORCL","ORLY",
+    "OTIS","OXY","PARA","PAYC","PAYX","PCAR","PEG","PEP","PFE","PFG","PG","PGR","PH","PKG",
+    "PLD","PLTR","PM","PNC","POOL","PPG","PPL","PRU","PSA","PSX","PTC","PWR","PYPL","QCOM",
+    "RCL","RE","REG","REGN","RF","RHI","RMD","ROK","ROL","ROP","ROST","RPM","RSG","RTX",
+    "SBAC","SBUX","SCHW","SEE","SFM","SHW","SJM","SKX","SLB","SMCI","SNA","SNPS","SNX","SO",
+    "SOLV","SPG","SPGI","SRE","STE","STLD","STT","STX","STZ","SW","SWK","SYF","SYK","SYY",
+    "T","TDG","TDY","TEL","TER","TFC","TFX","TGT","TJX","TMO","TMUS","TRGP","TROW","TRV",
+    "TSCO","TSLA","TSN","TT","TTWO","TXN","TXT","TYL","UAA","UAL","UBER","UDR","UHS","ULTA",
+    "UNH","UNM","UNP","UPS","URI","USB","UTHR","V","VICI","VLO","VMC","VNO","VRSK","VRSN",
+    "VRTX","VTR","VZ","WAB","WAT","WBA","WBD","WDAY","WDC","WEC","WELL","WFC","WHR","WM",
+    "WMB","WMT","WRB","WTW","WY","WYNN","XEL","XOM","XYL","YUM","ZBH","ZBRA","ZION","ZTS",
 ]
 NASDAQ100 = [
-    "ADBE","AMD","ABNB","GOOGL","AMZN","AMGN","AAPL","ARM","ASML","ADSK","BKR","BIIB","BKNG",
-    "AVGO","CDNS","CHTR","CTAS","CSCO","CMCSA","CPRT","COST","CRWD","CSX","DDOG","DXCM","DLTR",
-    "EA","ENPH","EXC","FAST","FTNT","GILD","HON","IDXX","INTC","INTU","ISRG","KDP","KLAC",
-    "LRCX","LULU","MAR","MRVL","MELI","META","MCHP","MU","MSFT","MRNA","MDLZ","MDB","MNST",
-    "NFLX","NVDA","NXPI","ORLY","ODFL","ON","PCAR","PANW","PAYX","PYPL","QCOM","REGN","ROP",
-    "ROST","SBUX","SNPS","TTWO","TMUS","TSLA","TXN","VRSK","VRTX","WBA","WDAY","XEL","ZS","ZM",
+    "AAPL","ABNB","ADBE","ADP","ADSK","AMAT","AMD","AMGN","AMZN","ANSS","ARM","ASML","AVGO","AXON",
+    "BIIB","BKNG","BKR","CDNS","CEG","CHTR","CMCSA","COST","CPRT","CRWD","CSCO","CSGP","CSX","CTAS",
+    "CTSH","DDOG","DLTR","DXCM","EA","ENPH","EXC","FANG","FAST","FTNT","GEHC","GFS","GILD","GOOGL",
+    "HON","IDXX","ILMN","INTC","INTU","ISRG","KDP","KLAC","LRCX","LULU","MAR","MCHP","MDB","MDLZ",
+    "MELI","META","MNST","MRNA","MRVL","MSFT","MSTR","MU","NDAQ","NFLX","NVDA","NXPI","ODFL","ON",
+    "ORLY","PANW","PAYX","PCAR","PDD","PYPL","PZZA","QCOM","REGN","ROP","ROST","SBUX","SIRI","SNPS",
+    "TEAM","TMUS","TSLA","TTD","TTWO","TXN","VRSK","VRTX","WBA","WDAY","XEL","ZM","ZS",
 ]
 EXTRAS = [
-    "SOFI","RIVN","COIN","MSTR","HOOD","RBLX","SNAP","LYFT","SHOP","SQ","ROKU","SPOT","NET",
-    "PANW","SMCI","GME","MARA","RIOT","CLSK","LCID","NKLA","AFRM","UPST","DKNG","CHWY","BYND",
-    "NIO","XPEV","LI","GRAB","SEA","BIDU","RKT","RELY","STNE","IREN","PINS","CCL","NCLH",
-    "RCL","DAL","AAL","UAL","ASTS","GTLB","PLTR","DKNG",
+    "AAL","ACHR","AFRM","ASTS","BBAI","BIDU","BROS","BYND","CAVA","CCL","CELH","CHWY","CLSK","COIN",
+    "DAL","DKNG","DUOL","ELF","GME","GRAB","GTLB","HOOD","IREN","JOBY","LCID","LI","LUNR","LYFT",
+    "MARA","MSTR","NCLH","NET","NIO","NKLA","ONON","OPEN","PANW","PINS","PLTR","RBLX","RCL","RDDT",
+    "RELY","RIOT","RIVN","RKLB","RKT","ROKU","SEA","SHOP","SMCI","SNAP","SOFI","SOUN","SPOT","SQ",
+    "STNE","UAL","UPST","XPEV",
 ]
 RUSSELL2000 = [
     "ACLS","ACMR","AEHR","AEIS","AEYE","AFCG","AGIO","AGYS","AHCO","AHPI","AIOT","AIXI",
@@ -1312,8 +1326,8 @@ def _yahoo_get(session, host, ticker, interval, range_, hdrs):
             headers=hdrs, timeout=15,
         )
         if r.status_code == 429:
-            print(f"    {ticker}: Yahoo 429 ({interval}) — esperando 5s")
-            time.sleep(5)
+            print(f"    {ticker}: Yahoo 429 ({interval}) — esperando 8s")
+            time.sleep(8)
             return None, 429
         if r.status_code != 200:
             return None, r.status_code
@@ -1335,7 +1349,7 @@ def get_market_data(ticker):
             "User-Agent": ua, "Accept": "application/json",
             "Referer": f"https://finance.yahoo.com/quote/{ticker}/",
         }
-        host = random.choice(["query1", "query2"])
+        host = random.choice(["query1", "query2", "query2"])
         s    = requests.Session()
         try:
             s.get(f"https://finance.yahoo.com/quote/{ticker}/", headers=hdrs, timeout=8)
@@ -1457,7 +1471,7 @@ def get_market_data(ticker):
         # ── Semanal ───────────────────────────────────────────────────
         weekly_trend = "N/D"
         closes_w     = []
-        time.sleep(0.8)
+        time.sleep(1.2)
         data_w, _ = _yahoo_get(s, host, ticker, "1wk", "1y", hdrs)
         if data_w:
             try:
@@ -1468,7 +1482,7 @@ def get_market_data(ticker):
 
         # ── Mensual ───────────────────────────────────────────────────
         monthly_trend = "N/D"
-        time.sleep(0.8)
+        time.sleep(1.2)
         data_m, _ = _yahoo_get(s, host, ticker, "1mo", "3y", hdrs)
         if data_m:
             try:
@@ -2382,7 +2396,7 @@ def watch_cycle():
 
         nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
         print(f"    → Alerta: {ticker} {nivel} ({signal}, {conf}%, {signal_type})")
-        time.sleep(4)
+        time.sleep(6)
 
     if alerts_this_cycle > 0:
         print(f"  {alerts_this_cycle} alerta(s) este ciclo")
