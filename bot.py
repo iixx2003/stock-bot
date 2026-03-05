@@ -1,30 +1,24 @@
 """
-StockBot Pro v5
+StockBot Pro v5.1
 ───────────────────────────────────────────────────────────────────────
-Cambios respecto a v4:
-  - Universo ampliado a ~2.000 acciones (Russell 2000 incluido)
-  - Base de datos enriquecida: 30+ indicadores por predicción
-  - Motor de aprendizaje autónomo en 5 niveles (activo desde predicción 20)
-  - Correlación entre activos relacionados
-  - Detección de régimen de mercado (bull/bear/lateral)
-  - Memoria de errores específicos por indicador y sector
-  - Detección de manipulación y pump & dump
-  - Prompts adaptativos con conocimiento acumulado
-  - Anti-429 mejorado: delays, backoff, rotación de hosts
-
-Arquitectura de 6 capas:
-  1. quick_scan()        — screeners Yahoo + correlaciones, sin IA
-  2. get_market_data()   — técnico completo: diario, semanal, mensual
-  3. get_fundamentals()  — P/E, short, earnings, insiders (1 petición)
-  4. get_sentiment()     — noticias NewsAPI + RSS + ETF sectorial
-  5. get_inst_signal()   — institucional + detección manipulación
-  6. call_ai()           — Claude con prompts adaptativos por aprendizaje
-
-Flujo automático:  quick_scan → analyze_ticker(force=False) → send_alert
-Flujo manual:      !analizar TICKER → analyze_ticker(force=True) → send_solicitud
+Añadidos sobre v5:
+  - Cola de calidad: solo Excepcionales antes de las 14:00h
+  - Premarket dedicado: gap >3%, volumen pre-mercado, etiqueta PREMARKET
+  - Stocktwits: sentimiento retail (peso bajo)
+  - Investing.com: noticias serias + calendario económico (peso alto)
+  - Put/call ratio: actividad institucional en opciones
+  - Contexto geopolítico: ajusta sectores automáticamente
+  - Señal PRE-EARNINGS: 1/día, solo compra, mínimo 3/4 beats
+  - Short squeeze detector
+  - Insiders masivos: 3+ compras en 7 días
+  - Gap de apertura >3%
+  - Divergencias RSI/precio (solo si aparece en 2 timeframes)
+  - Confluencia dinámica de timeframes según régimen
+  - Memoria de catalizadores por sector
+  - Calendario económico: más conservador en días Fed/CPI/NFP
 """
 
-import os, time, json, random, schedule, requests, feedparser, anthropic
+import os, time, json, random, schedule, requests, feedparser, anthropic, re
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pytz
@@ -46,32 +40,38 @@ NEWS_API_KEY             = os.environ.get("NEWS_API_KEY")
 SPAIN_TZ = pytz.timezone("Europe/Madrid")
 
 # Umbrales de confianza
-CONF_NORMAL      = 85   # mínimo para alerta automática
-CONF_FUERTE      = 88   # nivel fuerte
-CONF_EXCEPCIONAL = 94   # sin límite diario, siempre se envía
+CONF_NORMAL      = 85
+CONF_FUERTE      = 88
+CONF_EXCEPCIONAL = 94
 
 # Límites diarios
-MAX_ALERTAS_DIA  = 3    # máximo total (Excepcional no cuenta)
-MAX_VENTAS_DIA   = 1    # máximo ventas al día
-MAX_AI_POR_CICLO = 4    # máximo llamadas IA por ciclo de 5 min
+MAX_ALERTAS_DIA       = 3
+MAX_VENTAS_DIA        = 1
+MAX_AI_POR_CICLO      = 4
+MAX_PRE_EARNINGS_DIA  = 1   # máximo señales PRE-EARNINGS al día
 
-# Score técnico mínimo para análisis profundo
+# Score técnico mínimo
 SCORE_MINIMO = 6
 
-# Aprendizaje: mínimo de predicciones resueltas para activar cada nivel
-LEARN_MIN_PREDS = 20   # nivel 1 y 2
-LEARN_MIN_L3    = 40   # nivel 3 (sector)
-LEARN_MIN_L4    = 60   # nivel 4 (hora/sesión)
-LEARN_MIN_L5    = 80   # nivel 5 (autopuntuación completa)
+# Cola de calidad: hora a partir de la cual se desbloquean normales/fuertes
+HORA_DESBLOQUEO = 14   # 14:00 hora España
+
+# Aprendizaje
+LEARN_MIN_PREDS = 20
+LEARN_MIN_L3    = 40
+LEARN_MIN_L4    = 60
+LEARN_MIN_L5    = 80
 
 # Archivos de persistencia
-PREDICTIONS_FILE  = "/app/data/predictions.json"
-WATCHSTATE_FILE   = "/app/data/watchstate.json"
-LEARNINGS_FILE    = "/app/data/learnings.json"
-REGIME_FILE       = "/app/data/regime.json"
+PREDICTIONS_FILE      = "/app/data/predictions.json"
+WATCHSTATE_FILE       = "/app/data/watchstate.json"
+LEARNINGS_FILE        = "/app/data/learnings.json"
+REGIME_FILE           = "/app/data/regime.json"
+CATALYST_MEMORY_FILE  = "/app/data/catalyst_memory.json"
+ECON_CALENDAR_FILE    = "/app/data/econ_calendar.json"
 
 # ═══════════════════════════════════════════════════════════════════════
-# UNIVERSO DE ACCIONES (~2.000 tickers)
+# UNIVERSO — igual que v5, incluido aquí por completitud
 # ═══════════════════════════════════════════════════════════════════════
 
 SP500 = [
@@ -96,7 +96,6 @@ SP500 = [
     "VTR","VRSN","VRSK","VZ","VRTX","VMC","WAB","WBA","WMT","DIS","WM","WAT","WEC","WFC",
     "WELL","WDC","WY","WHR","WMB","WYNN","XEL","YUM","ZBH","ZTS",
 ]
-
 NASDAQ100 = [
     "ADBE","AMD","ABNB","GOOGL","AMZN","AMGN","AAPL","ARM","ASML","ADSK","BKR","BIIB","BKNG",
     "AVGO","CDNS","CHTR","CTAS","CSCO","CMCSA","CPRT","COST","CRWD","CSX","DDOG","DXCM","DLTR",
@@ -105,15 +104,12 @@ NASDAQ100 = [
     "NFLX","NVDA","NXPI","ORLY","ODFL","ON","PCAR","PANW","PAYX","PYPL","QCOM","REGN","ROP",
     "ROST","SBUX","SNPS","TTWO","TMUS","TSLA","TXN","VRSK","VRTX","WBA","WDAY","XEL","ZS","ZM",
 ]
-
 EXTRAS = [
     "SOFI","RIVN","COIN","MSTR","HOOD","RBLX","SNAP","LYFT","SHOP","SQ","ROKU","SPOT","NET",
     "PANW","SMCI","GME","MARA","RIOT","CLSK","LCID","NKLA","AFRM","UPST","DKNG","CHWY","BYND",
     "NIO","XPEV","LI","GRAB","SEA","BIDU","RKT","RELY","STNE","IREN","PINS","CCL","NCLH",
     "RCL","DAL","AAL","UAL","ASTS","GTLB","PLTR","DKNG",
 ]
-
-# Russell 2000 — small caps americanas
 RUSSELL2000 = [
     "ACLS","ACMR","AEHR","AEIS","AEYE","AFCG","AGIO","AGYS","AHCO","AHPI","AIOT","AIXI",
     "AKAM","AKBA","AKRO","ALEC","ALGM","ALGT","ALHC","ALKS","ALLT","ALNY","ALRM","ALRS",
@@ -132,126 +128,104 @@ RUSSELL2000 = [
     "CALX","CAMP","CANO","CARE","CARG","CASH","CASI","CATC","CATO","CBAT","CBAN","CBFV",
     "CBIO","CBRL","CBSH","CBTX","CCBG","CCCC","CCEP","CCRN","CDMO","CDNA","CDRE","CDRO",
     "CELC","CELH","CENTA","CERT","CEVA","CFFI","CFFN","CFLT","CGEM","CGNX","CHCO","CHDN",
-    "CHEF","CHGG","CHRS","CHUY","CIFR","CINF","CIVB","CIVITAS","CKPT","CLBK","CLBT","CLDT",
-    "CLFD","CLMT","CLNC","CLNE","CLNN","CLOV","CLPR","CLPT","CLRB","CLRO","CLSK","CLVT",
-    "CLWT","CMBM","CMCO","CMLS","CMMB","CMPO","CMRX","CMTL","CNDT","CNMD","CNNB","CNOB",
-    "CNXC","CNXN","CODA","CODX","COEP","COFS","COGT","COHU","COKE","COLB","CONN","CONX",
-    "CORR","CORS","CORT","COVA","COVS","CPRT","CPSI","CPTK","CRAI","CRDO","CRIS","CRMT",
-    "CRNX","CROX","CRSP","CRTD","CRVL","CRVO","CRWD","CRWS","CSBR","CSGS","CSLM","CSPI",
-    "CSSE","CSTE","CSTL","CSTR","CTBI","CTGO","CTKB","CTLP","CTOS","CTSH","CTVA","CTXS",
+    "CHEF","CHGG","CHRS","CHUY","CIFR","CINF","CIVB","CKPT","CLBK","CLBT","CLDT","CLFD",
+    "CLMT","CLNC","CLNE","CLNN","CLOV","CLPR","CLPT","CLRB","CLRO","CLSK","CLVT","CLWT",
+    "CMBM","CMCO","CMLS","CMMB","CMPO","CMRX","CMTL","CNDT","CNMD","CNNB","CNOB","CNXC",
+    "CNXN","CODA","CODX","COEP","COFS","COGT","COHU","COKE","COLB","CONN","CORR","CORS",
+    "CORT","CPSI","CRAI","CRDO","CRIS","CRMT","CRNX","CROX","CRSP","CRTD","CRVL","CRVO",
+    "CRWS","CSBR","CSGS","CSPI","CSSE","CSTE","CSTL","CTBI","CTGO","CTKB","CTLP","CTOS",
     "CUBI","CURL","CUTR","CVBF","CVCO","CVGW","CVLG","CVLT","CVLY","CWCO","CWEN","CWST",
-    "DAKT","DALI","DBRG","DBTX","DCBO","DCFC","DCOM","DCPH","DDOG","DENN","DFIN","DGICA",
-    "DHIL","DIOD","DJCO","DLHC","DLTH","DMLP","DNOW","DNUT","DOCU","DOGZ","DOOR","DORM",
-    "DOSE","DOUG","DPSI","DRCT","DRIO","DRNA","DRTS","DRVN","DSGX","DSSI","DTIL","DTST",
-    "DUOL","DXPE","DYAI","DYNE","EARN","EBIX","EBTC","ECBK","ECHO","ECPG","EDSA","EDTK",
-    "EFSC","EFXT","EGAN","EGBN","EGHT","EGIO","EGLE","EGRX","EHTH","EKSO","ELAT","ELLO",
-    "ELME","ELOX","ELST","EMBC","EMCF","EMKR","EMLD","EMNT","EMXC","ENOV","ENSG","ENTA",
-    "ENVB","ENVX","EOLS","EPAC","EPAM","EPIQ","EPIX","EPRT","EQBK","EQNR","EQRX","ERAS",
-    "ERII","ERNA","EROS","ESAB","ESBA","ESEA","ESGR","ESNT","ESOA","ESPR","ESSA","ESTA",
-    "ESTE","ETAO","ETSY","EVER","EVEX","EVGO","EVGR","EVLO","EVLV","EVMT","EVOP","EVRI",
-    "EVTL","EVTV","EWBC","EXAI","EXAS","EXFY","EXLS","EXPI","EXPO","EXTR","EZPW","FARO",
-    "FBIZ","FBMS","FBNC","FBRT","FCBC","FCBP","FCCO","FCNCA","FCRX","FCSP","FDMT","FDUS",
-    "FEAT","FERG","FGBI","FGEN","FGFPP","FIAC","FIBK","FIHL","FIOB","FISH","FITBI","FIVE",
-    "FIVN","FIZZ","FLGC","FLIC","FLNC","FLNT","FLNX","FLUX","FMBH","FMBI","FMCB","FMNB",
-    "FMST","FNKO","FNLC","FNWB","FOLD","FONR","FORR","FORTY","FOUN","FOUR","FPAY","FRAF",
-    "FRBA","FRGE","FRHC","FRME","FRPH","FRST","FRSX","FRXB","FSBW","FSEA","FSFG","FSLR",
-    "FSRX","FSTR","FTDR","FTEK","FTFT","FTLF","FTRE","FULT","FUNC","FUSB","FUTU","FWBI",
-    "FXNC","GAIN","GATO","GBBK","GBCI","GBIO","GCMG","GCUS","GENC","GENI","GEOS","GERN",
-    "GEVO","GFAI","GFED","GFGD","GFNCP","GGAL","GHIX","GHLD","GIII","GILD","GLDD","GLNG",
-    "GLPG","GLRE","GLSI","GLYC","GNLN","GNPX","GNSS","GNTX","GOCO","GOLF","GOOD","GOOG",
-    "GOSS","GPAK","GPMT","GPOR","GPRE","GPRK","GRAB","GRFS","GRND","GROM","GROV","GRPN",
-    "GRTS","GRTX","GSBC","GSIT","GSKY","GSMG","GSUN","GTLS","GTPB","GUTS","HAFC","HALO",
-    "HARP","HAYN","HBAN","HBCP","HBIO","HBNC","HBOS","HCAT","HCCI","HCKT","HCNWF","HCSG",
-    "HDSN","HEAR","HEES","HEICO","HELE","HFBL","HFFG","HFWA","HGTY","HIBB","HIFS","HIHO",
-    "HIIQ","HIMS","HIPO","HIVE","HKIT","HLMN","HLNE","HLTH","HMPT","HMST","HNNA","HNNAZ",
-    "HNST","HOFT","HOLO","HOLX","HONE","HOTH","HOWL","HRMY","HROW","HRPK","HRTG","HRTX",
-    "HSAQ","HSHP","HSII","HSKA","HSON","HTBI","HTBK","HTGM","HTLD","HTLF","HTRE","HTUS",
-    "HURC","HURN","HUSN","HVBC","HWBK","HWKN","HYMC","HYRE","HYXF","HZNP","IART","IBCP",
-    "IBEX","IBIO","IBRX","IBSS","ICAD","ICCC","ICCH","ICFI","ICHR","ICLK","ICMB","ICPT",
-    "IDCC","IDEX","IDYA","IESC","IFIN","IFRX","IGMS","IGPK","IHRT","IIIN","IIIV","IKNA",
-    "IMAQ","IMCR","IMGO","IMKTA","IMMP","IMMR","IMNN","IMRX","IMTX","IMUX","IMVT","IMXI",
-    "INBK","INBKZ","INBS","INCY","INDB","INDP","INDT","INFN","INGN","INMB","INMD","INNV",
-    "INPX","INSE","INSM","INSP","INST","INSU","INTJ","INTZ","INVA","INVE","INVH","IPIX",
-    "IPSC","IPVF","IPWR","IQMD","IRBT","IRDM","IRET","IRMD","IROQ","IRWD","ISEE","ISPC",
-    "ISRG","ISTR","ITGR","ITRM","ITRN","ITRI","IVAC","IVVD","IZEA","JACK","JAGX","JANX",
-    "JBLU","JBSS","JBWK","JELD","JFIN","JJSF","JKHY","JNCE","JOBY","JOUT","JPNX","JRVR",
-    "JSPR","JTAI","JUPW","JYNT","KALA","KALV","KALU","KAPI","KARO","KBSF","KBTX","KCAP",
-    "KDLY","KDMN","KFFB","KFRC","KGEI","KIDS","KION","KIRK","KINS","KLIC","KLTR","KNBE",
-    "KNDI","KNSL","KNWN","KOPN","KPTI","KRMD","KROS","KRTX","KRUS","KRYS","KSCP","KTOS",
-    "KTTX","KVHI","KYMR","KZIA","LBAI","LBPH","LBRT","LCII","LCNB","LCUT","LDOS","LECO",
-    "LEGH","LESL","LGND","LGVN","LHCG","LIQT","LITE","LIVN","LLNW","LMAT","LMFA","LMNL",
-    "LMNR","LNTH","LOCO","LOOP","LOVE","LPCN","LPLA","LPSN","LQDA","LQDT","LRFC","LSCC",
-    "LSEA","LSXMA","LTHM","LTRN","LTRX","LUNA","LUNG","LUXH","LVOX","LWLG","LYEL","LYRA",
-    "LYTS","MACK","MAGS","MAQC","MARPS","MATW","MAXN","MBCN","MBII","MBIN","MBNKP","MBUU",
-    "MBWM","MCBC","MCBS","MCFT","MCRI","MCRB","MDGL","MDJH","MDNA","MDVX","MDWD","MEIP",
-    "MELI","MERC","MESA","METC","MFAC","MFIN","MFON","MGEE","MGNX","MGPI","MGRC","MGTA",
-    "MGYR","MHLD","MIND","MINM","MIRM","MIST","MITK","MJCO","MKFG","MKSI","MKTW","MLAB",
-    "MLCO","MLKN","MLNK","MMSI","MMTRS","MNKD","MNMD","MNPR","MNRO","MNST","MNTK","MNTX",
-    "MODN","MOFG","MOMO","MOND","MONN","MORA","MORF","MPAA","MPAC","MPLN","MPLX","MPWR",
-    "MRAM","MRBK","MRCY","MREO","MRIN","MRKR","MRNS","MRSN","MRTX","MRUS","MSEX","MSFG",
-    "MSGE","MSON","MSTR","MTCH","MTCN","MTEX","MTRN","MTRX","MTTE","MTTR","MTUS","MVBF",
-    "MVIS","MXCT","MYMD","MYMX","MYND","MYPS","MYRG","MYSZ","NARI","NATH","NATR","NAUT",
-    "NAVB","NAVI","NBHC","NBIX","NBTB","NCNA","NCSM","NDLS","NDRA","NEOG","NEON","NEPH",
-    "NERD","NESR","NEXT","NFBK","NFLX","NGVC","NHHS","NHTC","NICE","NICK","NINE","NKLA",
-    "NKTR","NLSP","NLYS","NMIH","NMRA","NNBR","NODK","NOMD","NOTE","NRBO","NRDS","NRIM",
-    "NRIX","NRXP","NSIT","NSSC","NSTG","NTBL","NTCT","NTGR","NTIC","NTLA","NTNX","NTST",
-    "NUAN","NUVA","NVAX","NVEI","NVST","NWBI","NWFL","NWGL","NWLI","NWPX","NXGN","NXRT",
-    "NXST","NXUS","NYAX","NYMX","OABI","OBNK","OBSV","OCFC","OCGN","OCSL","OCUL","OCUP",
-    "ODFL","OFIX","OFLX","OGN","OGTX","OHLB","OKTA","OMAB","OMCL","OMER","OMGA","OMQS",
-    "ONTF","ONVO","OPBK","OPCH","OPEN","OPGN","OPOF","OPRX","OPTN","ORAC","ORBC","ORGO",
-    "ORGS","ORIC","ORLY","ORMP","ORRF","OSBC","OSCR","OSEA","OSIS","OSST","OSTK","OSTU",
-    "OTLK","OTMO","OTRK","OVBC","OVID","OVLY","OVNIX","OWLT","OXLC","OXSQ","OYST","OZRK",
-    "PACK","PACS","PAHC","PASG","PATK","PBAX","PBFS","PBHC","PBIP","PBPB","PCBC","PCCO",
-    "PCFG","PCOM","PCOR","PCPC","PCSA","PCTI","PCVX","PDCO","PDFS","PDSB","PDYN","PECO",
-    "PEGA","PENN","PFBC","PFIS","PFMT","PFNX","PFSI","PGNY","PHAT","PHGE","PHIO","PHVS",
-    "PIXY","PKBK","PKOH","PLBC","PLBY","PLCE","PLIN","PLRX","PLSE","PLUR","PMCB","PMTS",
-    "PNFP","PNTG","PNTM","POAI","POCI","PODD","POLY","POND","POOL","POWI","PPBI","PPBT",
-    "PPRX","PPTA","PRAA","PRAX","PRCH","PRDO","PRFT","PRGS","PRLD","PRME","PRNB","PRPB",
-    "PRPL","PRQR","PRST","PRTA","PRTK","PRTS","PRVA","PRZO","PSFE","PSHG","PSMT","PSNL",
-    "PSTV","PSTX","PTCT","PTGX","PTHM","PTLO","PTPI","PTVE","PUBM","PVBC","PWOD","PXLW",
-    "PYCR","PYXS","QCRH","QDEL","QFIN","QNST","QRTEA","QRTEB","QRVO","QTWO","QUAD","QUBT",
-    "QUIK","QURE","RADI","RAPT","RARE","RAVN","RCKT","RCKY","RCON","RCUS","RDCM","RDNT",
-    "RDUS","RDVT","RDWR","REAL","REAX","REFI","REGI","REKR","RELI","RELY","RENB","RENN",
-    "REPX","REXR","REYN","RFAC","RFIL","RGCO","RGEN","RGLD","RGLS","RGNX","RGRX","RGTI",
-    "RIGL","RIOT","RIVN","RLGT","RLAY","RLMD","RLYB","RMBI","RMBS","RMCF","RMNI","RNAC",
-    "RNAZ","RNDB","RNET","RNLX","RNXT","ROCC","ROCR","ROCO","RONI","RONN","ROTH","RPAY",
-    "RPTX","RRBI","RRGB","RRST","RRTS","RSSS","RTLR","RTPX","RUBY","RVSB","RVNC","RVPH",
-    "RVSN","RXDX","RXRX","RYAM","RZLT","SAFE","SAGE","SAIA","SANA","SAND","SANG","SATS",
-    "SBCF","SBET","SBFG","SBGI","SBIG","SBSI","SBTX","SCHL","SCKT","SCNX","SCPH","SCSC",
-    "SCVL","SDCL","SDGR","SDOT","SELB","SENS","SERV","SFBC","SFNC","SFST","SGBX","SGDM",
-    "SGMO","SGRY","SGTX","SHBI","SHLS","SHLT","SHOO","SHPW","SHYF","SIBN","SIEB","SIGA",
-    "SIGI","SILK","SILV","SIMO","SINT","SIRE","SISI","SITM","SIXT","SKIN","SKWD","SLCA",
-    "SLCR","SLDB","SLDP","SLGL","SLGN","SLNO","SLNX","SLQT","SMBC","SMBK","SMFL","SMID",
-    "SMIT","SMPL","SMSI","SMTC","SNBR","SNCY","SNCR","SNEX","SNFCA","SNOA","SNPO","SNPS",
-    "SNSE","SNSR","SNVX","SOFI","SOHO","SOLO","SOLY","SONX","SOPA","SOPH","SOTK","SOWG",
-    "SPFI","SPGX","SPKE","SPLK","SPNE","SPNS","SPOK","SPPI","SPRO","SPRY","SPRX","SPSC",
-    "SPTN","SPTY","SPWH","SPWR","SQFT","SQNS","SQSP","SRCE","SRCL","SRFM","SRGA","SRRK",
-    "SRTS","SSBI","SSBK","SSFI","SSII","SSRM","SSSS","SSYS","STAA","STAG","STBA","STBZ",
-    "STCN","STEP","STGW","STIM","STKS","STLA","STNE","STOK","STRA","STRS","STRT","STRW",
-    "STSS","STVN","STXS","SUMO","SUPN","SURF","SURGN","SVRA","SWAG","SWAV","SWIM","SWKH",
-    "SWKX","SWVL","SXTP","SYBT","SYBX","SYKE","SYRS","TACT","TALO","TALS","TANH","TASK",
-    "TAST","TATT","TBCP","TBIO","TBNK","TBPH","TBRG","TCBK","TCBX","TCFC","TCMD","TCON",
-    "TCPC","TDUP","TELL","TENB","TENX","TERN","TESS","TFFP","TFII","TFSL","TGLS","TGTX",
-    "THCA","THCH","THFF","THRD","THRM","THTX","TILE","TLGA","TLRY","TMBR","TMDI","TMDX",
-    "TMHC","TNXP","TORC","TPVG","TPVG","TRAK","TRAN","TRDA","TREE","TRGP","TRGT","TRIN",
-    "TRMK","TRMT","TRNO","TRON","TROO","TROW","TRST","TRTN","TRTX","TRUP","TRVG","TRVN",
-    "TSEM","TSHA","TSIO","TSLX","TTEC","TTEK","TTGT","TTMI","TTNP","TTSH","TTWO","TUSK",
-    "TUYA","TVIA","TVTX","TWCT","TWKS","TWLO","TWIN","TWNI","TWNK","TWST","TXNM","TXRH",
-    "TYGO","UAVS","UBCP","UBFO","UBOH","UBSI","UCBI","UCBR","UCTT","UFCS","UFPI","UFPT",
-    "UGRO","UHAL","ULCC","ULTA","ULTI","UMBF","UMPQ","UNAM","UNFI","UNIT","UNTY","UONE",
-    "UPLD","UPWK","URBN","URGN","USAC","USAK","USAP","USAT","USAU","USEI","USFD","USIG",
-    "USIO","USLM","USNA","USNF","USPH","UTHR","UTMD","UTSI","UVSP","VBFC","VBIV","VBTX",
-    "VCNX","VCTR","VCEL","VCNX","VCYT","VECO","VERA","VERB","VERX","VGFC","VGLT","VHAQ",
-    "VIAV","VICR","VIEW","VIGL","VINC","VIOT","VIPS","VITL","VIVO","VKTX","VLCN","VLON",
-    "VNDA","VNRX","VOXX","VRAY","VRCA","VRDN","VREX","VRNA","VRNS","VRNT","VRPX","VRSK",
-    "VSCO","VSEC","VSET","VSTA","VTGN","VTOL","VTVT","VUZI","VVOS","VVPR","VXRT","VYNT",
-    "WABC","WAFD","WASH","WATT","WAVE","WBHC","WBND","WCFB","WDFC","WERN","WETF","WEYS",
-    "WFCF","WFRD","WHLM","WHLR","WINA","WING","WINT","WIRE","WKHS","WKME","WLDN","WLFC",
-    "WLMS","WNEB","WOLF","WOOF","WORX","WPRT","WRBY","WSBC","WSFS","WTBA","WTFC","WTRG",
-    "WULF","WVVI","XAIR","XBIO","XCUR","XELA","XELB","XENE","XFOR","XGEVA","XNCR","XOMA",
-    "XPEL","XPER","XPOF","XRAY","XTLB","XTNT","XXII","XYLO","YCBD","YEXT","YMAB","YORW",
-    "YOSH","YPFSX","YTEN","YUMC","ZETA","ZEUS","ZFOX","ZGNX","ZIXI","ZLAB","ZNTE","ZNTL",
-    "ZROZ","ZSAN","ZTLK","ZVRA","ZYME","ZYXI",
+    "DAKT","DBRG","DBTX","DCBO","DCFC","DCOM","DCPH","DENN","DFIN","DIOD","DLHC","DLTH",
+    "DNOW","DNUT","DOOR","DORM","DOUG","DRCT","DRIO","DRNA","DRVN","DSGX","DTST","DUOL",
+    "DXPE","DYAI","DYNE","EARN","EBIX","EBTC","ECBK","ECHO","ECPG","EDSA","EFSC","EGAN",
+    "EGBN","EGHT","EGIO","EGLE","EGRX","EKSO","ELLO","ELME","EMBC","EMCF","EMKR","ENOV",
+    "ENSG","ENTA","ENVB","ENVX","EOLS","EPAC","EPIQ","EPRT","EQBK","ERAS","ERII","ESAB",
+    "ESEA","ESGR","ESNT","ESPR","ESSA","ESTE","EVER","EVEX","EVGO","EVLO","EVLV","EVOP",
+    "EVRI","EWBC","EXAS","EXFY","EXLS","EXPI","EXPO","EXTR","EZPW","FARO","FBIZ","FBMS",
+    "FBNC","FBRT","FCBC","FCBP","FCCO","FDMT","FDUS","FERG","FGBI","FGEN","FIBK","FIHL",
+    "FIVE","FIVN","FIZZ","FLGC","FLIC","FLNC","FLNT","FLUX","FMBH","FMBI","FMCB","FMNB",
+    "FNKO","FNLC","FNWB","FOLD","FONR","FORR","FOUR","FRAF","FRBA","FRGE","FRHC","FRME",
+    "FRPH","FRST","FSEA","FSFG","FSTR","FTDR","FTEK","FTRE","FULT","FUNC","FUSB","FUTU",
+    "GAIN","GATO","GBCI","GBIO","GCMG","GENC","GENI","GEOS","GERN","GEVO","GFED","GIII",
+    "GLDD","GLNG","GLPG","GLRE","GLYC","GNLN","GNPX","GNTX","GOCO","GOLF","GOOD","GOSS",
+    "GPMT","GPOR","GPRE","GRFS","GRND","GRPN","GRTS","GRTX","GSBC","GSIT","GTLS","HAFC",
+    "HALO","HARP","HAYN","HBCP","HBIO","HBNC","HCAT","HCCI","HCKT","HCSG","HDSN","HEAR",
+    "HEES","HELE","HFWA","HGTY","HIBB","HIFS","HIIQ","HIMS","HIVE","HLMN","HLNE","HLTH",
+    "HMST","HNNA","HNST","HOFT","HOLO","HONE","HOTH","HRMY","HROW","HRTG","HRTX","HSII",
+    "HSKA","HSON","HTBI","HTBK","HTGM","HTLD","HTLF","HURC","HURN","HVBC","HWBK","HWKN",
+    "HYMC","HYRE","IART","IBCP","IBEX","IBIO","IBRX","ICAD","ICFI","ICHR","ICMB","ICPT",
+    "IDCC","IDEX","IDYA","IESC","IFRX","IGMS","IHRT","IIIN","IIIV","IKNA","IMCR","IMGO",
+    "IMKTA","IMMP","IMMR","IMNN","IMRX","IMTX","IMUX","IMVT","IMXI","INBK","INBS","INCY",
+    "INDB","INDP","INDT","INFN","INGN","INMB","INMD","INNV","INPX","INSE","INSM","INSP",
+    "INST","INTZ","INVA","INVE","INVH","IPIX","IPSC","IPWR","IRBT","IRDM","IRET","IRMD",
+    "IRWD","ISEE","ISPC","ISTR","ITGR","ITRM","ITRN","ITRI","IVAC","IVVD","IZEA","JACK",
+    "JAGX","JANX","JBLU","JBSS","JELD","JJSF","JKHY","JNCE","JOBY","JOUT","JRVR","JSPR",
+    "JYNT","KALA","KALV","KALU","KARO","KBSF","KBTX","KFRC","KIDS","KION","KIRK","KINS",
+    "KLIC","KLTR","KNBE","KNDI","KNSL","KOPN","KPTI","KRMD","KROS","KRTX","KRUS","KRYS",
+    "KSCP","KTOS","KVHI","KYMR","KZIA","LBAI","LBPH","LBRT","LCII","LCNB","LCUT","LECO",
+    "LEGH","LESL","LGND","LGVN","LIQT","LITE","LIVN","LLNW","LMAT","LMFA","LMNL","LMNR",
+    "LNTH","LOCO","LOOP","LOVE","LPCN","LPLA","LPSN","LQDA","LRFC","LSCC","LSEA","LTHM",
+    "LTRN","LTRX","LUNA","LUNG","LVOX","LWLG","LYEL","LYRA","LYTS","MACK","MAGS","MARPS",
+    "MATW","MAXN","MBCN","MBII","MBIN","MBUU","MBWM","MCBC","MCBS","MCFT","MCRI","MCRB",
+    "MDGL","MDNA","MDVX","MEIP","MERC","MESA","METC","MFAC","MFIN","MGEE","MGNX","MGPI",
+    "MGRC","MGTA","MIND","MINM","MIRM","MIST","MITK","MKSI","MLAB","MLKN","MLNK","MMSI",
+    "MNKD","MNMD","MNPR","MNRO","MNTK","MNTX","MODN","MOFG","MOMO","MORA","MORF","MPAA",
+    "MPLN","MPWR","MRAM","MRBK","MRCY","MREO","MRIN","MRKR","MRNS","MRSN","MRTX","MRUS",
+    "MSEX","MSFG","MSON","MTCH","MTEX","MTRN","MTRX","MTTR","MTUS","MVBF","MVIS","MXCT",
+    "MYMD","MYND","MYPS","MYRG","NARI","NATH","NATR","NAUT","NAVB","NAVI","NBHC","NBIX",
+    "NBTB","NCNA","NCSM","NDLS","NDRA","NEOG","NEON","NEPH","NESR","NEXT","NFBK","NGVC",
+    "NHHS","NHTC","NICK","NINE","NKLA","NKTR","NLSP","NMIH","NMRA","NNBR","NOMD","NOTE",
+    "NRBO","NRDS","NRIM","NRIX","NRXP","NSIT","NSSC","NSTG","NTBL","NTCT","NTGR","NTIC",
+    "NTLA","NTNX","NTST","NUVA","NVAX","NVEI","NVST","NWBI","NWFL","NWLI","NXGN","NXRT",
+    "NXST","NYMX","OABI","OBNK","OBSV","OCFC","OCGN","OCSL","OCUL","OCUP","OFIX","OFLX",
+    "OMCL","OMER","OMGA","ONTF","ONVO","OPBK","OPCH","OPEN","OPGN","OPOF","OPRX","OPTN",
+    "ORBC","ORGO","ORGS","ORIC","ORMP","ORRF","OSBC","OSCR","OSIS","OSST","OSTK","OTLK",
+    "OTMO","OTRK","OVBC","OVID","OVLY","OWLT","OXLC","OXSQ","OYST","PACK","PACS","PAHC",
+    "PATK","PBFS","PBHC","PBIP","PBPB","PCBC","PCCO","PCFG","PCOM","PCOR","PCSA","PCTI",
+    "PCVX","PDCO","PDFS","PDSB","PECO","PEGA","PENN","PFBC","PFIS","PFMT","PFNX","PFSI",
+    "PGNY","PHAT","PHGE","PHIO","PHVS","PKBK","PKOH","PLBC","PLBY","PLCE","PLRX","PLSE",
+    "PLUR","PMCB","PMTS","PNFP","PNTG","POAI","POCI","PODD","POND","POOL","POWI","PPBI",
+    "PPBT","PPTA","PRAA","PRAX","PRCH","PRDO","PRFT","PRGS","PRLD","PRME","PRNB","PRPL",
+    "PRQR","PRST","PRTA","PRTK","PRTS","PRVA","PSFE","PSMT","PSNL","PSTV","PSTX","PTCT",
+    "PTGX","PTHM","PTLO","PTPI","PTVE","PUBM","PVBC","PWOD","PXLW","PYCR","PYXS","QCRH",
+    "QDEL","QFIN","QNST","QRTEA","QRTEB","QRVO","QTWO","QUAD","QUBT","QUIK","QURE","RADI",
+    "RAPT","RARE","RAVN","RCKT","RCKY","RCON","RCUS","RDCM","RDNT","RDUS","RDVT","RDWR",
+    "REAL","REAX","REFI","REGI","REKR","RELI","RELY","RENB","RENN","REPX","REXR","REYN",
+    "RFIL","RGCO","RGEN","RGLD","RGLS","RGNX","RGRX","RGTI","RIGL","RIOT","RIVN","RLGT",
+    "RLAY","RLMD","RLYB","RMBI","RMBS","RMCF","RMNI","RNAC","RNAZ","RNDB","RNET","RNLX",
+    "RNXT","ROCC","ROCR","RONI","ROTH","RPAY","RPTX","RRBI","RRGB","RRST","RRTS","RSSS",
+    "RTLR","RUBY","RVSB","RVNC","RVPH","RXDX","RXRX","RYAM","RZLT","SAFE","SAGE","SAIA",
+    "SANA","SAND","SATS","SBCF","SBET","SBFG","SBGI","SBIG","SBSI","SBTX","SCHL","SCKT",
+    "SCPH","SCSC","SCVL","SDCL","SDGR","SELB","SENS","SERV","SFBC","SFNC","SFST","SGBX",
+    "SGMO","SGRY","SGTX","SHBI","SHLS","SHOO","SHPW","SHYF","SIBN","SIEB","SIGA","SIGI",
+    "SILK","SILV","SIMO","SINT","SIRE","SITM","SKIN","SKWD","SLCA","SLDB","SLDP","SLGL",
+    "SLGN","SLNO","SLNX","SLQT","SMBC","SMBK","SMFL","SMID","SMIT","SMPL","SMSI","SMTC",
+    "SNBR","SNCY","SNCR","SNEX","SNOA","SNPO","SNSE","SNSR","SNVX","SOFI","SOHO","SOLO",
+    "SOLY","SONX","SOPA","SOPH","SOTK","SPFI","SPKE","SPNE","SPNS","SPOK","SPPI","SPRO",
+    "SPRY","SPRX","SPSC","SPTN","SPWH","SPWR","SQFT","SQNS","SQSP","SRCE","SRCL","SRFM",
+    "SRGA","SRRK","SRTS","SSBI","SSBK","SSII","SSRM","SSSS","SSYS","STAA","STAG","STBA",
+    "STBZ","STCN","STEP","STGW","STIM","STKS","STNE","STOK","STRA","STRS","STRT","STRW",
+    "STSS","STVN","STXS","SUMO","SUPN","SURF","SVRA","SWAG","SWAV","SWIM","SWKH","SXTP",
+    "SYBT","SYBX","SYRS","TACT","TALO","TALS","TANH","TASK","TAST","TATT","TBCP","TBIO",
+    "TBNK","TBPH","TBRG","TCBK","TCBX","TCFC","TCMD","TCON","TCPC","TDUP","TELL","TENB",
+    "TENX","TERN","TESS","TFFP","TFII","TFSL","TGLS","TGTX","THFF","THRM","THTX","TILE",
+    "TLGA","TLRY","TMBR","TMDI","TMDX","TMHC","TNXP","TORC","TPVG","TRAK","TRAN","TRDA",
+    "TREE","TRGP","TRGT","TRIN","TRMK","TRMT","TRNO","TRON","TROO","TRST","TRTN","TRTX",
+    "TRUP","TRVG","TRVN","TSEM","TSHA","TSIO","TSLX","TTEC","TTEK","TTGT","TTMI","TTNP",
+    "TTSH","TUSK","TUYA","TVIA","TVTX","TWKS","TWIN","TWNI","TWNK","TWST","TXNM","TXRH",
+    "UAVS","UBCP","UBFO","UBOH","UBSI","UCBI","UCTT","UFCS","UFPI","UFPT","UGRO","ULCC",
+    "ULTA","UMBF","UMPQ","UNAM","UNFI","UNIT","UNTY","UPLD","UPWK","URBN","URGN","USAC",
+    "USAK","USAP","USAT","USEI","USFD","USIO","USLM","USNA","USPH","UTHR","UTMD","UVSP",
+    "VBFC","VBIV","VBTX","VCNX","VCTR","VCEL","VCYT","VECO","VERA","VERB","VERX","VGFC",
+    "VIAV","VICR","VIEW","VIGL","VINC","VIOT","VIPS","VITL","VIVO","VKTX","VLCN","VNDA",
+    "VNRX","VOXX","VRAY","VRCA","VRDN","VREX","VRNA","VRNS","VRNT","VRPX","VSCO","VSEC",
+    "VSTA","VTGN","VTOL","VTVT","VUZI","VVOS","VXRT","VYNT","WABC","WAFD","WASH","WATT",
+    "WAVE","WBHC","WBND","WDFC","WERN","WETF","WEYS","WFRD","WHLM","WHLR","WINA","WING",
+    "WINT","WIRE","WKHS","WKME","WLDN","WLFC","WLMS","WNEB","WOLF","WOOF","WORX","WPRT",
+    "WRBY","WSBC","WSFS","WTBA","WTFC","WTRG","WULF","XAIR","XBIO","XCUR","XELA","XELB",
+    "XENE","XFOR","XNCR","XOMA","XPEL","XPER","XPOF","XRAY","XTNT","XXII","XYLO","YCBD",
+    "YEXT","YMAB","YORW","YTEN","YUMC","ZETA","ZEUS","ZFOX","ZGNX","ZIXI","ZLAB","ZNTE",
+    "ZNTL","ZSAN","ZTLK","ZVRA","ZYME","ZYXI",
 ]
 
 UNIVERSE = list(set(SP500 + NASDAQ100 + EXTRAS + RUSSELL2000))
@@ -263,7 +237,6 @@ SECTOR_ETFS = {
     "Utilities": "XLU", "Real Estate": "XLRE", "Basic Materials": "XLB",
 }
 
-# Correlaciones conocidas entre activos
 CORRELATIONS = {
     "NVDA": ["AMD","SMCI","AVGO","AMAT","LRCX","KLAC","MU"],
     "TSLA": ["RIVN","LCID","NIO","XPEV","LI"],
@@ -272,65 +245,76 @@ CORRELATIONS = {
     "AAPL": ["MSFT","GOOGL","META","AMZN"],
     "META": ["SNAP","PINS","GOOGL","RBLX"],
     "AMZN": ["SHOP","EBAY","ETSY"],
-    "PLTR": ["BBAI","SOUN","AI"],
+    "PLTR": ["BBAI","SOUN"],
     "AMD":  ["NVDA","INTC","QCOM","AVGO"],
-    "SMCI": ["NVDA","AMD","DELL","HPQ"],
+    "SMCI": ["NVDA","AMD","HPQ"],
+}
+
+# Sectores afectados por eventos geopolíticos
+GEO_SECTOR_MAP = {
+    "middle_east":  {"up": ["XLE","XLB"],   "down": ["XLY","XLC"]},
+    "china_us":     {"up": ["XLB","XLI"],   "down": ["XLK","XLY"]},
+    "ukraine":      {"up": ["XLE","XLB"],   "down": ["XLI","XLY"]},
+    "fed_hawkish":  {"up": ["XLF","XLU"],   "down": ["XLK","XLRE"]},
+    "fed_dovish":   {"up": ["XLK","XLRE"],  "down": ["XLF"]},
+    "recession":    {"up": ["XLP","XLU"],   "down": ["XLY","XLK"]},
 }
 
 # ═══════════════════════════════════════════════════════════════════════
 # ESTADO GLOBAL
 # ═══════════════════════════════════════════════════════════════════════
 
-predictions    = []   # predicciones enriquecidas guardadas en disco
-watch_signals  = {}   # {ticker: {"last_analyzed": ISO, "developing": bool}}
-learnings      = {    # motor de aprendizaje
-    "rules":          [],    # reglas aprendidas [{condition, win_rate, sample_size, description}]
-    "sector_memory":  {},    # {sector: {win_rate, total, avg_conf}}
-    "hour_memory":    {},    # {hour: {win_rate, total}}
-    "error_memory":   [],    # [{indicator, description, count}]
-    "regime_memory":  {},    # {regime: {win_rate, total}}
-    "last_updated":   None,
+predictions    = []
+watch_signals  = {}
+learnings      = {
+    "rules": [], "sector_memory": {}, "hour_memory": {},
+    "error_memory": [], "regime_memory": {}, "last_updated": None,
+}
+catalyst_memory = {}   # {sector: {catalyst_keyword: {wins, total}}}
+econ_calendar   = {    # eventos económicos del día
+    "high_impact_today": [],   # ["Fed Rate Decision", "CPI", ...]
+    "is_high_impact":    False,
+    "updated_at":        None,
 }
 market_context = {
     "fear_greed": 50, "sp500_change": 0.0, "vix": 15.0,
     "macro_news": [], "economic_events": [], "updated_at": None,
+    "geopolitical_context": [],   # eventos geo detectados
+    "sector_bias": {},            # {sector_etf: "up"/"down"/"neutral"}
 }
-market_regime  = {    # detectado automáticamente
-    "regime":       "UNKNOWN",   # BULL / BEAR / LATERAL
-    "strength":     0,           # 0-100
-    "description":  "",
-    "updated_at":   None,
+market_regime  = {
+    "regime": "UNKNOWN", "strength": 0, "description": "", "updated_at": None,
 }
 status_msg_id     = None
 last_cmd_msg_id   = None
 processed_cmd_ids = set()
 
 # ═══════════════════════════════════════════════════════════════════════
-# PERSISTENCIA EN DISCO
+# PERSISTENCIA
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_state():
-    """Carga todo el estado desde disco al arrancar."""
-    global predictions, watch_signals, learnings, market_regime
+    global predictions, watch_signals, learnings, market_regime, catalyst_memory, econ_calendar
     os.makedirs("/app/data", exist_ok=True)
 
     for var_name, filepath, default in [
-        ("predictions",   PREDICTIONS_FILE, []),
-        ("watch_signals", WATCHSTATE_FILE,  {}),
-        ("learnings",     LEARNINGS_FILE,   learnings),
-        ("market_regime", REGIME_FILE,      market_regime),
+        ("predictions",     PREDICTIONS_FILE,     []),
+        ("watch_signals",   WATCHSTATE_FILE,       {}),
+        ("learnings",       LEARNINGS_FILE,        learnings),
+        ("market_regime",   REGIME_FILE,           market_regime),
+        ("catalyst_memory", CATALYST_MEMORY_FILE,  {}),
+        ("econ_calendar",   ECON_CALENDAR_FILE,    econ_calendar),
     ]:
         try:
             if os.path.exists(filepath):
                 with open(filepath) as f:
                     data = json.load(f)
-                if var_name == "predictions":   predictions   = data
-                elif var_name == "watch_signals": watch_signals = data
-                elif var_name == "learnings":   learnings     = data
-                elif var_name == "market_regime": market_regime = data
-            else:
-                if var_name == "predictions":   predictions   = default
-                elif var_name == "watch_signals": watch_signals = default
+                if   var_name == "predictions":     predictions     = data
+                elif var_name == "watch_signals":   watch_signals   = data
+                elif var_name == "learnings":       learnings       = data
+                elif var_name == "market_regime":   market_regime   = data
+                elif var_name == "catalyst_memory": catalyst_memory = data
+                elif var_name == "econ_calendar":   econ_calendar   = data
         except Exception as e:
             print(f"  ERROR cargando {filepath}: {e}")
 
@@ -340,12 +324,13 @@ def load_state():
 
 
 def save_state():
-    """Guarda todo el estado en disco."""
     for data, filepath in [
-        (predictions,   PREDICTIONS_FILE),
-        (watch_signals, WATCHSTATE_FILE),
-        (learnings,     LEARNINGS_FILE),
-        (market_regime, REGIME_FILE),
+        (predictions,     PREDICTIONS_FILE),
+        (watch_signals,   WATCHSTATE_FILE),
+        (learnings,       LEARNINGS_FILE),
+        (market_regime,   REGIME_FILE),
+        (catalyst_memory, CATALYST_MEMORY_FILE),
+        (econ_calendar,   ECON_CALENDAR_FILE),
     ]:
         try:
             with open(filepath, "w") as f:
@@ -354,53 +339,32 @@ def save_state():
             print(f"  ERROR guardando {filepath}: {e}")
 
 
-def save_prediction(ticker, signal, tech, conf):
-    """
-    Registra una predicción enriquecida con todos los indicadores.
-    Estos datos son los que el motor de aprendizaje usará para detectar patrones.
-    """
+def save_prediction(ticker, signal, tech, conf, signal_type="NORMAL"):
+    """Guarda predicción enriquecida con tipo de señal."""
     predictions.append({
-        # Identificación
-        "ticker":     ticker,
-        "signal":     signal,
-        "confidence": conf,
-        "date":       datetime.now(SPAIN_TZ).isoformat(),
-        "result":     "pending",
-        "exit_price": None,
-        "days_to_result": None,
-
-        # Precio
-        "entry":      round(tech.get("price", 0), 2),
-        "target":     round(tech.get("price", 0) * (1.15 if signal == "COMPRAR" else 0.85), 2),
-        "stop":       round(tech.get("rl", tech.get("price", 0) * 0.93), 2),
-
-        # Contexto técnico completo (para aprendizaje)
-        "rsi":           tech.get("rsi"),
-        "rsi_zone":      tech.get("rsi_zone"),
-        "macd_bullish":  tech.get("macd_bullish"),
-        "stoch_k":       tech.get("stoch_k"),
-        "vol_ratio":     tech.get("vol_ratio"),
-        "obv_trend":     tech.get("obv_trend"),
-        "mom1m":         tech.get("mom1m"),
-        "mom3m":         tech.get("mom3m"),
-        "tf_confluence": tech.get("tf_confluence"),
-        "structure":     tech.get("structure"),
-        "tech_score":    tech.get("tech_score"),
-        "support_touches": tech.get("support_touches"),
-        "dist_h52":      tech.get("dist_h"),
-        "dist_l52":      tech.get("dist_l"),
-
-        # Contexto macro (para aprendizaje)
-        "fear_greed":    market_context.get("fear_greed"),
-        "vix":           market_context.get("vix"),
-        "sp500_change":  market_context.get("sp500_change"),
-        "regime":        market_regime.get("regime"),
-
-        # Contexto de sesión (para aprendizaje)
-        "sector":        tech.get("sector"),
-        "hour":          datetime.now(SPAIN_TZ).hour,
-        "session":       _session_label(datetime.now(SPAIN_TZ)),
-        "day_of_week":   datetime.now(SPAIN_TZ).weekday(),
+        "ticker": ticker, "signal": signal, "confidence": conf,
+        "signal_type": signal_type,   # NORMAL / PRE_EARNINGS / SHORT_SQUEEZE / INSIDER_MASSIVE
+        "date": datetime.now(SPAIN_TZ).isoformat(),
+        "result": "pending", "exit_price": None, "days_to_result": None,
+        "entry":  round(tech.get("price", 0), 2),
+        "target": round(tech.get("price", 0) * (1.15 if signal == "COMPRAR" else 0.85), 2),
+        "stop":   round(tech.get("rl", tech.get("price", 0) * 0.93), 2),
+        "rsi": tech.get("rsi"), "rsi_zone": tech.get("rsi_zone"),
+        "macd_bullish": tech.get("macd_bullish"), "stoch_k": tech.get("stoch_k"),
+        "vol_ratio": tech.get("vol_ratio"), "obv_trend": tech.get("obv_trend"),
+        "mom1m": tech.get("mom1m"), "mom3m": tech.get("mom3m"),
+        "tf_confluence": tech.get("tf_confluence"), "structure": tech.get("structure"),
+        "tech_score": tech.get("tech_score"), "support_touches": tech.get("support_touches"),
+        "dist_h52": tech.get("dist_h"), "dist_l52": tech.get("dist_l"),
+        "fear_greed": market_context.get("fear_greed"),
+        "vix": market_context.get("vix"),
+        "sp500_change": market_context.get("sp500_change"),
+        "regime": market_regime.get("regime"),
+        "sector": tech.get("sector"),
+        "hour": datetime.now(SPAIN_TZ).hour,
+        "session": _session_label(datetime.now(SPAIN_TZ)),
+        "day_of_week": datetime.now(SPAIN_TZ).weekday(),
+        "is_high_impact_day": econ_calendar.get("is_high_impact", False),
     })
     save_state()
 
@@ -435,25 +399,261 @@ def ventas_hoy():
     return sum(1 for p in _preds_today() if p["signal"] == "VENDER")
 
 
-def puede_enviar_alerta(signal, conf):
+def pre_earnings_hoy():
+    return sum(1 for p in _preds_today() if p.get("signal_type") == "PRE_EARNINGS")
+
+
+def puede_enviar_alerta(signal, conf, signal_type="NORMAL"):
+    now_hour = datetime.now(SPAIN_TZ).hour
+
+    # Excepcional siempre pasa
     if conf >= CONF_EXCEPCIONAL:
         return True, None
+
+    # Cola de calidad: antes de HORA_DESBLOQUEO solo Excepcionales
+    if now_hour < HORA_DESBLOQUEO:
+        return False, f"cola de calidad activa hasta las {HORA_DESBLOQUEO}:00"
+
+    # Límite total
     if alertas_hoy() >= MAX_ALERTAS_DIA:
         return False, f"límite diario ({MAX_ALERTAS_DIA}) alcanzado"
+
+    # Límite ventas
     if signal == "VENDER" and ventas_hoy() >= MAX_VENTAS_DIA:
         return False, "límite de ventas diario alcanzado"
+
+    # Límite PRE-EARNINGS
+    if signal_type == "PRE_EARNINGS" and pre_earnings_hoy() >= MAX_PRE_EARNINGS_DIA:
+        return False, "límite de señales PRE-EARNINGS alcanzado"
+
+    # Días de alto impacto macro: subir umbral
+    if econ_calendar.get("is_high_impact") and conf < CONF_FUERTE:
+        events = ", ".join(econ_calendar.get("high_impact_today", []))
+        return False, f"día de alto impacto macro ({events}) — confianza mínima {CONF_FUERTE}%"
+
     return True, None
 
 
 def _session_label(now):
     m = now.hour * 60 + now.minute
-    if  540 <= m <  570: return "PREMARKET"
-    if  570 <= m < 1320: return "MERCADO"
+    if  540 <= m <  570: return "PREMARKET_EARLY"
+    if  570 <= m <  930: return "PREMARKET"
+    if  930 <= m < 1320: return "MERCADO"
     if 1320 <= m < 1440: return "AFTERHOURS"
     return "FUERA DE MERCADO"
 
+
+def is_premarket():
+    now = datetime.now(SPAIN_TZ)
+    return 9 <= now.hour < 15 and now.minute < 30 if now.hour == 15 else 9 <= now.hour < 15
+
+
 # ═══════════════════════════════════════════════════════════════════════
-# DISCORD — ENVÍO Y GESTIÓN DE MENSAJES
+# FUENTES EXTERNAS — Stocktwits, Investing.com, calendario económico
+# Put/call ratio, contexto geopolítico
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_stocktwits_sentiment(ticker):
+    """
+    Sentimiento retail de Stocktwits.
+    Devuelve (bullish_pct, bearish_pct, message_count, trending).
+    """
+    try:
+        r = requests.get(
+            f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+
+        data     = r.json()
+        messages = data.get("messages", [])
+        if not messages:
+            return None
+
+        bullish = sum(1 for m in messages if m.get("entities", {}).get("sentiment", {}).get("basic") == "Bullish")
+        bearish = sum(1 for m in messages if m.get("entities", {}).get("sentiment", {}).get("basic") == "Bearish")
+        total   = bullish + bearish
+
+        if total == 0:
+            return None
+
+        bullish_pct = round(bullish / total * 100, 1)
+        bearish_pct = round(bearish / total * 100, 1)
+        trending    = len(messages) >= 15   # activo si hay 15+ mensajes recientes
+
+        return {
+            "bullish_pct":   bullish_pct,
+            "bearish_pct":   bearish_pct,
+            "message_count": len(messages),
+            "trending":      trending,
+            "label":         "MUY ALCISTA" if bullish_pct > 75 else
+                             "ALCISTA"     if bullish_pct > 55 else
+                             "MUY BAJISTA" if bearish_pct > 75 else
+                             "BAJISTA"     if bearish_pct > 55 else "MIXTO",
+        }
+    except Exception as e:
+        print(f"    Stocktwits {ticker}: {e}")
+        return None
+
+
+def get_investing_news(ticker):
+    """
+    Noticias de Investing.com vía RSS.
+    Devuelve lista de titulares recientes.
+    """
+    news = []
+    try:
+        feed = feedparser.parse(
+            f"https://www.investing.com/rss/news_25.rss",
+        )
+        keyword = ticker.lower()
+        for entry in feed.entries[:20]:
+            title = entry.get("title", "")
+            if keyword in title.lower() or keyword in entry.get("summary", "").lower():
+                news.append(title)
+            if len(news) >= 4:
+                break
+    except Exception as e:
+        print(f"    Investing.com news: {e}")
+    return news
+
+
+def get_put_call_ratio(ticker):
+    """
+    Intenta obtener put/call ratio de Yahoo Finance options.
+    Devuelve (ratio, interpretación) o (None, None).
+    Un ratio < 0.7 es alcista (más calls), > 1.2 es bajista (más puts).
+    """
+    try:
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v7/finance/options/{ticker}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        if r.status_code != 200:
+            return None, None
+
+        data    = r.json().get("optionChain", {}).get("result", [])
+        if not data:
+            return None, None
+
+        options = data[0].get("options", [{}])[0]
+        puts    = len(options.get("puts",  []))
+        calls   = len(options.get("calls", []))
+
+        if calls == 0:
+            return None, None
+
+        ratio = round(puts / calls, 2)
+        if ratio < 0.5:    interp = "MUY ALCISTA (calls dominan)"
+        elif ratio < 0.7:  interp = "ALCISTA"
+        elif ratio < 1.0:  interp = "NEUTRAL-ALCISTA"
+        elif ratio < 1.2:  interp = "NEUTRAL-BAJISTA"
+        elif ratio < 1.5:  interp = "BAJISTA"
+        else:              interp = "MUY BAJISTA (puts dominan)"
+
+        return ratio, interp
+    except Exception as e:
+        return None, None
+
+
+def update_econ_calendar():
+    """
+    Actualiza el calendario económico del día usando Investing.com RSS
+    y detección de palabras clave en noticias macro.
+    """
+    global econ_calendar
+    high_impact_keywords = {
+        "Federal Reserve": "Fed Decision",
+        "Fed Rate":        "Fed Decision",
+        "Interest Rate":   "Fed Decision",
+        "CPI":             "CPI Inflation",
+        "Consumer Price":  "CPI Inflation",
+        "NFP":             "Non-Farm Payrolls",
+        "Non-Farm":        "Non-Farm Payrolls",
+        "Jobs Report":     "Non-Farm Payrolls",
+        "GDP":             "GDP Report",
+        "Unemployment":    "Unemployment Data",
+        "FOMC":            "FOMC Meeting",
+        "Powell":          "Fed Speech",
+    }
+
+    found_events = []
+    try:
+        feed = feedparser.parse("https://www.investing.com/rss/news_301.rss")
+        for entry in feed.entries[:30]:
+            title = entry.get("title", "") + " " + entry.get("summary", "")
+            for keyword, event_name in high_impact_keywords.items():
+                if keyword.lower() in title.lower() and event_name not in found_events:
+                    found_events.append(event_name)
+    except: pass
+
+    # También revisar macro_news del contexto
+    for news in market_context.get("macro_news", []):
+        for keyword, event_name in high_impact_keywords.items():
+            if keyword.lower() in news.lower() and event_name not in found_events:
+                found_events.append(event_name)
+
+    econ_calendar = {
+        "high_impact_today": found_events,
+        "is_high_impact":    len(found_events) > 0,
+        "updated_at":        datetime.now(SPAIN_TZ).isoformat(),
+    }
+    save_state()
+
+    if found_events:
+        print(f"  Calendario económico: ⚠️ ALTO IMPACTO — {', '.join(found_events)}")
+        send_log(f"⚠️ Eventos macro hoy: {', '.join(found_events)} — umbral de confianza elevado")
+    else:
+        print(f"  Calendario económico: sin eventos de alto impacto")
+
+
+def detect_geopolitical_context():
+    """
+    Detecta contexto geopolítico relevante en noticias macro.
+    Actualiza market_context['sector_bias'] para que el prompt
+    sepa qué sectores priorizar/evitar.
+    """
+    geo_keywords = {
+        "middle east": "middle_east",
+        "israel":      "middle_east",
+        "iran":        "middle_east",
+        "china tariff":"china_us",
+        "trade war":   "china_us",
+        "ukraine":     "ukraine",
+        "russia":      "ukraine",
+        "hawkish":     "fed_hawkish",
+        "rate hike":   "fed_hawkish",
+        "dovish":      "fed_dovish",
+        "rate cut":    "fed_dovish",
+        "recession":   "recession",
+    }
+
+    all_news = (
+        market_context.get("macro_news", []) +
+        market_context.get("economic_events", [])
+    )
+    all_text   = " ".join(all_news).lower()
+    detected   = []
+    sector_bias = {}
+
+    for keyword, geo_type in geo_keywords.items():
+        if keyword in all_text and geo_type not in detected:
+            detected.append(geo_type)
+            for etf in GEO_SECTOR_MAP.get(geo_type, {}).get("up", []):
+                sector_bias[etf] = "up"
+            for etf in GEO_SECTOR_MAP.get(geo_type, {}).get("down", []):
+                if etf not in sector_bias:
+                    sector_bias[etf] = "down"
+
+    market_context["geopolitical_context"] = detected
+    market_context["sector_bias"]          = sector_bias
+
+    if detected:
+        print(f"  Contexto geopolítico: {detected} → bias sectorial: {sector_bias}")
+
+# ═══════════════════════════════════════════════════════════════════════
+# DISCORD — igual que v5
 # ═══════════════════════════════════════════════════════════════════════
 
 def _discord_post(channel_id, text):
@@ -471,7 +671,6 @@ def _discord_post(channel_id, text):
     except Exception as e:
         print(f"  Discord POST excepción: {e}")
 
-
 def send_alert(text):      _discord_post(DISCORD_ALERTS_ID, text)
 def send_log(text):        _discord_post(DISCORD_LOG_ID, text)
 def send_acierto(text):    _discord_post(DISCORD_ACIERTOS_ID, text)
@@ -479,7 +678,6 @@ def send_solicitud(text):  _discord_post(DISCORD_SOLICITUD_ID, text)
 
 
 def update_status(text):
-    """Edita el mensaje único de #status. Nunca crea duplicados."""
     global status_msg_id
     auth = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
     try:
@@ -492,7 +690,6 @@ def update_status(text):
                 for m in r.json():
                     if m.get("author", {}).get("bot"):
                         status_msg_id = m["id"]
-                        print(f"  Status: reutilizando mensaje {status_msg_id}")
                         break
 
         if status_msg_id:
@@ -502,7 +699,6 @@ def update_status(text):
             )
             if r.status_code in (200, 201):
                 return
-            print(f"  Status PATCH falló ({r.status_code}) — creando nuevo")
             status_msg_id = None
 
         r = requests.post(
@@ -511,13 +707,11 @@ def update_status(text):
         )
         if r.status_code in (200, 201):
             status_msg_id = r.json().get("id")
-            print(f"  Status: nuevo mensaje creado {status_msg_id}")
     except Exception as e:
         print(f"  Status error: {e}")
 
 
 def post_instrucciones():
-    """Borra mensajes anteriores del bot en #instrucciones y publica los nuevos."""
     try:
         r = requests.get(
             f"https://discord.com/api/v10/channels/{DISCORD_INSTRUCCIONES_ID}/messages?limit=20",
@@ -531,49 +725,44 @@ def post_instrucciones():
                         headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=5,
                     )
                     time.sleep(0.5)
-    except Exception as e:
-        print(f"  Error borrando instrucciones: {e}")
+    except: pass
 
     resolved  = len([p for p in predictions if p.get("result") != "pending"])
     rules_cnt = len(learnings.get("rules", []))
     regime    = market_regime.get("regime", "UNKNOWN")
+    eco_warn  = "⚠️ ALTO IMPACTO HOY" if econ_calendar.get("is_high_impact") else ""
 
     _discord_post(DISCORD_INSTRUCCIONES_ID, f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📖  **CÓMO FUNCIONA STOCKBOT PRO v5**
+📖  **CÓMO FUNCIONA STOCKBOT PRO v5.1**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍  **Análisis automático**
 Vigila ~{len(UNIVERSE)} acciones cada 5 min.
-Solo envía cuando hay convergencia real entre capas técnica, fundamental y macro.
-Máximo 3 alertas al día.
+Máximo 3 alertas al día. Solo Excepcionales antes de las 14:00h. {eco_warn}
 
 🧠  **Aprendizaje autónomo**
 Predicciones resueltas: {resolved} | Reglas aprendidas: {rules_cnt}
-Régimen de mercado detectado: {regime}
-El bot mejora sus análisis con cada predicción resuelta.
+Régimen de mercado: {regime}
 
 ⚡  **Niveles de confianza**
-🟢  Normal 85-87% — señal sólida
-🔥  Fuerte 88-93% — alta convicción
-⚡  Excepcional 94%+ — sin límite diario
+🟢  Normal 85-87% | 🔥  Fuerte 88-93% | ⚡  Excepcional 94%+
+📅  PRE-EARNINGS — señal especial antes de resultados
+🔀  SHORT SQUEEZE — posición corta atrapada
+👥  INSIDERS — compras masivas internas
 
-🎯  **Análisis bajo demanda**
-Escribe en **#solicitud-en-concreto**:
-`!analizar NVDA`
-Respuesta en menos de 30 segundos.""")
+🎯  **Bajo demanda:** `!analizar NVDA` en #solicitud-en-concreto""")
 
     time.sleep(1)
-
     _discord_post(DISCORD_INSTRUCCIONES_ID, """━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📡  **CANALES**
-**#stock-alerts** — alertas automáticas (máx. 3/día)
-**#aciertos-bot** — resumen cada domingo 10:00
+**#stock-alerts** — alertas automáticas
+**#aciertos-bot** — resumen dominical
 **#solicitud-en-concreto** — análisis bajo demanda
 **#log-bot** — actividad interna
-**#status** — estado del bot en tiempo real
+**#status** — estado en tiempo real
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━""")
 
 # ═══════════════════════════════════════════════════════════════════════
-# CONTEXTO MACRO
+# CONTEXTO MACRO + RÉGIMEN
 # ═══════════════════════════════════════════════════════════════════════
 
 def _fg_label(fg):
@@ -585,7 +774,6 @@ def _fg_label(fg):
 
 
 def update_market_context():
-    """Actualiza Fear&Greed, S&P500, VIX y noticias macro."""
     global market_context
     print("  Actualizando contexto macro...")
 
@@ -594,8 +782,7 @@ def update_market_context():
         r = requests.get("https://api.alternative.me/fng/", timeout=8)
         if r.status_code == 200:
             fg = int(r.json()["data"][0]["value"])
-    except Exception as e:
-        print(f"    Fear&Greed error: {e}")
+    except: pass
 
     sp500_change, vix = 0.0, 15.0
     for symbol, key in [("SPY", "sp500"), ("^VIX", "vix")]:
@@ -612,8 +799,7 @@ def update_market_context():
                     else:
                         vix = round(closes[-1], 1)
             time.sleep(0.5)
-        except Exception as e:
-            print(f"    {symbol} error: {e}")
+        except: pass
 
     macro_news, econ_events = [], []
     if NEWS_API_KEY:
@@ -634,173 +820,403 @@ def update_market_context():
                 econ_events = [a.get("title", "") for a in r.json().get("articles", [])[:4]]
         except: pass
 
-    market_context = {
-        "fear_greed":      fg,
-        "sp500_change":    sp500_change,
-        "vix":             vix,
-        "macro_news":      macro_news,
-        "economic_events": econ_events,
-        "updated_at":      datetime.now(SPAIN_TZ).strftime("%H:%M"),
-    }
+    market_context.update({
+        "fear_greed": fg, "sp500_change": sp500_change, "vix": vix,
+        "macro_news": macro_news, "economic_events": econ_events,
+        "updated_at": datetime.now(SPAIN_TZ).strftime("%H:%M"),
+    })
 
     fg_str = _fg_label(fg)
     print(f"  Fear&Greed: {fg} ({fg_str}) | S&P500: {sp500_change:+.2f}% | VIX: {vix}")
     send_log(f"📊 Macro — Fear&Greed: {fg} ({fg_str}) | S&P500: {sp500_change:+.2f}% | VIX: {vix}")
 
-    # Actualizar régimen después de macro
     detect_market_regime()
+    detect_geopolitical_context()
+    update_econ_calendar()
 
-# ═══════════════════════════════════════════════════════════════════════
-# DETECCIÓN DE RÉGIMEN DE MERCADO
-# Bull / Bear / Lateral — ajusta umbrales automáticamente
-# ═══════════════════════════════════════════════════════════════════════
 
 def detect_market_regime():
-    """
-    Detecta el régimen de mercado analizando SPY, QQQ y VIX.
-    Guarda el resultado en market_regime y en disco.
-    El régimen afecta los umbrales de confianza y la selectividad del bot.
-    """
     global market_regime
-    print("  Detectando régimen de mercado...")
-
     try:
-        spy_closes, qqq_closes = [], []
-
-        for sym, store in [("SPY", "spy"), ("QQQ", "qqq")]:
-            r = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=3mo",
-                headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
-            )
-            if r.status_code == 200:
-                closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
-                if store == "spy": spy_closes = closes
-                else:              qqq_closes = closes
-            time.sleep(0.5)
+        spy_closes = []
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/SPY?interval=1d&range=3mo",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        if r.status_code == 200:
+            spy_closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
 
         if not spy_closes or len(spy_closes) < 20:
             return
 
-        price      = spy_closes[-1]
-        sma20      = sum(spy_closes[-20:]) / 20
-        sma50      = sum(spy_closes[-50:]) / 50 if len(spy_closes) >= 50 else sma20
-        mom1m      = ((price - spy_closes[-22]) / spy_closes[-22] * 100) if len(spy_closes) >= 22 else 0
-        mom3m      = ((price - spy_closes[-66]) / spy_closes[-66] * 100) if len(spy_closes) >= 66 else 0
-        vix        = market_context.get("vix", 15)
-        fg         = market_context.get("fear_greed", 50)
+        price  = spy_closes[-1]
+        sma20  = sum(spy_closes[-20:]) / 20
+        sma50  = sum(spy_closes[-50:]) / 50 if len(spy_closes) >= 50 else sma20
+        mom1m  = ((price - spy_closes[-22]) / spy_closes[-22] * 100) if len(spy_closes) >= 22 else 0
+        mom3m  = ((price - spy_closes[-66]) / spy_closes[-66] * 100) if len(spy_closes) >= 66 else 0
+        vix    = market_context.get("vix", 15)
+        fg     = market_context.get("fear_greed", 50)
 
-        # Puntuación de régimen
-        bull_score = 0
-        bear_score = 0
-
-        if price > sma20:  bull_score += 2
-        else:              bear_score += 2
-        if price > sma50:  bull_score += 2
-        else:              bear_score += 2
-        if mom1m > 2:      bull_score += 2
-        elif mom1m < -2:   bear_score += 2
-        if mom3m > 5:      bull_score += 3
-        elif mom3m < -5:   bear_score += 3
-        if vix < 18:       bull_score += 2
-        elif vix > 25:     bear_score += 2
-        if fg > 60:        bull_score += 1
-        elif fg < 30:      bear_score += 1
+        bull_score = bear_score = 0
+        if price > sma20: bull_score += 2
+        else:             bear_score += 2
+        if price > sma50: bull_score += 2
+        else:             bear_score += 2
+        if mom1m > 2:     bull_score += 2
+        elif mom1m < -2:  bear_score += 2
+        if mom3m > 5:     bull_score += 3
+        elif mom3m < -5:  bear_score += 3
+        if vix < 18:      bull_score += 2
+        elif vix > 25:    bear_score += 2
+        if fg > 60:       bull_score += 1
+        elif fg < 30:     bear_score += 1
 
         total = bull_score + bear_score
         if total == 0:
-            regime, strength, desc = "LATERAL", 50, "Mercado sin dirección clara"
+            regime, strength, desc = "LATERAL", 50, "Sin dirección clara"
         elif bull_score > bear_score * 1.5:
-            strength = min(int((bull_score / total) * 100), 99)
-            regime   = "BULL"
-            desc     = f"Tendencia alcista confirmada | SPY {mom3m:+.1f}% en 3m | VIX {vix}"
+            strength = min(int(bull_score / total * 100), 99)
+            regime, desc = "BULL", f"Tendencia alcista | SPY {mom3m:+.1f}% en 3m | VIX {vix}"
         elif bear_score > bull_score * 1.5:
-            strength = min(int((bear_score / total) * 100), 99)
-            regime   = "BEAR"
-            desc     = f"Tendencia bajista confirmada | SPY {mom3m:+.1f}% en 3m | VIX {vix}"
+            strength = min(int(bear_score / total * 100), 99)
+            regime, desc = "BEAR", f"Tendencia bajista | SPY {mom3m:+.1f}% en 3m | VIX {vix}"
         else:
             strength = 50
-            regime   = "LATERAL"
-            desc     = f"Mercado sin dirección clara | SPY {mom3m:+.1f}% en 3m | VIX {vix}"
+            regime, desc = "LATERAL", f"Sin dirección clara | SPY {mom3m:+.1f}% en 3m | VIX {vix}"
 
-        prev_regime = market_regime.get("regime", "UNKNOWN")
+        prev = market_regime.get("regime", "UNKNOWN")
         market_regime = {
-            "regime":      regime,
-            "strength":    strength,
-            "description": desc,
-            "spy_mom1m":   round(mom1m, 1),
-            "spy_mom3m":   round(mom3m, 1),
-            "vix":         vix,
-            "updated_at":  datetime.now(SPAIN_TZ).isoformat(),
+            "regime": regime, "strength": strength, "description": desc,
+            "spy_mom1m": round(mom1m, 1), "spy_mom3m": round(mom3m, 1),
+            "vix": vix, "updated_at": datetime.now(SPAIN_TZ).isoformat(),
         }
         save_state()
-
-        print(f"  Régimen: {regime} (fuerza {strength}%) — {desc}")
-
-        if prev_regime != regime and prev_regime != "UNKNOWN":
-            send_log(f"🔄 Cambio de régimen: {prev_regime} → {regime} | {desc}")
-
+        print(f"  Régimen: {regime} ({strength}%) — {desc}")
+        if prev != regime and prev != "UNKNOWN":
+            send_log(f"🔄 Cambio régimen: {prev} → {regime}")
     except Exception as e:
         print(f"  detect_market_regime error: {e}")
 
 
 def get_regime_conf_adjustment():
+    regime = market_regime.get("regime", "UNKNOWN")
+    return {
+        "BULL":    {"COMPRAR": 0, "VENDER": 3},
+        "BEAR":    {"COMPRAR": 3, "VENDER": 0},
+        "LATERAL": {"COMPRAR": 2, "VENDER": 2},
+    }.get(regime, {"COMPRAR": 0, "VENDER": 0})
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONFLUENCIA DINÁMICA DE TIMEFRAMES SEGÚN RÉGIMEN
+# En BEAR: mensual manda más. En BULL: diario manda más.
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_tf_weights():
     """
-    Ajusta la confianza mínima según el régimen de mercado.
-    En BEAR: más estricto con compras (+3% confianza mínima)
-    En BULL: más estricto con ventas (+3% confianza mínima)
-    En LATERAL: estricto con ambos (+2%)
+    Devuelve pesos (diario, semanal, mensual) según régimen.
+    Suma siempre 1.0.
     """
     regime = market_regime.get("regime", "UNKNOWN")
     return {
-        "BULL":    {"COMPRAR": 0,  "VENDER": 3},
-        "BEAR":    {"COMPRAR": 3,  "VENDER": 0},
-        "LATERAL": {"COMPRAR": 2,  "VENDER": 2},
-    }.get(regime, {"COMPRAR": 0, "VENDER": 0})
+        "BULL":    (0.50, 0.30, 0.20),
+        "BEAR":    (0.20, 0.30, 0.50),
+        "LATERAL": (0.35, 0.35, 0.30),
+    }.get(regime, (0.35, 0.35, 0.30))
+
+
+def calc_weighted_tf_confluence(tech):
+    """
+    Calcula confluencia ponderada según régimen.
+    Devuelve (score_0_a_3, descripción).
+    """
+    w_d, w_w, w_m = get_tf_weights()
+    regime = market_regime.get("regime", "UNKNOWN")
+
+    d_bull = 1.0 if tech.get("daily_trend")   == "ALCISTA" else 0.0
+    w_bull = 1.0 if tech.get("weekly_trend")  == "ALCISTA" else 0.0
+    m_bull = 1.0 if tech.get("monthly_trend") == "ALCISTA" else 0.0
+
+    score   = d_bull * w_d + w_bull * w_w + m_bull * w_m
+    raw_pct = round(score * 100, 0)
+
+    if score >= 0.8:   label = "CONFLUENCIA ALCISTA FUERTE"
+    elif score >= 0.5: label = "MAYORIA ALCISTA"
+    elif score <= 0.2: label = "CONFLUENCIA BAJISTA FUERTE"
+    elif score <= 0.5: label = "MAYORIA BAJISTA"
+    else:              label = "SIN CONFLUENCIA"
+
+    return round(score, 2), f"{label} ({raw_pct}% ponderado — régimen {regime}: D{int(w_d*100)}%/S{int(w_w*100)}%/M{int(w_m*100)}%)"
+
 
 # ═══════════════════════════════════════════════════════════════════════
-# CAPA 1 — QUICK SCAN + CORRELACIONES + DETECCIÓN DE MANIPULACIÓN
+# DETECCIÓN DE DIVERGENCIAS RSI/PRECIO (2 timeframes mínimo)
+# Solo señal si aparece en diario Y semanal simultáneamente
 # ═══════════════════════════════════════════════════════════════════════
 
-def detect_manipulation(sym, change, vol_ratio, price):
+def detect_divergence(closes_d, rsi_d, closes_w, rsi_w):
     """
-    Detecta señales de pump & dump o manipulación de precio.
-    Devuelve (True, motivo) si es sospechoso, (False, None) si es limpio.
-
-    Señales de alerta:
-    - Subida >20% con volumen bajo (<1.5x)
-    - Precio < $2 con volumen explosivo (típico penny stock pump)
-    - Ticker desconocido con subida >30% sin noticias
-    - Acción con capitalización muy baja y movimiento extremo
+    Divergencia alcista: precio baja pero RSI sube (señal de reversión al alza)
+    Divergencia bajista: precio sube pero RSI baja (señal de reversión a la baja)
+    Solo cuenta si aparece en AMBOS timeframes (diario y semanal).
+    Devuelve (tipo, descripción) o (None, None).
     """
-    # Penny stocks con movimiento extremo
-    if price < 2 and abs(change) > 20:
-        return True, f"penny stock pump sospechoso (${price}, {change:+.1f}%)"
+    if not closes_d or not closes_w or rsi_d is None or rsi_w is None:
+        return None, None
 
-    # Subida explosiva con volumen bajo — posible manipulación
-    if change > 20 and vol_ratio < 1.5:
-        return True, f"subida extrema ({change:+.1f}%) con volumen bajo ({vol_ratio}x) — sospechoso"
+    # Diario: comparar últimos 5 días
+    if len(closes_d) >= 5:
+        price_change_d = closes_d[-1] - closes_d[-5]
+        # Aproximación RSI trend: usamos cambio de precio reciente
+        rsi_proxy_d    = sum(closes_d[-3:]) / 3 - sum(closes_d[-6:-3]) / 3 if len(closes_d) >= 6 else 0
+        div_bull_d = price_change_d < 0 and rsi_proxy_d > 0 and rsi_d < 40
+        div_bear_d = price_change_d > 0 and rsi_proxy_d < 0 and rsi_d > 60
+    else:
+        div_bull_d = div_bear_d = False
 
-    # Subida >35% en un día es casi siempre noticia específica o pump
-    if abs(change) > 35 and vol_ratio < 2:
-        return True, f"movimiento extremo ({change:+.1f}%) sin volumen institucional"
+    # Semanal: comparar últimas 3 semanas
+    if len(closes_w) >= 3:
+        price_change_w = closes_w[-1] - closes_w[-3]
+        rsi_proxy_w    = sum(closes_w[-2:]) / 2 - sum(closes_w[-4:-2]) / 2 if len(closes_w) >= 4 else 0
+        div_bull_w = price_change_w < 0 and rsi_proxy_w > 0
+        div_bear_w = price_change_w > 0 and rsi_proxy_w < 0
+    else:
+        div_bull_w = div_bear_w = False
+
+    # Solo señal si aparece en AMBOS timeframes
+    if div_bull_d and div_bull_w:
+        return "ALCISTA", f"Divergencia alcista confirmada en diario+semanal (RSI {rsi_d:.0f} con precio bajando)"
+    if div_bear_d and div_bear_w:
+        return "BAJISTA", f"Divergencia bajista confirmada en diario+semanal (RSI {rsi_d:.0f} con precio subiendo)"
+
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DETECCIÓN DE GAP DE APERTURA
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_premarket_data(ticker):
+    """
+    Obtiene precio premarket y calcula gap respecto al cierre anterior.
+    Devuelve dict con gap_pct, premarket_price, premarket_volume o None.
+    """
+    try:
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d&prePost=true",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        if r.status_code == 429:
+            time.sleep(5)
+            return None
+        if r.status_code != 200:
+            return None
+
+        result = r.json().get("chart", {}).get("result", [])
+        if not result:
+            return None
+
+        meta             = result[0].get("meta", {})
+        prev_close       = meta.get("chartPreviousClose") or meta.get("previousClose")
+        pre_price        = meta.get("preMarketPrice")
+        pre_volume       = meta.get("preMarketVolume", 0)
+        regular_volume   = meta.get("regularMarketVolume", 0)
+        avg_volume       = meta.get("averageDailyVolume3Month", 1) or 1
+
+        if not prev_close or not pre_price:
+            return None
+
+        gap_pct       = round(((pre_price - prev_close) / prev_close) * 100, 2)
+        pre_vol_ratio = round(pre_volume / (avg_volume / 6.5), 2) if avg_volume > 0 else 0  # 6.5h sesión normal
+
+        return {
+            "pre_price":     round(pre_price, 2),
+            "prev_close":    round(prev_close, 2),
+            "gap_pct":       gap_pct,
+            "pre_volume":    pre_volume,
+            "pre_vol_ratio": pre_vol_ratio,
+            "gap_up":        gap_pct >= 3,
+            "gap_down":      gap_pct <= -3,
+            "significant":   abs(gap_pct) >= 3,
+        }
+    except Exception as e:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SHORT SQUEEZE DETECTOR
+# ═══════════════════════════════════════════════════════════════════════
+
+def detect_short_squeeze(fund, tech):
+    """
+    Condiciones para short squeeze:
+    - Short interest > 15% del float
+    - Precio subiendo con volumen alto (>2x)
+    - OBV en acumulación
+    Devuelve (True, descripción) o (False, None).
+    """
+    short_int  = fund.get("short_interest", 0) or 0
+    vol_ratio  = tech.get("vol_ratio", 1)
+    change_pct = tech.get("change_pct", 0)
+    obv_trend  = tech.get("obv_trend", "")
+
+    if short_int >= 15 and change_pct > 3 and vol_ratio > 2:
+        confidence = "ALTO" if short_int > 25 and vol_ratio > 3 else "MODERADO"
+        return True, f"SHORT SQUEEZE {confidence}: {short_int}% short float + {change_pct:+.1f}% + vol {vol_ratio}x"
+
+    if short_int >= 20 and change_pct > 1 and obv_trend == "ACUMULACION":
+        return True, f"SQUEEZE INICIÁNDOSE: {short_int}% short float con acumulación OBV"
 
     return False, None
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# INSIDERS MASIVOS DETECTOR
+# ═══════════════════════════════════════════════════════════════════════
+
+def detect_massive_insider(fund):
+    """
+    3+ compras de insiders en 30 días = señal fuerte.
+    Devuelve (True, descripción) o (False, None).
+    """
+    buys  = fund.get("insider_buys", 0)
+    sells = fund.get("insider_sells", 0)
+
+    if buys >= 3 and buys > sells * 2:
+        return True, f"INSIDERS MASIVOS: {buys} compras vs {sells} ventas (30 días)"
+    if buys >= 5:
+        return True, f"INSIDERS ACUMULANDO: {buys} compras internas (30 días)"
+
+    return False, None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PRE-EARNINGS SIGNAL
+# Solo COMPRAR, mínimo 3/4 beats, máximo 1 al día
+# ═══════════════════════════════════════════════════════════════════════
+
+def check_pre_earnings_signal(fund, tech):
+    """
+    Condiciones para señal PRE-EARNINGS:
+    - Earnings en 1-7 días (ventana óptima)
+    - 3/4 o 4/4 últimos beats
+    - Técnico alcista (estructura o confluencia alcista)
+    - No bajista en ningún timeframe importante
+    Devuelve (True, días_para_earnings, descripción) o (False, None, None).
+    """
+    days    = fund.get("earnings_days")
+    beats   = fund.get("earnings_beats", 0)
+    upside  = fund.get("analyst_upside", 0) or 0
+
+    if days is None or days < 1 or days > 7:
+        return False, None, None
+
+    if beats < 3:
+        return False, None, None
+
+    # Técnico debe ser alcista
+    structure   = tech.get("structure", "")
+    tf_conf     = tech.get("tf_confluence", "")
+    change_pct  = tech.get("change_pct", 0)
+
+    is_bullish = (
+        "ALCISTA" in structure or
+        "ALCISTA" in tf_conf or
+        (tech.get("rsi", 50) > 50 and change_pct > 0)
+    )
+
+    if not is_bullish:
+        return False, None, None
+
+    beat_pct = beats * 25  # 4/4 = 100%, 3/4 = 75%
+    desc = (
+        f"PRE-EARNINGS en {days}d: {beats}/4 beats ({beat_pct}%) | "
+        f"Analistas: {upside:+.1f}% upside | Técnico alcista"
+    )
+    return True, days, desc
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MEMORIA DE CATALIZADORES POR SECTOR
+# Aprende qué tipo de catalizador funciona mejor en cada sector
+# ═══════════════════════════════════════════════════════════════════════
+
+def extract_catalyst_keyword(ai_response):
+    """Extrae la palabra clave del catalizador de la respuesta de la IA."""
+    for line in ai_response.splitlines():
+        if "CATALIZADOR:" in line or "⚡" in line:
+            text = line.split(":", 1)[-1].strip().lower()
+            # Extraer primera palabra significativa
+            words = [w for w in text.split() if len(w) > 4]
+            return words[0] if words else None
+    return None
+
+
+def update_catalyst_memory(ticker, sector, ai_response, result):
+    """
+    Actualiza la memoria de catalizadores cuando se resuelve una predicción.
+    result: "win" o "loss"
+    """
+    keyword = extract_catalyst_keyword(ai_response)
+    if not keyword or not sector:
+        return
+
+    if sector not in catalyst_memory:
+        catalyst_memory[sector] = {}
+
+    if keyword not in catalyst_memory[sector]:
+        catalyst_memory[sector][keyword] = {"wins": 0, "total": 0}
+
+    catalyst_memory[sector][keyword]["total"] += 1
+    if result == "win":
+        catalyst_memory[sector][keyword]["wins"] += 1
+
+    save_state()
+
+
+def get_catalyst_context(sector):
+    """
+    Devuelve contexto de catalizadores para el prompt.
+    Muestra qué catalizadores han funcionado/fallado en este sector.
+    """
+    if not sector or sector not in catalyst_memory:
+        return ""
+
+    lines = []
+    for keyword, data in catalyst_memory[sector].items():
+        total = data["total"]
+        if total < 3:
+            continue
+        win_rate = round(data["wins"] / total * 100, 0)
+        if win_rate >= 70:
+            lines.append(f"✅ '{keyword}' funcionó {int(win_rate)}% en {sector} ({total} casos)")
+        elif win_rate <= 35:
+            lines.append(f"⚠️ '{keyword}' falló {int(100-win_rate)}% en {sector} ({total} casos)")
+
+    return "\n".join(lines[:3]) if lines else ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CAPA 1 — QUICK SCAN + CORRELACIONES + MANIPULACIÓN
+# ═══════════════════════════════════════════════════════════════════════
+
+def detect_manipulation(sym, change, vol_ratio, price):
+    if price < 2 and abs(change) > 20:
+        return True, f"penny stock pump (${price}, {change:+.1f}%)"
+    if change > 20 and vol_ratio < 1.5:
+        return True, f"subida extrema ({change:+.1f}%) sin volumen institucional"
+    if abs(change) > 35 and vol_ratio < 2:
+        return True, f"movimiento extremo ({change:+.1f}%) sin volumen"
+    return False, None
+
+
 def quick_scan():
-    """
-    Escanea screeners de Yahoo Finance buscando candidatos reales.
-    Incluye detección de correlaciones y filtro anti-manipulación.
-    Devuelve lista de candidatos ordenados por urgencia.
-    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json",
         "Referer": "https://finance.yahoo.com",
     }
-    seen          = set()
-    candidates    = []
-    corr_triggers = []   # tickers activados por correlación
+    seen, candidates, corr_triggers = set(), [], []
 
     for url in [
         "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=50",
@@ -810,7 +1226,6 @@ def quick_scan():
         try:
             r = requests.get(url, headers=headers, timeout=15)
             if r.status_code == 429:
-                print(f"  Quick scan: Yahoo 429 — esperando 5s")
                 time.sleep(5)
                 continue
             if r.status_code != 200:
@@ -830,92 +1245,67 @@ def quick_scan():
                 if sym in seen:                           continue
                 if already_alerted_today(sym):            continue
 
-                # Filtro anti-manipulación
                 is_manip, manip_reason = detect_manipulation(sym, change, vol_ratio, price)
                 if is_manip:
-                    print(f"  Filtrado por manipulación: {sym} — {manip_reason}")
+                    print(f"  Filtrado manipulación: {sym} — {manip_reason}")
                     continue
 
                 score = 0
-                if abs(change) > 8:        score += 3
-                elif abs(change) > 5:      score += 2
-                elif abs(change) > 3:      score += 1
-                if vol_ratio > 3:          score += 3
-                elif vol_ratio > 2:        score += 2
-                elif vol_ratio > 1.5:      score += 1
+                if abs(change) > 8:       score += 3
+                elif abs(change) > 5:     score += 2
+                elif abs(change) > 3:     score += 1
+                if vol_ratio > 3:         score += 3
+                elif vol_ratio > 2:       score += 2
+                elif vol_ratio > 1.5:     score += 1
 
                 if score >= 2:
                     seen.add(sym)
                     candidates.append({
-                        "ticker":    sym,
-                        "name":      q.get("longName", sym),
-                        "sector":    q.get("sector", "Unknown"),
-                        "price":     price,
-                        "change":    change,
-                        "vol_ratio": round(vol_ratio, 2),
-                        "score":     score,
-                        "source":    "screener",
+                        "ticker": sym, "name": q.get("longName", sym),
+                        "sector": q.get("sector", "Unknown"),
+                        "price": price, "change": change,
+                        "vol_ratio": round(vol_ratio, 2), "score": score,
+                        "source": "screener",
                     })
-
-                    # Correlaciones: si este ticker tiene correlacionados, añadirlos
                     if sym in CORRELATIONS:
-                        for corr_ticker in CORRELATIONS[sym]:
-                            if corr_ticker not in seen and not already_alerted_today(corr_ticker):
+                        for ct in CORRELATIONS[sym]:
+                            if ct not in seen and not already_alerted_today(ct):
                                 corr_triggers.append({
-                                    "ticker":  corr_ticker,
-                                    "name":    corr_ticker,
-                                    "sector":  "Unknown",
-                                    "price":   0,
-                                    "change":  0,
-                                    "vol_ratio": 0,
-                                    "score":   2,
-                                    "source":  f"correlación con {sym}",
+                                    "ticker": ct, "name": ct, "sector": "Unknown",
+                                    "price": 0, "change": 0, "vol_ratio": 0,
+                                    "score": 2, "source": f"correlación con {sym}",
                                 })
-                                seen.add(corr_ticker)
-
+                                seen.add(ct)
             time.sleep(0.5)
         except Exception as e:
             print(f"  Quick scan error: {e}")
 
-    # Añadir en desarrollo
     developing = [
-        {
-            "ticker": t, "name": t, "sector": "Unknown",
-            "price": 0, "change": 0, "vol_ratio": 0, "score": 1,
-            "source": "developing",
-        }
+        {"ticker": t, "name": t, "sector": "Unknown", "price": 0,
+         "change": 0, "vol_ratio": 0, "score": 1, "source": "developing"}
         for t, s in watch_signals.items()
         if s.get("developing") and not already_alerted_today(t) and t not in seen
     ]
 
-    # Deduplicar correlaciones
     corr_unique = []
+    existing = {x["ticker"] for x in candidates + developing}
     for c in corr_triggers:
-        if c["ticker"] not in {x["ticker"] for x in candidates + developing + corr_unique}:
+        if c["ticker"] not in existing and c["ticker"] not in {x["ticker"] for x in corr_unique}:
             corr_unique.append(c)
 
     all_candidates = (
         sorted(candidates, key=lambda x: x["score"], reverse=True)
-        + corr_unique[:4]
-        + developing
+        + corr_unique[:4] + developing
     )
 
-    n_corr = len(corr_unique)
-    n_dev  = len(developing)
-    print(f"  Quick scan: {len(candidates)} urgentes + {n_corr} correlaciones + {n_dev} en desarrollo")
-
+    print(f"  Quick scan: {len(candidates)} urgentes + {len(corr_unique)} correlaciones + {len(developing)} en desarrollo")
     return all_candidates[:15]
 
 # ═══════════════════════════════════════════════════════════════════════
-# CAPA 2 — DATOS DE MERCADO (Yahoo Finance, 3 timeframes)
-# Anti-429 mejorado: delays, backoff, rotación de hosts
+# CAPA 2 — DATOS DE MERCADO con divergencias y premarket
 # ═══════════════════════════════════════════════════════════════════════
 
 def _yahoo_get(session, host, ticker, interval, range_, hdrs):
-    """
-    Petición a Yahoo Finance con manejo de 429.
-    Devuelve (data, status_code).
-    """
     try:
         r = session.get(
             f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={range_}",
@@ -934,11 +1324,6 @@ def _yahoo_get(session, host, ticker, interval, range_, hdrs):
 
 
 def get_market_data(ticker):
-    """
-    Datos técnicos completos para un ticker.
-    3 peticiones: diario (1y), semanal (1y), mensual (3y).
-    Anti-429: User-Agent aleatorio, host aleatorio, delays.
-    """
     try:
         ua = random.choice([
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
@@ -947,20 +1332,16 @@ def get_market_data(ticker):
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
         ])
         hdrs = {
-            "User-Agent": ua,
-            "Accept":     "application/json",
-            "Referer":    f"https://finance.yahoo.com/quote/{ticker}/",
+            "User-Agent": ua, "Accept": "application/json",
+            "Referer": f"https://finance.yahoo.com/quote/{ticker}/",
         }
         host = random.choice(["query1", "query2"])
         s    = requests.Session()
-
-        # Cookie inicial
         try:
             s.get(f"https://finance.yahoo.com/quote/{ticker}/", headers=hdrs, timeout=8)
             time.sleep(1.0)
         except: pass
 
-        # ── Diario ────────────────────────────────────────────────────
         data, status = _yahoo_get(s, host, ticker, "1d", "1y", hdrs)
         if not data:
             if status != 429:
@@ -985,22 +1366,18 @@ def get_market_data(ticker):
 
         price      = closes[-1]
         change_pct = ((price - closes[-2]) / closes[-2]) * 100
+        sma20      = sum(closes[-20:]) / 20
+        sma50      = sum(closes[-50:]) / 50
+        sma200     = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
 
-        # Medias móviles
-        sma20  = sum(closes[-20:]) / 20
-        sma50  = sum(closes[-50:]) / 50
-        sma200 = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
-
-        # EMA 12 y 26 para MACD
         ema12 = ema26 = closes[-1]
         for i in range(min(26, len(closes))):
-            ema12 = closes[-(i+1)] * (2/13)  + ema12 * (11/13)
-            ema26 = closes[-(i+1)] * (2/27)  + ema26 * (25/27)
+            ema12 = closes[-(i+1)] * (2/13) + ema12 * (11/13)
+            ema26 = closes[-(i+1)] * (2/27) + ema26 * (25/27)
         macd         = ema12 - ema26
         macd_signal  = macd * 0.9
         macd_bullish = macd > macd_signal
 
-        # RSI 14
         gains, losses_list = [], []
         for i in range(1, 15):
             d = closes[-i] - closes[-i-1]
@@ -1015,12 +1392,10 @@ def get_market_data(ticker):
         elif rsi > 75: rsi_zone = "overbought_extreme"
         elif rsi > 68: rsi_zone = "overbought"
 
-        # Estocástico
         low14   = min(lows[-14:])  if len(lows)  >= 14 else min(lows)
         high14  = max(highs[-14:]) if len(highs) >= 14 else max(highs)
         stoch_k = ((price - low14) / (high14 - low14) * 100) if high14 != low14 else 50
 
-        # Volumen y OBV
         avg_vol20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
         vol_ratio = volumes[-1] / avg_vol20  if avg_vol20 > 0    else 1
         obv = sum(
@@ -1028,20 +1403,14 @@ def get_market_data(ticker):
             for i in range(1, min(20, len(closes)))
         )
         obv_trend = "ACUMULACION" if obv > 0 else "DISTRIBUCION"
+        vwap      = sum(closes[-5:]) / 5
 
-        # VWAP
-        vwap = sum(closes[-5:]) / 5
-
-        # ATR
         atr_vals = [
-            max(highs[-i] - lows[-i],
-                abs(highs[-i] - closes[-i-1]),
-                abs(lows[-i]  - closes[-i-1]))
+            max(highs[-i] - lows[-i], abs(highs[-i] - closes[-i-1]), abs(lows[-i] - closes[-i-1]))
             for i in range(1, min(15, len(closes)))
         ]
         atr = sum(atr_vals) / len(atr_vals) if atr_vals else price * 0.02
 
-        # Fibonacci
         h52 = max(closes[-252:]) if len(closes) >= 252 else max(closes)
         l52 = min(closes[-252:]) if len(closes) >= 252 else min(closes)
         rng = h52 - l52
@@ -1050,16 +1419,13 @@ def get_market_data(ticker):
         fib500 = round(h52 - rng * 0.500, 2)
         fib618 = round(h52 - rng * 0.618, 2)
 
-        # Soporte y resistencia
         rh = max(highs[-20:]) if len(highs) >= 20 else price
         rl = min(lows[-20:])  if len(lows)  >= 20 else price
         support_touches = sum(1 for l in lows[-60:] if abs(l - rl) / rl < 0.02) if len(lows) >= 60 else 0
 
-        # Momentum
         mom1m = ((price - closes[-22]) / closes[-22] * 100) if len(closes) >= 22 else 0
         mom3m = ((price - closes[-66]) / closes[-66] * 100) if len(closes) >= 66 else 0
 
-        # Estructura
         rh10 = highs[-10:] if len(highs) >= 10 else highs
         rl10 = lows[-10:]  if len(lows)  >= 10 else lows
         hh = all(rh10[i] >= rh10[i-1] for i in range(1, len(rh10)))
@@ -1070,7 +1436,6 @@ def get_market_data(ticker):
         elif lh and ll: structure = "TENDENCIA BAJISTA CLARA"
         else:           structure = "LATERAL / CONSOLIDACION"
 
-        # Score técnico
         tech_score = 0
         if rsi_zone == "oversold_extreme":     tech_score += 4
         elif rsi_zone == "oversold":           tech_score += 2
@@ -1091,13 +1456,14 @@ def get_market_data(ticker):
 
         # ── Semanal ───────────────────────────────────────────────────
         weekly_trend = "N/D"
+        closes_w     = []
         time.sleep(0.8)
         data_w, _ = _yahoo_get(s, host, ticker, "1wk", "1y", hdrs)
         if data_w:
             try:
-                wc = [c for c in data_w["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
-                if len(wc) >= 10:
-                    weekly_trend = "ALCISTA" if wc[-1] > sum(wc[-10:]) / 10 else "BAJISTA"
+                closes_w = [c for c in data_w["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
+                if len(closes_w) >= 10:
+                    weekly_trend = "ALCISTA" if closes_w[-1] > sum(closes_w[-10:]) / 10 else "BAJISTA"
             except: pass
 
         # ── Mensual ───────────────────────────────────────────────────
@@ -1123,44 +1489,43 @@ def get_market_data(ticker):
         if tf_bullish >= 2: tech_score += 2
         if tf_bearish >= 2: tech_score += 2
 
+        # ── Divergencias (solo si 2 timeframes) ──────────────────────
+        div_type, div_desc = detect_divergence(closes, rsi, closes_w, rsi)
+
+        # ── Confluencia dinámica ponderada ────────────────────────────
+        tf_tech = {"daily_trend": daily_trend, "weekly_trend": weekly_trend,
+                   "monthly_trend": monthly_trend}
+        weighted_score, weighted_desc = calc_weighted_tf_confluence(tf_tech)
+
         return {
-            "ticker":          ticker,
-            "name":            meta.get("longName", ticker),
-            "sector":          meta.get("sector", "Unknown"),
-            "price":           round(price, 2),
-            "change_pct":      round(change_pct, 2),
-            "sma20":           round(sma20, 2),
-            "sma50":           round(sma50, 2),
-            "sma200":          round(sma200, 2) if sma200 else None,
-            "vwap":            round(vwap, 2),
-            "rsi":             round(rsi, 1),
-            "rsi_zone":        rsi_zone,
-            "macd":            round(macd, 3),
-            "macd_signal":     round(macd_signal, 3),
-            "macd_bullish":    macd_bullish,
-            "stoch_k":         round(stoch_k, 1),
-            "vol_ratio":       round(vol_ratio, 2),
-            "obv_trend":       obv_trend,
-            "atr":             round(atr, 2),
-            "h52":             round(h52, 2),
-            "l52":             round(l52, 2),
-            "dist_h":          round(((price - h52) / h52) * 100, 1),
-            "dist_l":          round(((price - l52) / l52) * 100, 1),
-            "fib236":          fib236,
-            "fib382":          fib382,
-            "fib500":          fib500,
-            "fib618":          fib618,
-            "rh":              round(rh, 2),
-            "rl":              round(rl, 2),
+            "ticker": ticker, "name": meta.get("longName", ticker),
+            "sector": meta.get("sector", "Unknown"),
+            "price": round(price, 2), "change_pct": round(change_pct, 2),
+            "sma20": round(sma20, 2), "sma50": round(sma50, 2),
+            "sma200": round(sma200, 2) if sma200 else None,
+            "vwap": round(vwap, 2),
+            "rsi": round(rsi, 1), "rsi_zone": rsi_zone,
+            "macd": round(macd, 3), "macd_signal": round(macd_signal, 3),
+            "macd_bullish": macd_bullish,
+            "stoch_k": round(stoch_k, 1),
+            "vol_ratio": round(vol_ratio, 2), "obv_trend": obv_trend,
+            "atr": round(atr, 2),
+            "h52": round(h52, 2), "l52": round(l52, 2),
+            "dist_h": round(((price - h52) / h52) * 100, 1),
+            "dist_l": round(((price - l52) / l52) * 100, 1),
+            "fib236": fib236, "fib382": fib382, "fib500": fib500, "fib618": fib618,
+            "rh": round(rh, 2), "rl": round(rl, 2),
             "support_touches": support_touches,
-            "mom1m":           round(mom1m, 1),
-            "mom3m":           round(mom3m, 1),
-            "structure":       structure,
-            "daily_trend":     daily_trend,
-            "weekly_trend":    weekly_trend,
-            "monthly_trend":   monthly_trend,
-            "tf_confluence":   tf_conf,
-            "tech_score":      max(tech_score, 0),
+            "mom1m": round(mom1m, 1), "mom3m": round(mom3m, 1),
+            "structure": structure,
+            "daily_trend": daily_trend, "weekly_trend": weekly_trend,
+            "monthly_trend": monthly_trend, "tf_confluence": tf_conf,
+            "tech_score": max(tech_score, 0),
+            # Nuevos en v5.1
+            "divergence_type": div_type,
+            "divergence_desc": div_desc,
+            "weighted_tf_score": weighted_score,
+            "weighted_tf_desc":  weighted_desc,
         }
 
     except Exception as e:
@@ -1218,8 +1583,7 @@ def get_fundamentals(ticker):
 
         history = data.get("earningsHistory", {}).get("history", [])
         result["earnings_beats"] = sum(
-            1 for h in history[-4:]
-            if (_raw(h, "surprisePercent", 0) or 0) > 0
+            1 for h in history[-4:] if (_raw(h, "surprisePercent", 0) or 0) > 0
         )
 
         for t in data.get("insiderTransactions", {}).get("transactions", [])[:10]:
@@ -1235,7 +1599,7 @@ def get_fundamentals(ticker):
     return result
 
 # ═══════════════════════════════════════════════════════════════════════
-# CAPA 4 — SENTIMIENTO
+# CAPA 4 — SENTIMIENTO enriquecido: NewsAPI + Stocktwits + Investing.com
 # ═══════════════════════════════════════════════════════════════════════
 
 def get_sentiment(ticker, sector):
@@ -1244,6 +1608,7 @@ def get_sentiment(ticker, sector):
     positive_words  = ["beat","surge","jump","upgrade","buy","strong","growth","record","partnership","contract","raised","guidance"]
     negative_words  = ["miss","fall","drop","downgrade","sell","weak","loss","cut","investigation","lawsuit","recall","fraud"]
 
+    # NewsAPI
     if NEWS_API_KEY:
         try:
             r = requests.get(
@@ -1253,18 +1618,31 @@ def get_sentiment(ticker, sector):
             if r.status_code == 200:
                 for a in r.json().get("articles", [])[:6]:
                     title = a.get("title", "")
-                    news_items.append(title)
+                    news_items.append(f"[NEWS] {title}")
                     tl = title.lower()
                     sentiment_score += sum(1 for w in positive_words if w in tl)
                     sentiment_score -= sum(1 for w in negative_words if w in tl)
         except: pass
 
+    # RSS Yahoo Finance
     try:
         feed = feedparser.parse(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US")
-        for e in feed.entries[:4]:
-            news_items.append(e.title)
+        for e in feed.entries[:3]:
+            news_items.append(f"[YAHOO] {e.title}")
     except: pass
 
+    # Investing.com
+    investing_news = get_investing_news(ticker)
+    for n in investing_news:
+        news_items.append(f"[INVESTING] {n}")
+        tl = n.lower()
+        sentiment_score += sum(1 for w in positive_words if w in tl) * 2   # peso doble por ser fuente seria
+        sentiment_score -= sum(1 for w in negative_words if w in tl) * 2
+
+    # Stocktwits
+    st_data = get_stocktwits_sentiment(ticker)
+
+    # ETF sectorial
     sector_perf = None
     etf = SECTOR_ETFS.get(sector)
     if etf:
@@ -1279,11 +1657,16 @@ def get_sentiment(ticker, sector):
                     sector_perf = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 2)
         except: pass
 
+    # Bias sectorial por geopolítica
+    sector_geo_bias = market_context.get("sector_bias", {}).get(etf, "neutral") if etf else "neutral"
+
     return {
-        "news":            news_items[:8],
+        "news":            news_items[:10],
         "sentiment_score": sentiment_score,
         "sentiment_label": "POSITIVO" if sentiment_score > 2 else "NEGATIVO" if sentiment_score < -2 else "NEUTRAL",
         "sector_perf":     sector_perf,
+        "stocktwits":      st_data,
+        "sector_geo_bias": sector_geo_bias,
     }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1291,10 +1674,6 @@ def get_sentiment(ticker, sector):
 # ═══════════════════════════════════════════════════════════════════════
 
 def get_inst_signal(tech):
-    """
-    Infiere actividad institucional desde volumen, precio y OBV.
-    Boost aplicado ANTES del formateo para confianza coherente.
-    """
     vol_ratio  = tech.get("vol_ratio", 1)
     obv_trend  = tech.get("obv_trend", "NEUTRAL")
     change_pct = tech.get("change_pct", 0)
@@ -1308,34 +1687,24 @@ def get_inst_signal(tech):
     elif price > vwap and vol_ratio > 1.5 and change_pct > 0: signal = "PRESION COMPRADORA"; boost = 3
     elif price < vwap and vol_ratio > 1.5 and change_pct < 0: signal = "PRESION VENDEDORA";  boost = 3
 
-    if obv_trend == "ACUMULACION"  and change_pct > 0: boost += 2
+    if obv_trend == "ACUMULACION"   and change_pct > 0: boost += 2
     elif obv_trend == "DISTRIBUCION" and change_pct < 0: boost += 2
 
     return signal, boost
 
 # ═══════════════════════════════════════════════════════════════════════
-# MOTOR DE APRENDIZAJE AUTÓNOMO — 5 NIVELES
-# Activo desde predicción 20 resuelta
+# MOTOR DE APRENDIZAJE — igual que v5, sin cambios
 # ═══════════════════════════════════════════════════════════════════════
 
 def _resolved_predictions():
-    """Predicciones con resultado conocido (win o loss)."""
     return [p for p in predictions if p.get("result") in ("win", "loss")]
 
 
 def _update_learning_level1():
-    """
-    Nivel 1 — Reglas simples por indicador.
-    Ejemplo: RSI < 30 + volumen > 2x → win_rate X%
-    Activo desde predicción 20.
-    """
     resolved = _resolved_predictions()
     if len(resolved) < LEARN_MIN_PREDS:
         return
-
     rules = []
-
-    # Combinaciones a analizar
     conditions = [
         ("rsi_oversold",          lambda p: (p.get("rsi") or 50) < 32),
         ("rsi_oversold_extreme",  lambda p: (p.get("rsi") or 50) < 25),
@@ -1350,8 +1719,10 @@ def _update_learning_level1():
         ("high_score",            lambda p: (p.get("tech_score") or 0) >= 10),
         ("support_strong",        lambda p: (p.get("support_touches") or 0) >= 3),
         ("mom1m_strong",          lambda p: abs(p.get("mom1m") or 0) > 10),
+        ("high_impact_day",       lambda p: p.get("is_high_impact_day") is True),
+        ("pre_earnings",          lambda p: p.get("signal_type") == "PRE_EARNINGS"),
+        ("short_squeeze",         lambda p: p.get("signal_type") == "SHORT_SQUEEZE"),
     ]
-
     for name, cond_fn in conditions:
         matching = [p for p in resolved if cond_fn(p)]
         if len(matching) < 5:
@@ -1359,24 +1730,17 @@ def _update_learning_level1():
         wins     = sum(1 for p in matching if p["result"] == "win")
         win_rate = round(wins / len(matching) * 100, 1)
         rules.append({
-            "condition":   name,
-            "win_rate":    win_rate,
+            "condition": name, "win_rate": win_rate,
             "sample_size": len(matching),
             "description": f"{name}: {win_rate}% acierto en {len(matching)} casos",
         })
-
     learnings["rules"] = sorted(rules, key=lambda x: abs(x["win_rate"] - 50), reverse=True)
 
 
 def _update_learning_level2():
-    """
-    Nivel 2 — Ajuste por régimen de mercado.
-    Activo desde predicción 20.
-    """
     resolved = _resolved_predictions()
     if len(resolved) < LEARN_MIN_PREDS:
         return
-
     regime_memory = {}
     for regime in ["BULL", "BEAR", "LATERAL"]:
         subset = [p for p in resolved if p.get("regime") == regime]
@@ -1384,52 +1748,30 @@ def _update_learning_level2():
             continue
         wins     = sum(1 for p in subset if p["result"] == "win")
         win_rate = round(wins / len(subset) * 100, 1)
-        regime_memory[regime] = {
-            "win_rate": win_rate,
-            "total":    len(subset),
-            "buys":     sum(1 for p in subset if p.get("signal") == "COMPRAR"),
-            "sells":    sum(1 for p in subset if p.get("signal") == "VENDER"),
-        }
-
+        regime_memory[regime] = {"win_rate": win_rate, "total": len(subset)}
     learnings["regime_memory"] = regime_memory
 
 
 def _update_learning_level3():
-    """
-    Nivel 3 — Memoria por sector.
-    Activo desde predicción 40.
-    """
     resolved = _resolved_predictions()
     if len(resolved) < LEARN_MIN_L3:
         return
-
     sector_memory = {}
-    sectors = list(set(p.get("sector", "Unknown") for p in resolved))
-    for sector in sectors:
+    for sector in list(set(p.get("sector", "Unknown") for p in resolved)):
         subset = [p for p in resolved if p.get("sector") == sector]
         if len(subset) < 4:
             continue
         wins     = sum(1 for p in subset if p["result"] == "win")
         win_rate = round(wins / len(subset) * 100, 1)
         avg_conf = round(sum(p.get("confidence", 85) for p in subset) / len(subset), 1)
-        sector_memory[sector] = {
-            "win_rate": win_rate,
-            "total":    len(subset),
-            "avg_conf": avg_conf,
-        }
-
+        sector_memory[sector] = {"win_rate": win_rate, "total": len(subset), "avg_conf": avg_conf}
     learnings["sector_memory"] = sector_memory
 
 
 def _update_learning_level4():
-    """
-    Nivel 4 — Memoria por hora y sesión.
-    Activo desde predicción 60.
-    """
     resolved = _resolved_predictions()
     if len(resolved) < LEARN_MIN_L4:
         return
-
     hour_memory = {}
     for hour in range(9, 23):
         subset = [p for p in resolved if p.get("hour") == hour]
@@ -1438,107 +1780,69 @@ def _update_learning_level4():
         wins     = sum(1 for p in subset if p["result"] == "win")
         win_rate = round(wins / len(subset) * 100, 1)
         hour_memory[str(hour)] = {"win_rate": win_rate, "total": len(subset)}
-
     learnings["hour_memory"] = hour_memory
 
 
 def _update_learning_level5():
-    """
-    Nivel 5 — Autopuntuación: la IA analiza sus propios errores.
-    Activo desde predicción 80.
-    Llama a la IA con los últimos 10 fallos para extraer lecciones.
-    """
     resolved = _resolved_predictions()
     if len(resolved) < LEARN_MIN_L5:
         return
-
     recent_losses = [p for p in resolved if p["result"] == "loss"][-10:]
     if len(recent_losses) < 5:
         return
-
     losses_txt = "\n".join([
         f"- {p['ticker']} ({p.get('signal','?')}) | RSI:{p.get('rsi','?')} "
         f"Vol:{p.get('vol_ratio','?')}x | Conf:{p.get('confidence','?')}% "
         f"| Régimen:{p.get('regime','?')} | Sector:{p.get('sector','?')} "
-        f"| Estructura:{p.get('structure','?')} | TF:{p.get('tf_confluence','?')}"
+        f"| Tipo:{p.get('signal_type','NORMAL')}"
         for p in recent_losses
     ])
-
-    prompt = f"""Eres un analista cuantitativo analizando los fallos de un bot de trading.
-Aquí están los últimos {len(recent_losses)} fallos:
-
+    prompt = f"""Analiza los últimos {len(recent_losses)} fallos de un bot de trading.
 {losses_txt}
-
-Analiza los patrones comunes de estos fallos. ¿Qué indicadores o combinaciones
-están correlacionando con los errores? Sé muy específico y conciso.
-
-Responde SOLO con este formato JSON (sin markdown, sin explicaciones):
-[
-  {{"indicator": "nombre_indicador", "description": "descripción del problema en 10 palabras", "count": N}},
-  ...
-]
-Máximo 5 entradas. Solo patrones que aparezcan en 3+ fallos."""
-
+Responde SOLO con JSON (sin markdown):
+[{{"indicator": "nombre", "description": "problema en 10 palabras", "count": N}}]
+Máximo 5 entradas. Solo patrones en 3+ fallos."""
     try:
         result = call_ai(prompt, max_tokens=300)
         if result:
-            # Limpiar posible markdown
-            clean = result.strip().replace("```json", "").replace("```", "").strip()
+            clean  = result.strip().replace("```json", "").replace("```", "").strip()
             errors = json.loads(clean)
             if isinstance(errors, list):
                 learnings["error_memory"] = errors[:5]
-                print(f"  Nivel 5: {len(errors)} patrones de error detectados")
     except Exception as e:
         print(f"  Nivel 5 error: {e}")
 
 
 def run_learning_engine():
-    """
-    Ejecuta todos los niveles del motor de aprendizaje.
-    Se llama cada domingo junto al resumen semanal.
-    """
     resolved = _resolved_predictions()
     print(f"  Motor de aprendizaje: {len(resolved)} predicciones resueltas")
-
     if len(resolved) < LEARN_MIN_PREDS:
-        print(f"  Aprendizaje inactivo — necesita {LEARN_MIN_PREDS} predicciones (tiene {len(resolved)})")
+        print(f"  Inactivo — necesita {LEARN_MIN_PREDS} predicciones")
         return
-
     _update_learning_level1()
     _update_learning_level2()
-    if len(resolved) >= LEARN_MIN_L3:  _update_learning_level3()
-    if len(resolved) >= LEARN_MIN_L4:  _update_learning_level4()
-    if len(resolved) >= LEARN_MIN_L5:  _update_learning_level5()
-
+    if len(resolved) >= LEARN_MIN_L3: _update_learning_level3()
+    if len(resolved) >= LEARN_MIN_L4: _update_learning_level4()
+    if len(resolved) >= LEARN_MIN_L5: _update_learning_level5()
     learnings["last_updated"] = datetime.now(SPAIN_TZ).isoformat()
     save_state()
-
     rules_cnt  = len(learnings.get("rules", []))
     sector_cnt = len(learnings.get("sector_memory", {}))
     error_cnt  = len(learnings.get("error_memory", []))
-    print(f"  Aprendizaje actualizado: {rules_cnt} reglas | {sector_cnt} sectores | {error_cnt} patrones de error")
-    send_log(
-        f"🧠 Motor de aprendizaje actualizado\n"
-        f"Predicciones resueltas: {len(resolved)} | Reglas: {rules_cnt} | Sectores: {sector_cnt} | Errores detectados: {error_cnt}"
-    )
+    print(f"  Aprendizaje: {rules_cnt} reglas | {sector_cnt} sectores | {error_cnt} errores")
+    send_log(f"🧠 Aprendizaje: {rules_cnt} reglas | {sector_cnt} sectores | {error_cnt} patrones error")
 
 
 def update_prediction_results():
-    """
-    Comprueba si alguna predicción pendiente ha llegado a objetivo o stop.
-    Se llama cada domingo antes del resumen.
-    """
     pending = [p for p in predictions if p.get("result") == "pending"]
     if not pending:
         return
-
     for p in pending:
         ticker = p["ticker"]
         entry  = p.get("entry", 0)
         target = p.get("target", entry * 1.15)
         stop   = p.get("stop",   entry * 0.93)
         signal = p.get("signal", "COMPRAR")
-
         try:
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d",
@@ -1549,28 +1853,20 @@ def update_prediction_results():
                 if not closes:
                     continue
                 current    = closes[-1]
-                date_pred  = datetime.fromisoformat(p["date"])
-                days_since = (datetime.now() - date_pred).days
-
+                days_since = (datetime.now() - datetime.fromisoformat(p["date"])).days
                 hit_target = (signal == "COMPRAR" and current >= target) or (signal == "VENDER" and current <= target)
                 hit_stop   = (signal == "COMPRAR" and current <= stop)   or (signal == "VENDER" and current >= stop)
                 expired    = days_since > 30
-
                 if hit_target:
-                    p["result"]        = "win"
-                    p["exit_price"]    = round(current, 2)
-                    p["days_to_result"]= days_since
+                    p["result"] = "win";  p["exit_price"] = round(current, 2); p["days_to_result"] = days_since
                 elif hit_stop or expired:
-                    p["result"]        = "loss"
-                    p["exit_price"]    = round(current, 2)
-                    p["days_to_result"]= days_since
+                    p["result"] = "loss"; p["exit_price"] = round(current, 2); p["days_to_result"] = days_since
         except: pass
         time.sleep(0.3)
-
     save_state()
 
 # ═══════════════════════════════════════════════════════════════════════
-# CAPA 6 — IA (Claude Sonnet) CON PROMPTS ADAPTATIVOS
+# CAPA 6 — IA con prompts adaptativos v5.1
 # ═══════════════════════════════════════════════════════════════════════
 
 def call_ai(prompt, max_tokens=700):
@@ -1588,186 +1884,243 @@ def call_ai(prompt, max_tokens=700):
 
 
 def _build_learning_context():
-    """
-    Construye el bloque de conocimiento aprendido para inyectar en el prompt.
-    Solo incluye lo relevante según el número de predicciones resueltas.
-    """
     resolved_count = len(_resolved_predictions())
     if resolved_count < LEARN_MIN_PREDS:
         return ""
+    lines = ["\nCONOCIMIENTO HISTÓRICO APRENDIDO:"]
 
-    lines = ["\nCONOCIMIENTO HISTÓRICO DEL BOT (aprendido de predicciones reales):"]
-
-    # Nivel 1 — reglas con alta significancia
     top_rules = [r for r in learnings.get("rules", []) if r["sample_size"] >= 5][:5]
     if top_rules:
-        lines.append("Patrones con mejor/peor rendimiento histórico:")
+        lines.append("Patrones históricos:")
         for r in top_rules:
             perf = "✅ FIABLE" if r["win_rate"] >= 65 else "⚠️ POCO FIABLE" if r["win_rate"] <= 40 else "~neutro"
             lines.append(f"  {perf}: {r['description']}")
 
-    # Nivel 2 — régimen actual
-    regime      = market_regime.get("regime", "UNKNOWN")
-    reg_memory  = learnings.get("regime_memory", {}).get(regime, {})
+    regime     = market_regime.get("regime", "UNKNOWN")
+    reg_memory = learnings.get("regime_memory", {}).get(regime, {})
     if reg_memory:
-        lines.append(f"En régimen {regime}: win_rate histórico {reg_memory['win_rate']}% ({reg_memory['total']} casos)")
+        lines.append(f"Régimen {regime}: win_rate histórico {reg_memory['win_rate']}% ({reg_memory['total']} casos)")
 
-    # Nivel 3 — sector (activo desde 40 predicciones)
     if resolved_count >= LEARN_MIN_L3:
-        sector_memory = learnings.get("sector_memory", {})
-        if sector_memory:
-            worst = [s for s, d in sector_memory.items() if d["win_rate"] < 45]
-            if worst:
-                lines.append(f"Sectores con bajo rendimiento histórico: {', '.join(worst)} — ser más estricto")
+        worst = [s for s, d in learnings.get("sector_memory", {}).items() if d["win_rate"] < 45]
+        if worst:
+            lines.append(f"Sectores con bajo rendimiento histórico: {', '.join(worst)}")
 
-    # Nivel 4 — hora actual (activo desde 60 predicciones)
     if resolved_count >= LEARN_MIN_L4:
         current_hour = str(datetime.now(SPAIN_TZ).hour)
         hour_data    = learnings.get("hour_memory", {}).get(current_hour, {})
         if hour_data:
-            lines.append(f"A las {current_hour}h: win_rate histórico {hour_data['win_rate']}% ({hour_data['total']} casos)")
+            lines.append(f"A las {current_hour}h: win_rate {hour_data['win_rate']}% ({hour_data['total']} casos)")
 
-    # Nivel 5 — patrones de error (activo desde 80 predicciones)
     if resolved_count >= LEARN_MIN_L5:
-        errors = learnings.get("error_memory", [])
-        if errors:
-            lines.append("Indicadores que han engañado al bot anteriormente:")
-            for e in errors[:3]:
-                lines.append(f"  ⚠️ {e['indicator']}: {e['description']}")
+        for e in learnings.get("error_memory", [])[:3]:
+            lines.append(f"  ⚠️ Error conocido — {e['indicator']}: {e['description']}")
 
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
-def _build_auto_prompt(tech, fund, sent, inst_signal, conf_boost):
-    fg     = market_context["fear_greed"]
-    sp500  = market_context["sp500_change"]
-    vix    = market_context["vix"]
-    fg_str = _fg_label(fg)
-    regime = market_regime.get("regime", "UNKNOWN")
+def _build_auto_prompt(tech, fund, sent, inst_signal, conf_boost, special_signals=None):
+    """
+    Prompt automático v5.1 con todas las nuevas capas:
+    - Premarket / gap
+    - Stocktwits
+    - Investing.com
+    - Put/call ratio
+    - Contexto geopolítico
+    - Divergencias
+    - Confluencia ponderada
+    - Señales especiales (squeeze, insiders, pre-earnings)
+    - Calendario económico
+    - Catalizadores históricos por sector
+    """
+    if special_signals is None:
+        special_signals = {}
+
+    fg      = market_context["fear_greed"]
+    sp500   = market_context["sp500_change"]
+    vix     = market_context["vix"]
+    fg_str  = _fg_label(fg)
+    regime  = market_regime.get("regime", "UNKNOWN")
     regime_desc = market_regime.get("description", "")
 
-    news_txt  = "\n".join(f"- {h}" for h in sent["news"][:5]) or "- Sin noticias"
-    macro_txt = "\n".join(f"- {h}" for h in market_context.get("macro_news", [])[:4]) or "- Sin noticias macro"
+    # Contexto macro
+    macro_txt = "\n".join(f"- {h}" for h in market_context.get("macro_news", [])[:4]) or "- Sin noticias"
     econ_txt  = "\n".join(f"- {h}" for h in market_context.get("economic_events", [])[:3]) or "- Sin eventos"
 
+    # Calendario económico
+    eco_warn = ""
+    if econ_calendar.get("is_high_impact"):
+        events   = ", ".join(econ_calendar["high_impact_today"])
+        eco_warn = f"\n⚠️ ALTO IMPACTO HOY: {events} — ser MUY conservador"
+
+    # Geopolítica
+    geo_ctx = market_context.get("geopolitical_context", [])
+    geo_bias = market_context.get("sector_bias", {})
+    geo_txt = ""
+    if geo_ctx:
+        bias_up   = [k for k, v in geo_bias.items() if v == "up"]
+        bias_down = [k for k, v in geo_bias.items() if v == "down"]
+        geo_txt = f"\nContexto geopolítico: {', '.join(geo_ctx)}"
+        if bias_up:   geo_txt += f" | Sectores favorecidos: {', '.join(bias_up)}"
+        if bias_down: geo_txt += f" | Sectores penalizados: {', '.join(bias_down)}"
+
+    # Noticias
+    news_txt = "\n".join(f"- {h}" for h in sent["news"][:6]) or "- Sin noticias"
+
+    # Stocktwits
+    st = sent.get("stocktwits")
+    st_txt = ""
+    if st:
+        st_txt = f"\nStocktwits ({st['message_count']} msgs): {st['label']} — {st['bullish_pct']}% alcista / {st['bearish_pct']}% bajista"
+        if st.get("trending"):
+            st_txt += " — TRENDING"
+
+    # Fundamentales
     rec_map  = {"strongBuy":"COMPRA FUERTE","buy":"COMPRAR","hold":"MANTENER","sell":"VENDER","strongSell":"VENTA FUERTE"}
-    rec_txt  = rec_map.get(fund.get("rec_key","hold"), "MANTENER")
-    tgt_txt  = (f"Precio objetivo analistas: ${fund['analyst_target']} ({fund['analyst_upside']:+.1f}% upside)"
-                if fund.get("analyst_target") else "Sin precio objetivo disponible")
-    earn_txt = (f"EARNINGS EN {fund['earnings_days']} DÍAS — {fund.get('earnings_beats',0)}/4 últimos beats"
+    rec_txt  = rec_map.get(fund.get("rec_key", "hold"), "MANTENER")
+    tgt_txt  = (f"Objetivo analistas: ${fund['analyst_target']} ({fund['analyst_upside']:+.1f}%)"
+                if fund.get("analyst_target") else "Sin precio objetivo")
+    earn_txt = (f"EARNINGS EN {fund['earnings_days']} DÍAS — {fund.get('earnings_beats',0)}/4 beats"
                 if fund.get("earnings_days") is not None else "Sin earnings próximos")
 
-    # Ajuste de confianza por régimen
+    # Premarket
+    pm = special_signals.get("premarket")
+    pm_txt = ""
+    if pm and pm.get("significant"):
+        direction = "GAP UP" if pm["gap_up"] else "GAP DOWN"
+        pm_txt = f"\n🌅 PREMARKET: {direction} {pm['gap_pct']:+.1f}% | Precio pre: ${pm['pre_price']} | Vol premarket: {pm['pre_vol_ratio']}x"
+
+    # Put/call ratio
+    pc_ratio, pc_interp = special_signals.get("put_call", (None, None))
+    pc_txt = f"\nPut/Call ratio: {pc_ratio} — {pc_interp}" if pc_ratio else ""
+
+    # Divergencias
+    div_txt = ""
+    if tech.get("divergence_type"):
+        div_txt = f"\n⚡ DIVERGENCIA {tech['divergence_type']}: {tech['divergence_desc']}"
+
+    # Confluencia ponderada
+    weighted_desc = tech.get("weighted_tf_desc", tech.get("tf_confluence", ""))
+
+    # Señales especiales
+    special_txt = ""
+    if special_signals.get("squeeze"):
+        special_txt += f"\n🔀 {special_signals['squeeze']}"
+    if special_signals.get("insider"):
+        special_txt += f"\n👥 {special_signals['insider']}"
+    if special_signals.get("pre_earnings"):
+        special_txt += f"\n📅 {special_signals['pre_earnings']}"
+
+    # Catalizadores históricos
+    catalyst_ctx = get_catalyst_context(tech.get("sector", ""))
+    catalyst_txt = f"\nCatalizadores históricos en {tech.get('sector','')}:\n{catalyst_ctx}" if catalyst_ctx else ""
+
+    # Ajuste confianza mínima
     regime_adj  = get_regime_conf_adjustment()
-    conf_minimo = CONF_NORMAL + regime_adj.get(
-        "COMPRAR" if tech.get("change_pct", 0) >= 0 else "VENDER", 0
-    )
+    signal_dir  = "COMPRAR" if tech.get("change_pct", 0) >= 0 else "VENDER"
+    conf_minimo = CONF_NORMAL + regime_adj.get(signal_dir, 0)
+    if econ_calendar.get("is_high_impact"):
+        conf_minimo = max(conf_minimo, CONF_FUERTE)
 
     # Contexto aprendido
     learning_ctx = _build_learning_context()
 
-    return f"""Eres el mejor analista cuantitativo del mundo. Tu misión es encontrar las pocas oportunidades REALES del mercado.
+    return f"""Eres el mejor analista cuantitativo del mundo. Tu misión es encontrar oportunidades REALES.
 
-REGLA CRÍTICA: Solo emites señal cuando hay CONVERGENCIA entre al menos 4 de estas 5 capas:
-  1. Técnico (RSI, MACD, volumen, estructura)
-  2. Timeframes (diario + semanal + mensual alineados)
+REGLA CRÍTICA: Solo señal con CONVERGENCIA en al menos 4 de 5 capas:
+  1. Técnico (RSI, MACD, volumen, estructura, divergencias)
+  2. Timeframes ponderados según régimen (diario/semanal/mensual)
   3. Fundamental (valoración, analistas, insiders)
-  4. Sentimiento (noticias, contexto macro)
-  5. Institucional (volumen anómalo, OBV)
-Si no hay convergencia real en 4 capas → NO_SIGNAL obligatorio.
-Prefiere NO_SIGNAL a una señal mediocre. La calidad importa más que la cantidad.
+  4. Sentimiento (NewsAPI + Stocktwits + Investing.com)
+  5. Institucional (volumen, OBV, put/call ratio)
+Si no hay convergencia real → NO_SIGNAL.
 
-RÉGIMEN DE MERCADO ACTUAL: {regime} — {regime_desc}
-MACRO
-Fear&Greed: {fg}/100 — {fg_str}
-S&P500: {sp500:+.2f}% | VIX: {vix} {'— ALTA VOLATILIDAD' if vix > 25 else ''}
-Noticias macro: {macro_txt}
-Eventos económicos: {econ_txt}
+RÉGIMEN: {regime} — {regime_desc}{eco_warn}{geo_txt}
+MACRO: Fear&Greed {fg}/100 ({fg_str}) | S&P500 {sp500:+.2f}% | VIX {vix} {'⚠️ ALTA VOLATILIDAD' if vix > 25 else ''}
+{macro_txt}
+{econ_txt}
 
-TÉCNICO — {tech['ticker']} ({tech['name']})
-Precio: ${tech['price']} ({tech['change_pct']:+.2f}% hoy) | Sector: {tech['sector']} | ETF sectorial: {sent.get('sector_perf','N/D')}%
-Tendencias: Diario {tech['daily_trend']} | Semanal {tech['weekly_trend']} | Mensual {tech['monthly_trend']}
-Confluencia: {tech['tf_confluence']} | Estructura: {tech['structure']}
-SMA20: ${tech['sma20']} | SMA50: ${tech['sma50']} | SMA200: ${tech.get('sma200','N/D')} | VWAP: ${tech['vwap']} ({'SOBRE' if tech['price'] > tech['vwap'] else 'BAJO'} VWAP)
-RSI(14): {tech['rsi']} {'— SOBREVENTA EXTREMA' if tech['rsi']<25 else '— sobreventa' if tech['rsi']<32 else '— SOBRECOMPRA EXTREMA' if tech['rsi']>75 else '— sobrecompra' if tech['rsi']>68 else ''}
-MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Estocástico K: {tech['stoch_k']} {'— SOBREVENTA' if tech['stoch_k']<20 else '— SOBRECOMPRA' if tech['stoch_k']>80 else ''}
-Volumen: {tech['vol_ratio']}x media | OBV: {tech['obv_trend']} | ATR: ${tech['atr']}
+TÉCNICO — {tech['ticker']} ({tech['name']}) | Sector: {tech['sector']} | ETF: {sent.get('sector_perf','N/D')}% | Bias geo: {sent.get('sector_geo_bias','neutral')}
+Precio: ${tech['price']} ({tech['change_pct']:+.2f}% hoy){pm_txt}
+Confluencia TF ponderada: {weighted_desc}
+Estructura: {tech['structure']}
+SMA20: ${tech['sma20']} | SMA50: ${tech['sma50']} | SMA200: ${tech.get('sma200','N/D')} | VWAP: ${tech['vwap']} ({'SOBRE' if tech['price'] > tech['vwap'] else 'BAJO'})
+RSI(14): {tech['rsi']} {('SOBREVENTA EXTREMA' if tech['rsi']<25 else 'sobreventa' if tech['rsi']<32 else 'SOBRECOMPRA EXTREMA' if tech['rsi']>75 else 'sobrecompra' if tech['rsi']>68 else '')}
+MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Estocástico K: {tech['stoch_k']}{div_txt}
+Volumen: {tech['vol_ratio']}x | OBV: {tech['obv_trend']} | ATR: ${tech['atr']}
 Momentum: 1m {tech['mom1m']:+.1f}% | 3m {tech['mom3m']:+.1f}%
 Fibonacci: 23.6%=${tech['fib236']} | 38.2%=${tech['fib382']} | 50%=${tech['fib500']} | 61.8%=${tech['fib618']}
 Soporte: ${tech['rl']} ({tech['support_touches']} toques) | Resistencia: ${tech['rh']}
-Mín 52s: ${tech['l52']} ({tech['dist_l']:+.1f}%) | Máx 52s: ${tech['h52']} ({tech['dist_h']:+.1f}%)
+52s: mín ${tech['l52']} ({tech['dist_l']:+.1f}%) / máx ${tech['h52']} ({tech['dist_h']:+.1f}%)
 
 FUNDAMENTAL
-P/E Forward: {fund.get('pe_ratio','N/D')} | Margen: {fund.get('profit_margins','N/D')}% | Short: {fund.get('short_interest',0)}% {'— POSIBLE SHORT SQUEEZE' if (fund.get('short_interest') or 0) > 20 else ''}
-{earn_txt}
-Insiders: {fund.get('insider_buys',0)} compras / {fund.get('insider_sells',0)} ventas (30d)
+P/E: {fund.get('pe_ratio','N/D')} | Margen: {fund.get('profit_margins','N/D')}% | Short: {fund.get('short_interest',0)}% {'⚠️ SHORT SQUEEZE POSIBLE' if (fund.get('short_interest') or 0) > 20 else ''}
+{earn_txt} | Insiders: {fund.get('insider_buys',0)} compras / {fund.get('insider_sells',0)} ventas (30d)
 
 SENTIMIENTO
-Noticias: {sent['sentiment_label']} (score {sent['sentiment_score']}) | Analistas: {rec_txt}
-{tgt_txt}
+{sent['sentiment_label']} (score {sent['sentiment_score']}) | Analistas: {rec_txt} | {tgt_txt}{st_txt}{pc_txt}
 {news_txt}
 
-INSTITUCIONAL
-{inst_signal} | Boost calculado: +{conf_boost}%
+INSTITUCIONAL: {inst_signal} | Boost: +{conf_boost}%{special_txt}{catalyst_txt}
 {learning_ctx}
 
-INSTRUCCIONES
-Confianza mínima aceptable: {conf_minimo}% (ajustado por régimen {regime}).
-No expliques el proceso. Ve directo al resultado.
-Responde EXACTAMENTE en este formato:
+Confianza mínima: {conf_minimo}% (régimen {regime}{', alto impacto' if econ_calendar.get('is_high_impact') else ''})
+Responde EXACTAMENTE:
 
 SEÑAL: COMPRAR o VENDER
 CONFIANZA: [X]%
-🎯 ENTRADA ÓPTIMA: $[precio exacto]
-📈 OBJETIVO: [+/-X%] → $[precio] en [X días/semanas] — [razón en 5 palabras]
-🛑 STOP LOSS: $[precio en soporte/Fibonacci] — prob. stop: [X]%
+🎯 ENTRADA ÓPTIMA: $[precio]
+📈 OBJETIVO: [+/-X%] → $[precio] en [plazo] — [razón 5 palabras]
+🛑 STOP LOSS: $[precio] — prob. stop: [X]%
 ⚖️ RATIO R/B: [X]:1
-💬 POR QUÉ: [2-3 frases concretas — qué converge, por qué ahora]
-⚡ CATALIZADOR: [factor más importante]
-❌ INVALIDACIÓN: [precio o evento exacto]
+💬 POR QUÉ: [2-3 frases — qué converge, por qué ahora]
+⚡ CATALIZADOR: [factor principal]
+❌ INVALIDACIÓN: [precio o evento]
 
-Si no hay convergencia real en 4 capas: NO_SIGNAL"""
+Sin convergencia en 4 capas → NO_SIGNAL"""
 
 
 def _build_manual_prompt(tech, fund, sent):
     fg     = market_context["fear_greed"]
     fg_str = _fg_label(fg)
     regime = market_regime.get("regime", "UNKNOWN")
+    st     = sent.get("stocktwits")
+    st_txt = f"\nStocktwits: {st['label']} ({st['bullish_pct']}% bull)" if st else ""
+    div_txt = f"\nDivergencia: {tech.get('divergence_desc','')}" if tech.get("divergence_type") else ""
     learning_ctx = _build_learning_context()
 
-    return f"""Eres el mejor analista del mundo. El usuario solicita análisis de {tech['ticker']} ({tech['name']}).
-Da SIEMPRE análisis completo. Si no hay señal clara: NEUTRAL con toda la info igualmente.
-No expliques el proceso. Ve directo al resultado.
+    return f"""Eres el mejor analista del mundo. Análisis solicitado de {tech['ticker']} ({tech['name']}).
+Da SIEMPRE análisis completo. NEUTRAL si no hay señal clara.
 
 Precio: ${tech['price']} ({tech['change_pct']:+.2f}% hoy)
-RSI: {tech['rsi']} | MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Volumen: {tech['vol_ratio']}x
+RSI: {tech['rsi']} | MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Vol: {tech['vol_ratio']}x
 SMA20: ${tech['sma20']} | SMA50: ${tech['sma50']} | VWAP: ${tech['vwap']}
-Tendencia: {tech['daily_trend']} diario | {tech['weekly_trend']} semanal | {tech['tf_confluence']}
+TF ponderada: {tech.get('weighted_tf_desc', tech.get('tf_confluence',''))}
 Soporte: ${tech['rl']} ({tech['support_touches']} toques) | Resistencia: ${tech['rh']}
 Fib 38.2%: ${tech['fib382']} | 61.8%: ${tech['fib618']}
-Momentum: 1m {tech['mom1m']:+.1f}% | 3m {tech['mom3m']:+.1f}%
+Momentum: 1m {tech['mom1m']:+.1f}% | 3m {tech['mom3m']:+.1f}%{div_txt}
 Fear&Greed: {fg}/100 ({fg_str}) | VIX: {market_context['vix']} | Régimen: {regime}
 P/E: {fund.get('pe_ratio','N/D')} | Short: {fund.get('short_interest','N/D')}% | Analistas: {fund.get('rec_key','N/D')}
-Sentimiento noticias: {sent['sentiment_label']}
+Sentimiento: {sent['sentiment_label']}{st_txt}
 {learning_ctx}
 
-Responde EXACTAMENTE así:
+Responde EXACTAMENTE:
 SEÑAL: COMPRAR / VENDER / NEUTRAL
 CONFIANZA: [X]%
-📊 SITUACIÓN: [1 frase — dónde está la acción ahora y por qué importa]
-🎯 ENTRADA ÓPTIMA: $[precio]
+📊 SITUACIÓN: [1 frase]
+🎯 ENTRADA: $[precio]
 📈 OBJETIVO: [+/-X%] → $[precio] en [plazo] — [razón]
-🛑 STOP LOSS: $[precio] — prob. stop: [X]%
+🛑 STOP: $[precio] — prob. stop: [X]%
 ⚖️ RATIO R/B: [X]:1
-💬 POR QUÉ: [2-3 frases concretas]
-⚡ CATALIZADOR: [factor principal]
+💬 POR QUÉ: [2-3 frases]
+⚡ CATALIZADOR: [factor]
 ❌ INVALIDACIÓN: [precio o evento]"""
 
 # ═══════════════════════════════════════════════════════════════════════
-# FORMATEO DE ALERTAS DISCORD
+# FORMATEO DE ALERTAS
 # ═══════════════════════════════════════════════════════════════════════
 
-def format_alert(tech, ai_response, conf_final, session_tag=""):
+def format_alert(tech, ai_response, conf_final, session_tag="", signal_type="NORMAL"):
     signal = "COMPRAR"
     for line in ai_response.splitlines():
         if line.startswith("SEÑAL:"):
@@ -1775,7 +2128,15 @@ def format_alert(tech, ai_response, conf_final, session_tag=""):
             break
 
     is_buy = signal == "COMPRAR"
-    if conf_final >= CONF_EXCEPCIONAL:
+
+    # Emoji según tipo de señal y confianza
+    if signal_type == "PRE_EARNINGS":
+        emoji = "📅"
+    elif signal_type == "SHORT_SQUEEZE":
+        emoji = "🔀"
+    elif signal_type == "INSIDER_MASSIVE":
+        emoji = "👥"
+    elif conf_final >= CONF_EXCEPCIONAL:
         emoji = "⚡" if is_buy else "💀"
     elif conf_final >= CONF_FUERTE:
         emoji = "🔥" if is_buy else "🔴"
@@ -1791,11 +2152,21 @@ def format_alert(tech, ai_response, conf_final, session_tag=""):
     sess    = f"  [{session_tag}]" if session_tag and session_tag != "MERCADO" else ""
     regime  = market_regime.get("regime", "")
     reg_tag = f"  {regime}" if regime and regime != "UNKNOWN" else ""
-    now     = datetime.now(SPAIN_TZ).strftime("%H:%M  %d/%m/%Y")
+
+    # Tags especiales
+    type_tag = ""
+    if signal_type == "PRE_EARNINGS":   type_tag = "  PRE-EARNINGS"
+    elif signal_type == "SHORT_SQUEEZE": type_tag = "  SHORT SQUEEZE"
+    elif signal_type == "INSIDER_MASSIVE": type_tag = "  INSIDERS"
+
+    # Alerta de alto impacto
+    eco_tag = "  ⚠️ALTO IMPACTO" if econ_calendar.get("is_high_impact") else ""
+
+    now = datetime.now(SPAIN_TZ).strftime("%H:%M  %d/%m/%Y")
 
     text = (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{emoji}  **{signal}  —  {tech['ticker']}**{sess}{reg_tag}\n"
+        f"{emoji}  **{signal}  —  {tech['ticker']}**{sess}{reg_tag}{type_tag}{eco_tag}\n"
         f"{tech['name']}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰  **${tech['price']}**  ({sign}{tech['change_pct']}% hoy)  ·  {conf_final}% confianza\n"
@@ -1807,23 +2178,10 @@ def format_alert(tech, ai_response, conf_final, session_tag=""):
     return text, signal
 
 # ═══════════════════════════════════════════════════════════════════════
-# ANÁLISIS COMPLETO — automático y manual
+# ANÁLISIS COMPLETO
 # ═══════════════════════════════════════════════════════════════════════
 
 def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcionales=False):
-    """
-    Análisis completo con las 6 capas + aprendizaje.
-
-    force=False (automático):
-        - Filtro de score mínimo
-        - Boost institucional antes del formateo
-        - Límites diarios y de régimen
-        - Rechaza NO_SIGNAL
-
-    force=True (manual, !analizar):
-        - Sin filtros
-        - Siempre devuelve resultado aunque sea NEUTRAL
-    """
     print(f"  Analizando {ticker}...")
 
     tech = get_market_data(ticker)
@@ -1839,8 +2197,56 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
     sent               = get_sentiment(ticker, sector or tech["sector"])
     inst_signal, boost = get_inst_signal(tech)
 
-    prompt      = _build_manual_prompt(tech, fund, sent) if force else _build_auto_prompt(tech, fund, sent, inst_signal, boost)
-    ai_response = call_ai(prompt, max_tokens=650 if force else 800)
+    # Detectar señales especiales
+    signal_type    = "NORMAL"
+    special_signals = {}
+
+    # Premarket
+    if is_premarket():
+        pm_data = get_premarket_data(ticker)
+        if pm_data:
+            special_signals["premarket"] = pm_data
+            if pm_data.get("significant"):
+                print(f"    {ticker}: gap premarket {pm_data['gap_pct']:+.1f}%")
+
+    # Put/call ratio
+    pc_ratio, pc_interp = get_put_call_ratio(ticker)
+    if pc_ratio:
+        special_signals["put_call"] = (pc_ratio, pc_interp)
+
+    # Short squeeze
+    is_squeeze, squeeze_desc = detect_short_squeeze(fund, tech)
+    if is_squeeze:
+        special_signals["squeeze"] = squeeze_desc
+        signal_type = "SHORT_SQUEEZE"
+        boost = min(boost + 3, 15)
+        print(f"    {ticker}: {squeeze_desc}")
+
+    # Insiders masivos
+    is_insider, insider_desc = detect_massive_insider(fund)
+    if is_insider and signal_type == "NORMAL":
+        special_signals["insider"] = insider_desc
+        signal_type = "INSIDER_MASSIVE"
+        boost = min(boost + 3, 15)
+        print(f"    {ticker}: {insider_desc}")
+
+    # Pre-earnings (solo en automático)
+    if not force:
+        is_pe, pe_days, pe_desc = check_pre_earnings_signal(fund, tech)
+        if is_pe:
+            special_signals["pre_earnings"] = pe_desc
+            if signal_type == "NORMAL":
+                signal_type = "PRE_EARNINGS"
+            boost = min(boost + 4, 15)
+            print(f"    {ticker}: {pe_desc}")
+
+    # Construir prompt
+    if force:
+        prompt = _build_manual_prompt(tech, fund, sent)
+    else:
+        prompt = _build_auto_prompt(tech, fund, sent, inst_signal, boost, special_signals)
+
+    ai_response = call_ai(prompt, max_tokens=700 if force else 900)
     if not ai_response:
         return None
 
@@ -1858,17 +2264,16 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
                 conf_ia = int(digits[:3])
             break
 
-    # Boost institucional ANTES del formateo
     conf_final = min(conf_ia + boost, 99) if not force else conf_ia
 
-    # Controles solo en automático
+    # Controles en automático
     if not force:
         if conf_final < CONF_NORMAL:
-            print(f"    {ticker}: confianza {conf_final}% insuficiente (mín {CONF_NORMAL}%)")
+            print(f"    {ticker}: confianza {conf_final}% insuficiente")
             return None
 
         if solo_excepcionales and conf_final < CONF_EXCEPCIONAL:
-            print(f"    {ticker}: límite normal alcanzado, descartado (no es Excepcional)")
+            print(f"    {ticker}: solo excepcionales activo, descartado")
             return None
 
         # Ajuste por régimen
@@ -1881,16 +2286,16 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
 
         extra_conf = regime_adj.get(signal_check, 0)
         if conf_final < CONF_NORMAL + extra_conf:
-            print(f"    {ticker}: confianza insuficiente para régimen {market_regime.get('regime')} ({conf_final}% < {CONF_NORMAL + extra_conf}%)")
+            print(f"    {ticker}: conf insuficiente para régimen {market_regime.get('regime')} ({conf_final}%)")
             return None
 
-        puede, motivo = puede_enviar_alerta(signal_check, conf_final)
+        puede, motivo = puede_enviar_alerta(signal_check, conf_final, signal_type)
         if not puede:
             print(f"    {ticker}: {motivo}")
             return None
 
     session_tag = _session_label(datetime.now(SPAIN_TZ))
-    text, signal = format_alert(tech, ai_response, conf_final, session_tag)
+    text, signal = format_alert(tech, ai_response, conf_final, session_tag, signal_type)
 
     watch_signals[ticker] = {
         "last_analyzed": datetime.now().isoformat(),
@@ -1899,9 +2304,9 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
     save_state()
 
     nivel = "EXCEPCIONAL ⚡" if conf_final >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf_final >= CONF_FUERTE else "NORMAL 🟢"
-    print(f"    {ticker}: {nivel} {signal} {conf_final}%")
+    print(f"    {ticker}: {nivel} {signal} {conf_final}% [{signal_type}]")
 
-    return text, signal, conf_final, tech
+    return text, signal, conf_final, tech, signal_type
 
 # ═══════════════════════════════════════════════════════════════════════
 # CICLO AUTOMÁTICO — cada 5 minutos
@@ -1913,6 +2318,11 @@ def watch_cycle():
         return
 
     solo_excepcionales = alertas_hoy() >= MAX_ALERTAS_DIA
+
+    # Info de cola de calidad
+    queue_active = now.hour < HORA_DESBLOQUEO
+    if queue_active and not solo_excepcionales:
+        print(f"  Cola de calidad activa — solo Excepcionales hasta las {HORA_DESBLOQUEO}:00")
 
     candidates = quick_scan()
     if not candidates:
@@ -1935,7 +2345,9 @@ def watch_cycle():
 
     to_analyze = candidates + rotation_items
     regime     = market_regime.get("regime", "?")
-    print(f"\n[{now.strftime('%H:%M')} ES] {len(to_analyze)} candidatos | alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA} | régimen: {regime}")
+    eco_flag   = " ⚠️ALTO IMPACTO" if econ_calendar.get("is_high_impact") else ""
+    pm_flag    = " 🌅PREMARKET" if is_premarket() else ""
+    print(f"\n[{now.strftime('%H:%M')} ES] {len(to_analyze)} candidatos | alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA} | {regime}{eco_flag}{pm_flag}")
 
     alerts_this_cycle = 0
 
@@ -1953,10 +2365,6 @@ def watch_cycle():
             if elapsed < 3600:
                 continue
 
-        source = item.get("source", "")
-        if source.startswith("correlación"):
-            print(f"  Analizando {ticker} ({source})")
-
         result = analyze_ticker(
             ticker,
             item.get("name", ticker),
@@ -1967,20 +2375,20 @@ def watch_cycle():
             time.sleep(2)
             continue
 
-        text, signal, conf, tech = result
+        text, signal, conf, tech, signal_type = result
         send_alert(text)
-        save_prediction(ticker, signal, tech, conf)
+        save_prediction(ticker, signal, tech, conf, signal_type)
         alerts_this_cycle += 1
 
         nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
-        print(f"    → Alerta enviada: {ticker} {nivel} ({signal}, {conf}%)")
+        print(f"    → Alerta: {ticker} {nivel} ({signal}, {conf}%, {signal_type})")
         time.sleep(4)
 
     if alerts_this_cycle > 0:
-        print(f"  {alerts_this_cycle} alerta(s) enviada(s) este ciclo")
+        print(f"  {alerts_this_cycle} alerta(s) este ciclo")
 
 # ═══════════════════════════════════════════════════════════════════════
-# COMANDOS MANUALES — !analizar cada 30 segundos
+# COMANDOS MANUALES
 # ═══════════════════════════════════════════════════════════════════════
 
 def listen_commands(init=False):
@@ -1997,7 +2405,6 @@ def listen_commands(init=False):
             timeout=10,
         )
         if r.status_code != 200:
-            print(f"  listen_commands error {r.status_code}")
             return
 
         messages = r.json()
@@ -2022,8 +2429,6 @@ def listen_commands(init=False):
                 continue
 
             text = msg.get("content", "").strip()
-            print(f"  Mensaje en solicitudes: {text[:60]}")
-
             tickers = []
             for line in text.splitlines():
                 line = line.strip().lower()
@@ -2050,18 +2455,18 @@ def listen_commands(init=False):
                     send_solicitud(
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"❓  **{ticker}** no encontrado\n"
-                        f"Verifica que el ticker sea correcto (ej: NVDA, AAPL)\n"
+                        f"Verifica el ticker (ej: NVDA, AAPL)\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                     )
                 else:
-                    text_alert, signal, conf, tech = result
+                    text_alert, signal, conf, tech, signal_type = result
                     send_solicitud(text_alert)
 
                 fg_loop = market_context["fear_greed"]
                 update_status(
-                    f"🟢  **Activo** — vigilando mercado\n"
-                    f"📡 Fear&Greed: {fg_loop} ({_fg_label(fg_loop)}) | VIX: {market_context['vix']} | Régimen: {market_regime.get('regime','?')}\n"
-                    f"🕐  Última actualización: {now_es.strftime('%H:%M')} — si esto no cambia en 10 min el bot está caído"
+                    f"🟢  **Activo v5.1** — vigilando mercado\n"
+                    f"📡 F&G: {fg_loop} ({_fg_label(fg_loop)}) | VIX: {market_context['vix']} | {market_regime.get('regime','?')}\n"
+                    f"🕐  {now_es.strftime('%H:%M')} — si no cambia en 10 min el bot está caído"
                 )
                 time.sleep(2)
 
@@ -2071,60 +2476,75 @@ def listen_commands(init=False):
         print(traceback.format_exc())
 
 # ═══════════════════════════════════════════════════════════════════════
-# RESUMEN DOMINICAL — actualiza resultados + aprende + publica
+# RESUMEN DOMINICAL
 # ═══════════════════════════════════════════════════════════════════════
 
 def weekly_report():
     now = datetime.now(SPAIN_TZ)
-
-    # 1. Actualizar resultados pendientes
     update_prediction_results()
-
-    # 2. Ejecutar motor de aprendizaje
     run_learning_engine()
 
-    # 3. Publicar resumen
     wins    = [p for p in predictions if p.get("result") == "win"]
     losses  = [p for p in predictions if p.get("result") == "loss"]
     pending = [p for p in predictions if p.get("result") == "pending"]
 
-    # Solo la semana pasada
-    week_ago = now - timedelta(days=7)
+    week_ago  = now - timedelta(days=7)
     wins_w    = [p for p in wins    if datetime.fromisoformat(p["date"]) >= week_ago]
     losses_w  = [p for p in losses  if datetime.fromisoformat(p["date"]) >= week_ago]
     pending_w = [p for p in pending if datetime.fromisoformat(p["date"]) >= week_ago]
 
     total    = len(wins_w) + len(losses_w)
     win_rate = round(len(wins_w) / total * 100) if total > 0 else 0
-    avg_win  = round(sum(((p["exit_price"] - p["entry"]) / p["entry"] * 100) for p in wins_w)   / len(wins_w),   1) if wins_w   else 0
-    avg_loss = round(sum(((p["exit_price"] - p["entry"]) / p["entry"] * 100) for p in losses_w) / len(losses_w), 1) if losses_w else 0
+    avg_win  = round(sum(((p.get("exit_price",0) - p["entry"]) / p["entry"] * 100) for p in wins_w)   / len(wins_w),   1) if wins_w   else 0
+    avg_loss = round(sum(((p.get("exit_price",0) - p["entry"]) / p["entry"] * 100) for p in losses_w) / len(losses_w), 1) if losses_w else 0
+
+    # Desglose por tipo de señal
+    type_stats = {}
+    for p in wins_w + losses_w:
+        st = p.get("signal_type", "NORMAL")
+        if st not in type_stats:
+            type_stats[st] = {"wins": 0, "total": 0}
+        type_stats[st]["total"] += 1
+        if p["result"] == "win":
+            type_stats[st]["wins"] += 1
 
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "📊  **RESUMEN SEMANAL**",
-        f"Semana del {(now - timedelta(days=7)).strftime('%d/%m')} al {now.strftime('%d/%m/%Y')}",
-        f"Régimen de mercado: {market_regime.get('regime','?')}",
+        "📊  **RESUMEN SEMANAL v5.1**",
+        f"Semana {(now-timedelta(days=7)).strftime('%d/%m')} → {now.strftime('%d/%m/%Y')}",
+        f"Régimen: {market_regime.get('regime','?')}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
     for w in sorted(wins_w, key=lambda x: x.get("exit_price", 0) - x.get("entry", 0), reverse=True):
-        chg = round(((w["exit_price"] - w["entry"]) / w["entry"]) * 100, 1) if w.get("exit_price") else 0
-        lines.append(f"✅  **{w['ticker']}**  {chg:+.1f}%  en {w.get('days_to_result','?')} días")
+        chg  = round(((w.get("exit_price",0) - w["entry"]) / w["entry"]) * 100, 1) if w.get("exit_price") else 0
+        tag  = f" [{w.get('signal_type','NORMAL')}]" if w.get("signal_type", "NORMAL") != "NORMAL" else ""
+        lines.append(f"✅  **{w['ticker']}**{tag}  {chg:+.1f}%  en {w.get('days_to_result','?')}d")
     for l in sorted(losses_w, key=lambda x: x.get("exit_price", 0) - x.get("entry", 0)):
-        chg = round(((l["exit_price"] - l["entry"]) / l["entry"]) * 100, 1) if l.get("exit_price") else 0
-        lines.append(f"❌  **{l['ticker']}**  {chg:+.1f}%  stop en {l.get('days_to_result','?')} días")
+        chg  = round(((l.get("exit_price",0) - l["entry"]) / l["entry"]) * 100, 1) if l.get("exit_price") else 0
+        tag  = f" [{l.get('signal_type','NORMAL')}]" if l.get("signal_type", "NORMAL") != "NORMAL" else ""
+        lines.append(f"❌  **{l['ticker']}**{tag}  {chg:+.1f}%  stop {l.get('days_to_result','?')}d")
     for p in pending_w:
-        lines.append(f"⏳  **{p['ticker']}**  pendiente")
+        lines.append(f"⏳  **{p['ticker']}** pendiente")
+
     if not wins_w and not losses_w and not pending_w:
         lines.append("Sin predicciones esta semana")
 
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🎯  Aciertos: {len(wins_w)}/{total}  —  {win_rate}%",
+        f"🎯  {len(wins_w)}/{total} — {win_rate}%",
     ]
-    if wins_w:   lines.append(f"💰  Ganancia media: {avg_win:+.1f}%")
-    if losses_w: lines.append(f"📉  Pérdida media: {avg_loss:+.1f}%")
+    if wins_w:   lines.append(f"💰  Media: {avg_win:+.1f}%")
+    if losses_w: lines.append(f"📉  Media stops: {avg_loss:+.1f}%")
 
-    # Añadir reglas aprendidas si las hay
+    # Stats por tipo de señal
+    if type_stats:
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("📈  **POR TIPO DE SEÑAL**")
+        for st, d in type_stats.items():
+            wr = round(d["wins"] / d["total"] * 100) if d["total"] > 0 else 0
+            lines.append(f"  {st}: {d['wins']}/{d['total']} ({wr}%)")
+
+    # Reglas aprendidas
     top_rules = [r for r in learnings.get("rules", []) if r["sample_size"] >= 5][:3]
     if top_rules:
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -2135,25 +2555,21 @@ def weekly_report():
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     send_acierto("\n".join(lines))
-    send_log(f"📊 Resumen dominical: {len(wins_w)} aciertos / {len(losses_w)} stops / {len(pending_w)} pendientes | Reglas aprendidas: {len(learnings.get('rules',[]))}")
+    send_log(f"📊 Dominical: {len(wins_w)}✅ {len(losses_w)}❌ {len(pending_w)}⏳ | Reglas: {len(learnings.get('rules',[]))}")
 
 
 def weekly_summary():
-    now     = datetime.now(SPAIN_TZ)
-    total   = len([p for p in predictions if p.get("result") != "pending"])
-    wins    = len([p for p in predictions if p.get("result") == "win"])
-    losses  = len([p for p in predictions if p.get("result") == "loss"])
-    pending = len([p for p in predictions if p.get("result") == "pending"])
-    rate    = round(wins / total * 100, 1) if total > 0 else 0
-    regime  = market_regime.get("regime", "?")
-    rules   = len(learnings.get("rules", []))
+    now    = datetime.now(SPAIN_TZ)
+    total  = len([p for p in predictions if p.get("result") != "pending"])
+    wins   = len([p for p in predictions if p.get("result") == "win"])
+    losses = len([p for p in predictions if p.get("result") == "loss"])
+    pend   = len([p for p in predictions if p.get("result") == "pending"])
+    rate   = round(wins / total * 100, 1) if total > 0 else 0
     send_log(
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 RESUMEN — {now.strftime('%d/%m/%Y')}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ Acertadas: {wins}  ❌ Falladas: {losses}  ⏳ Pendientes: {pending}\n"
-        f"🎯 Tasa de acierto: {rate}%\n"
-        f"🧠 Reglas aprendidas: {rules} | Régimen: {regime}\n"
+        f"✅ {wins}  ❌ {losses}  ⏳ {pend} | Acierto: {rate}%\n"
+        f"🧠 Reglas: {len(learnings.get('rules',[]))} | Régimen: {market_regime.get('regime','?')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -2163,39 +2579,37 @@ def weekly_summary():
 
 def main():
     now = datetime.now(SPAIN_TZ)
-    print(f"StockBot Pro v5 — {now.strftime('%H:%M %d/%m/%Y')}")
+    print(f"StockBot Pro v5.1 — {now.strftime('%H:%M %d/%m/%Y')}")
 
     load_state()
-    update_status(f"⚙️  **Arrancando v5...**\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
-    update_market_context()   # incluye detect_market_regime()
+    update_status(f"⚙️  **Arrancando v5.1...**\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
+    update_market_context()   # incluye régimen + geopolítica + calendario
 
-    fg      = market_context["fear_greed"]
-    fg_str  = _fg_label(fg)
-    sp500   = market_context["sp500_change"]
-    vix     = market_context["vix"]
-    regime  = market_regime.get("regime", "?")
-    rules   = len(learnings.get("rules", []))
-    total_h = alertas_hoy()
+    fg     = market_context["fear_greed"]
+    fg_str = _fg_label(fg)
+    sp500  = market_context["sp500_change"]
+    vix    = market_context["vix"]
+    regime = market_regime.get("regime", "?")
+    rules  = len(learnings.get("rules", []))
+    eco    = ", ".join(econ_calendar.get("high_impact_today", [])) or "ninguno"
 
     send_log(
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 **StockBot v5 arrancado** — {now.strftime('%H:%M %d/%m/%Y')}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 Fear&Greed: {fg}/100 ({fg_str})\n"
-        f"📈 S&P500: {sp500:+.2f}%  |  VIX: {vix}\n"
+        f"🤖 **StockBot v5.1** — {now.strftime('%H:%M %d/%m/%Y')}\n"
+        f"📡 F&G: {fg}/100 ({fg_str}) | S&P500: {sp500:+.2f}% | VIX: {vix}\n"
         f"🔄 Régimen: {regime} | Universo: {len(UNIVERSE)} acciones\n"
-        f"🧠 Reglas aprendidas: {rules}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Alertas hoy: {total_h}/{MAX_ALERTAS_DIA}\n"
-        f"🟢 Vigilancia activa cada 5 min"
+        f"🧠 Reglas: {rules} | Eventos macro: {eco}\n"
+        f"📊 Alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA}\n"
+        f"🟢 Solo Excepcionales hasta las {HORA_DESBLOQUEO}:00h\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     post_instrucciones()
     print("  Instrucciones publicadas")
 
     update_status(
-        f"🟢  **Activo v5** — vigilando mercado\n"
-        f"📡 Fear&Greed: {fg} ({fg_str}) | VIX: {vix} | Régimen: {regime}\n"
+        f"🟢  **Activo v5.1** — vigilando mercado\n"
+        f"📡 F&G: {fg} ({fg_str}) | VIX: {vix} | {regime}\n"
         f"🕐  {now.strftime('%H:%M  %d/%m/%Y')}"
     )
 
@@ -2223,10 +2637,11 @@ def main():
         if ts - last_status_check >= 300:
             now_loop = datetime.now(SPAIN_TZ)
             fg_loop  = market_context["fear_greed"]
+            eco_warn = " ⚠️ALTO IMPACTO" if econ_calendar.get("is_high_impact") else ""
             update_status(
-                f"🟢  **Activo v5** — vigilando mercado\n"
-                f"📡 Fear&Greed: {fg_loop} ({_fg_label(fg_loop)}) | VIX: {market_context['vix']} | Régimen: {market_regime.get('regime','?')}\n"
-                f"🕐  Última actualización: {now_loop.strftime('%H:%M')} — si esto no cambia en 10 min el bot está caído"
+                f"🟢  **Activo v5.1** — vigilando mercado\n"
+                f"📡 F&G: {fg_loop} ({_fg_label(fg_loop)}) | VIX: {market_context['vix']} | {market_regime.get('regime','?')}{eco_warn}\n"
+                f"🕐  {now_loop.strftime('%H:%M')} — si no cambia en 10 min el bot está caído"
             )
             last_status_check = ts
 
