@@ -44,8 +44,8 @@ MAX_VENTAS_DIA  = 1
 MAX_AI_POR_CICLO = 4   # máx llamadas IA por ciclo de 5 min
 
 # Archivos de persistencia (Railway tiene /app con disco persistente)
-PREDICTIONS_FILE = "/app/predictions.json"
-WATCHSTATE_FILE  = "/app/watchstate.json"
+PREDICTIONS_FILE = "/app/data/predictions.json"
+WATCHSTATE_FILE  = "/app/data/watchstate.json"
 
 # ═══════════════════════════════════════════════════════════════════════
 # UNIVERSO DE ACCIONES
@@ -117,6 +117,7 @@ processed_cmd_ids = set()  # IDs ya procesados en esta sesión (evita reprocesar
 def load_state():
     """Al arrancar: carga predictions y watch_signals desde disco."""
     global predictions, watch_signals
+    os.makedirs("/app/data", exist_ok=True)
     try:
         if os.path.exists(PREDICTIONS_FILE):
             with open(PREDICTIONS_FILE) as f:
