@@ -1,16 +1,24 @@
 """
-StockBot Pro v3 — Reescritura limpia
-─────────────────────────────────────
-Arquitectura de 6 capas:
-  1. quick_scan()        — screeners Yahoo, sin IA, detecta movimiento
-  2. get_market_data()   — datos técnicos completos (diario, semanal, mensual)
-  3. get_fundamentals()  — P/E, short interest, earnings, insiders (1 petición)
-  4. get_sentiment()     — noticias NewsAPI + RSS Yahoo + ETF sectorial
-  5. get_inst_signal()   — infiere actividad institucional desde volumen/OBV
-  6. call_ai()           — Claude sintetiza y decide señal o NO_SIGNAL
+StockBot Pro v4
+───────────────────────────────────────────────────────────────────────
+Cambios respecto a v3:
+  - Máximo 3 alertas totales al día (Excepcional no cuenta)
+  - Confianza mínima subida de 82% a 85%
+  - Prompt IA más estricto: exige convergencia real entre capas
+  - La IA debe ser muy selectiva — mejor NO_SIGNAL que señal mediocre
+  - Boost institucional aplicado ANTES del formateo (confianza coherente)
+  - Score técnico mínimo subido de 5 a 6
 
-Flujo automático:  quick_scan → analyze_ticker (force=False) → send_alert
-Flujo manual:      !analizar TICKER → analyze_ticker (force=True) → send_solicitud
+Arquitectura de 6 capas:
+  1. quick_scan()       — screeners Yahoo, sin IA, detecta movimiento real
+  2. get_market_data()  — técnico completo: diario, semanal, mensual
+  3. get_fundamentals() — P/E, short, earnings, insiders (1 petición)
+  4. get_sentiment()    — noticias NewsAPI + RSS Yahoo + ETF sectorial
+  5. get_inst_signal()  — actividad institucional desde volumen/OBV
+  6. call_ai()          — Claude decide con convergencia real o NO_SIGNAL
+
+Flujo automático:  quick_scan → analyze_ticker(force=False) → send_alert
+Flujo manual:      !analizar TICKER → analyze_ticker(force=True) → send_solicitud
 """
 
 import os, time, json, random, schedule, requests, feedparser, anthropic
@@ -34,16 +42,19 @@ NEWS_API_KEY             = os.environ.get("NEWS_API_KEY")
 SPAIN_TZ = pytz.timezone("Europe/Madrid")
 
 # Umbrales de confianza
-CONF_NORMAL      = 82   # mínimo para enviar alerta automática
-CONF_FUERTE      = 88   # máx. 2 por día
-CONF_EXCEPCIONAL = 94   # sin límite, siempre se envía
+CONF_NORMAL      = 85   # mínimo para enviar alerta automática (subido de 82)
+CONF_FUERTE      = 88   # nivel fuerte
+CONF_EXCEPCIONAL = 94   # excepcional — no cuenta para el límite diario total
 
 # Límites diarios
-MAX_FUERTES_DIA = 2
-MAX_VENTAS_DIA  = 1
-MAX_AI_POR_CICLO = 4   # máx llamadas IA por ciclo de 5 min
+MAX_ALERTAS_DIA  = 3    # máximo total (Excepcional no cuenta)
+MAX_VENTAS_DIA   = 1    # máximo ventas al día
+MAX_AI_POR_CICLO = 4    # máximo llamadas IA por ciclo de 5 min
 
-# Archivos de persistencia (Railway tiene /app con disco persistente)
+# Score técnico mínimo para pasar al análisis profundo (subido de 5 a 6)
+SCORE_MINIMO = 6
+
+# Archivos de persistencia (Railway volume en /app/data)
 PREDICTIONS_FILE = "/app/data/predictions.json"
 WATCHSTATE_FILE  = "/app/data/watchstate.json"
 
@@ -85,7 +96,7 @@ EXTRAS = [
     "SOFI","RIVN","COIN","MSTR","HOOD","RBLX","SNAP","LYFT","SHOP","SQ","ROKU","SPOT","NET",
     "PANW","SMCI","GME","MARA","RIOT","CLSK","LCID","NKLA","AFRM","UPST","DKNG","CHWY","BYND",
     "NIO","XPEV","LI","GRAB","SEA","BIDU","RKT","RELY","STNE","IREN","PINS","CCL","NCLH",
-    "RCL","DAL","AAL","UAL","ASTS","GTLB","PLTR","HOOD","DKNG",
+    "RCL","DAL","AAL","UAL","ASTS","GTLB","PLTR","DKNG",
 ]
 UNIVERSE = list(set(SP500 + NASDAQ100 + EXTRAS))
 
@@ -100,24 +111,25 @@ SECTOR_ETFS = {
 # ESTADO GLOBAL
 # ═══════════════════════════════════════════════════════════════════════
 
-predictions   = []    # lista de predicciones guardadas en disco
+predictions   = []    # predicciones guardadas en disco
 watch_signals = {}    # {ticker: {"last_analyzed": ISO, "developing": bool}}
-market_context = {    # actualizado al arrancar y cada mañana a las 09:00
+market_context = {    # actualizado al arrancar y cada día a las 09:00
     "fear_greed": 50, "sp500_change": 0.0, "vix": 15.0,
     "macro_news": [], "economic_events": [], "updated_at": None,
 }
-status_msg_id     = None   # ID del mensaje único en #status (se edita, nunca se crea duplicado)
+status_msg_id     = None   # ID del mensaje único en #status
 last_cmd_msg_id   = None   # último ID visto en #solicitud-en-concreto
-processed_cmd_ids = set()  # IDs ya procesados en esta sesión (evita reprocesar al reiniciar)
+processed_cmd_ids = set()  # IDs ya procesados esta sesión
 
 # ═══════════════════════════════════════════════════════════════════════
 # PERSISTENCIA EN DISCO
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_state():
-    """Al arrancar: carga predictions y watch_signals desde disco."""
+    """Carga predictions y watch_signals desde disco al arrancar."""
     global predictions, watch_signals
     os.makedirs("/app/data", exist_ok=True)
+
     try:
         if os.path.exists(PREDICTIONS_FILE):
             with open(PREDICTIONS_FILE) as f:
@@ -168,11 +180,13 @@ def save_prediction(ticker, signal, entry, stop, conf):
     save_state()
 
 # ═══════════════════════════════════════════════════════════════════════
-# LÍMITES DIARIOS — todo basado en predictions (persiste entre reinicios)
+# LÍMITES DIARIOS
+# Toda la lógica se basa en predictions guardadas en disco.
+# Así los límites sobreviven reinicios sin necesidad de contadores en memoria.
 # ═══════════════════════════════════════════════════════════════════════
 
 def _preds_today():
-    """Predicciones de hoy según zona horaria España."""
+    """Predicciones registradas hoy (zona horaria España)."""
     today = datetime.now(SPAIN_TZ).date()
     result = []
     for p in predictions:
@@ -192,9 +206,12 @@ def already_alerted_today(ticker):
     return any(p["ticker"] == ticker for p in _preds_today())
 
 
-def fuertes_hoy():
-    """Alertas Fuerte (88-93%) enviadas hoy."""
-    return sum(1 for p in _preds_today() if CONF_FUERTE <= p["confidence"] < CONF_EXCEPCIONAL)
+def alertas_hoy():
+    """
+    Alertas normales+fuertes enviadas hoy.
+    Las Excepcionales (94%+) no cuentan para este límite.
+    """
+    return sum(1 for p in _preds_today() if p["confidence"] < CONF_EXCEPCIONAL)
 
 
 def ventas_hoy():
@@ -202,9 +219,29 @@ def ventas_hoy():
     return sum(1 for p in _preds_today() if p["signal"] == "VENDER")
 
 
-def alertas_hoy():
-    """Total de alertas enviadas hoy."""
-    return len(_preds_today())
+def fuertes_hoy():
+    """Alertas Fuerte (88-93%) enviadas hoy — para logging."""
+    return sum(1 for p in _preds_today() if CONF_FUERTE <= p["confidence"] < CONF_EXCEPCIONAL)
+
+
+def puede_enviar_alerta(signal, conf):
+    """
+    Comprueba si se puede enviar una alerta dadas las restricciones diarias.
+    Devuelve (True, None) si puede, o (False, "motivo") si no puede.
+    """
+    # Excepcional siempre pasa
+    if conf >= CONF_EXCEPCIONAL:
+        return True, None
+
+    # Límite total diario
+    if alertas_hoy() >= MAX_ALERTAS_DIA:
+        return False, f"límite diario ({MAX_ALERTAS_DIA}) alcanzado"
+
+    # Límite de ventas
+    if signal == "VENDER" and ventas_hoy() >= MAX_VENTAS_DIA:
+        return False, "límite de ventas diario alcanzado"
+
+    return True, None
 
 # ═══════════════════════════════════════════════════════════════════════
 # DISCORD — ENVÍO Y GESTIÓN DE MENSAJES
@@ -238,12 +275,11 @@ def update_status(text):
     Edita el mensaje único de #status.
     Si no existe en memoria, busca el último del bot en el canal.
     Si no hay ninguno, crea uno nuevo.
-    Así nunca hay mensajes duplicados de status.
+    Nunca crea duplicados.
     """
     global status_msg_id
     auth = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
     try:
-        # Buscar mensaje existente del bot si no lo tenemos en memoria
         if not status_msg_id:
             r = requests.get(
                 f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages?limit=20",
@@ -256,7 +292,6 @@ def update_status(text):
                         print(f"  Status: reutilizando mensaje {status_msg_id}")
                         break
 
-        # Editar si existe
         if status_msg_id:
             r = requests.patch(
                 f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages/{status_msg_id}",
@@ -264,11 +299,9 @@ def update_status(text):
             )
             if r.status_code in (200, 201):
                 return
-            # Falló (borrado externamente), limpiar y crear nuevo
             print(f"  Status PATCH falló ({r.status_code}) — creando nuevo")
             status_msg_id = None
 
-        # Crear nuevo mensaje
         r = requests.post(
             f"https://discord.com/api/v10/channels/{DISCORD_STATUS_ID}/messages",
             json={"content": text}, headers=auth, timeout=10,
@@ -282,11 +315,9 @@ def update_status(text):
 
 def post_instrucciones():
     """
-    Borra los mensajes anteriores del bot en #instrucciones
-    y publica las instrucciones actualizadas.
+    Borra mensajes anteriores del bot en #instrucciones y publica las nuevas.
     Solo se llama al arrancar.
     """
-    # Borrar mensajes previos del bot
     try:
         r = requests.get(
             f"https://discord.com/api/v10/channels/{DISCORD_INSTRUCCIONES_ID}/messages?limit=20",
@@ -308,12 +339,13 @@ def post_instrucciones():
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍  **Análisis automático**
 Vigila +1.200 acciones cada 5 min.
-Cuando detecta señal real, analiza con 6 capas y avisa en **#stock-alerts**.
+Solo envía cuando hay convergencia real entre capas técnica, fundamental y macro.
+Máximo 3 alertas al día.
 
 ⚡  **Niveles de confianza**
-🟢  Normal 82-87% — señal sólida
-🔥  Fuerte 88-93% — máx. 2 por día
-⚡  Excepcional 94%+ — siempre envía
+🟢  Normal 85-87% — señal sólida
+🔥  Fuerte 88-93% — alta convicción
+⚡  Excepcional 94%+ — sin límite diario
 
 🎯  **Análisis bajo demanda**
 Escribe en **#solicitud-en-concreto**:
@@ -324,7 +356,7 @@ Respuesta en menos de 30 segundos.""")
 
     _discord_post(DISCORD_INSTRUCCIONES_ID, """━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📡  **CANALES**
-**#stock-alerts** — alertas automáticas
+**#stock-alerts** — alertas automáticas (máx. 3/día)
 **#aciertos-bot** — resumen cada domingo 10:00
 **#solicitud-en-concreto** — análisis bajo demanda
 **#log-bot** — actividad interna
@@ -332,11 +364,10 @@ Respuesta en menos de 30 segundos.""")
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━""")
 
 # ═══════════════════════════════════════════════════════════════════════
-# CONTEXTO MACRO — actualizado al arrancar y cada mañana a las 09:00
+# CONTEXTO MACRO
 # ═══════════════════════════════════════════════════════════════════════
 
 def _fg_label(fg):
-    """Etiqueta textual para el índice Fear & Greed."""
     if fg < 20: return "PÁNICO EXTREMO"
     if fg < 40: return "Miedo"
     if fg < 60: return "Neutral"
@@ -352,7 +383,6 @@ def update_market_context():
     global market_context
     print("  Actualizando contexto macro...")
 
-    # Fear & Greed Index
     fg = 50
     try:
         r = requests.get("https://api.alternative.me/fng/", timeout=8)
@@ -361,7 +391,6 @@ def update_market_context():
     except Exception as e:
         print(f"    Fear&Greed error: {e}")
 
-    # S&P500 y VIX desde Yahoo Finance
     sp500_change, vix = 0.0, 15.0
     for symbol, key in [("SPY", "sp500"), ("^VIX", "vix")]:
         try:
@@ -380,7 +409,6 @@ def update_market_context():
         except Exception as e:
             print(f"    {symbol} error: {e}")
 
-    # Noticias macro desde NewsAPI (opcional, no falla si no hay clave)
     macro_news, econ_events = [], []
     if NEWS_API_KEY:
         try:
@@ -419,9 +447,8 @@ def update_market_context():
 
 def quick_scan():
     """
-    Escanea los screeners de Yahoo Finance buscando acciones con
-    movimiento real de precio y volumen anómalo.
-    No llama a la IA. No tiene coste.
+    Escanea screeners de Yahoo Finance buscando acciones con movimiento
+    real de precio y volumen anómalo. Sin IA, sin coste.
     Devuelve lista de candidatos ordenados por urgencia, sin duplicados.
     """
     headers = {
@@ -450,19 +477,17 @@ def quick_scan():
                 change    = abs(q.get("regularMarketChangePercent", 0))
                 vol_ratio = vol / avg_vol
 
-                # Filtros de calidad mínima
                 if not sym or "." in sym or len(sym) > 5:  continue
                 if price < 5 or vol < 500_000:              continue
                 if sym in seen:                             continue
                 if already_alerted_today(sym):              continue
 
-                # Score de urgencia: movimiento de precio + volumen anómalo
                 score = 0
-                if change > 8:      score += 3
-                elif change > 5:    score += 2
-                elif change > 3:    score += 1
-                if vol_ratio > 3:   score += 3
-                elif vol_ratio > 2: score += 2
+                if change > 8:        score += 3
+                elif change > 5:      score += 2
+                elif change > 3:      score += 1
+                if vol_ratio > 3:     score += 3
+                elif vol_ratio > 2:   score += 2
                 elif vol_ratio > 1.5: score += 1
 
                 if score >= 2:
@@ -480,7 +505,6 @@ def quick_scan():
         except Exception as e:
             print(f"  Quick scan error: {e}")
 
-    # Añadir acciones en desarrollo de ciclos anteriores
     developing = [
         {"ticker": t, "name": t, "sector": "Unknown", "price": 0, "change": 0, "vol_ratio": 0, "score": 1}
         for t, s in watch_signals.items()
@@ -497,9 +521,8 @@ def quick_scan():
 
 def get_market_data(ticker):
     """
-    Obtiene datos técnicos completos para un ticker.
-    Hace 3 peticiones a Yahoo: diario (1y), semanal (1y), mensual (3y).
-    Calcula RSI, MACD, Estocástico, ATR, Fibonacci, OBV, estructura de precio.
+    Datos técnicos completos para un ticker.
+    3 peticiones a Yahoo: diario (1y), semanal (1y), mensual (3y).
     Devuelve dict con todos los indicadores, o None si falla.
     """
     try:
@@ -518,7 +541,7 @@ def get_market_data(ticker):
         s.get(f"https://finance.yahoo.com/quote/{ticker}/", headers=hdrs, timeout=8)
         time.sleep(0.8)
 
-        # ── Diario (1 año) ──────────────────────────────────────────────
+        # ── Diario (1 año) ───────────────────────────────────────────────
         r = s.get(
             f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y",
             headers=hdrs, timeout=15,
@@ -554,10 +577,8 @@ def get_market_data(ticker):
         # EMA 12 y 26 para MACD
         ema12 = ema26 = closes[-1]
         for i in range(min(26, len(closes))):
-            k12   = 2 / 13
-            k26   = 2 / 27
-            ema12 = closes[-(i + 1)] * k12 + ema12 * (1 - k12)
-            ema26 = closes[-(i + 1)] * k26 + ema26 * (1 - k26)
+            ema12 = closes[-(i+1)] * (2/13) + ema12 * (11/13)
+            ema26 = closes[-(i+1)] * (2/27) + ema26 * (25/27)
         macd         = ema12 - ema26
         macd_signal  = macd * 0.9
         macd_bullish = macd > macd_signal
@@ -565,7 +586,7 @@ def get_market_data(ticker):
         # RSI 14
         gains, losses_list = [], []
         for i in range(1, 15):
-            d = closes[-i] - closes[-i - 1]
+            d = closes[-i] - closes[-i-1]
             (gains if d >= 0 else losses_list).append(abs(d))
         avg_gain = sum(gains) / 14       if gains       else 0
         avg_loss = sum(losses_list) / 14 if losses_list else 0.001
@@ -586,19 +607,19 @@ def get_market_data(ticker):
         avg_vol20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
         vol_ratio = volumes[-1] / avg_vol20  if avg_vol20 > 0    else 1
         obv = sum(
-            volumes[-i] if closes[-i] > closes[-i - 1] else -volumes[-i]
+            volumes[-i] if closes[-i] > closes[-i-1] else -volumes[-i]
             for i in range(1, min(20, len(closes)))
         )
         obv_trend = "ACUMULACION" if obv > 0 else "DISTRIBUCION"
 
-        # VWAP aproximado (últimos 5 días)
+        # VWAP (últimos 5 días)
         vwap = sum(closes[-5:]) / 5
 
-        # ATR (Average True Range, 14 días)
+        # ATR (14 días)
         atr_vals = [
             max(highs[-i] - lows[-i],
-                abs(highs[-i] - closes[-i - 1]),
-                abs(lows[-i]  - closes[-i - 1]))
+                abs(highs[-i] - closes[-i-1]),
+                abs(lows[-i]  - closes[-i-1]))
             for i in range(1, min(15, len(closes)))
             if highs and lows
         ]
@@ -618,41 +639,41 @@ def get_market_data(ticker):
         rl = min(lows[-20:])  if len(lows)  >= 20 else price
         support_touches = sum(1 for l in lows[-60:] if abs(l - rl) / rl < 0.02) if len(lows) >= 60 else 0
 
-        # Momentum temporal
+        # Momentum
         mom1m = ((price - closes[-22]) / closes[-22] * 100) if len(closes) >= 22 else 0
         mom3m = ((price - closes[-66]) / closes[-66] * 100) if len(closes) >= 66 else 0
 
-        # Estructura de precio (máximos y mínimos últimos 10 días)
+        # Estructura de precio (últimos 10 días)
         rh10 = highs[-10:] if len(highs) >= 10 else highs
         rl10 = lows[-10:]  if len(lows)  >= 10 else lows
-        hh   = all(rh10[i] >= rh10[i - 1] for i in range(1, len(rh10)))
-        hl   = all(rl10[i] >= rl10[i - 1] for i in range(1, len(rl10)))
-        lh   = all(rh10[i] <= rh10[i - 1] for i in range(1, len(rh10)))
-        ll   = all(rl10[i] <= rl10[i - 1] for i in range(1, len(rl10)))
+        hh = all(rh10[i] >= rh10[i-1] for i in range(1, len(rh10)))
+        hl = all(rl10[i] >= rl10[i-1] for i in range(1, len(rl10)))
+        lh = all(rh10[i] <= rh10[i-1] for i in range(1, len(rh10)))
+        ll = all(rl10[i] <= rl10[i-1] for i in range(1, len(rl10)))
         if hh and hl:   structure = "TENDENCIA ALCISTA CLARA"
         elif lh and ll: structure = "TENDENCIA BAJISTA CLARA"
         else:           structure = "LATERAL / CONSOLIDACION"
 
-        # Score técnico — combinaciones con sentido (no arbitrario)
+        # Score técnico — basado en combinaciones con sentido
         tech_score = 0
-        if rsi_zone in ("oversold_extreme",):   tech_score += 4
-        elif rsi_zone == "oversold":             tech_score += 2
-        elif rsi_zone in ("overbought_extreme",):tech_score += 4
-        elif rsi_zone == "overbought":           tech_score += 2
+        if rsi_zone == "oversold_extreme":    tech_score += 4
+        elif rsi_zone == "oversold":          tech_score += 2
+        elif rsi_zone == "overbought_extreme":tech_score += 4
+        elif rsi_zone == "overbought":        tech_score += 2
         if vol_ratio > 3:      tech_score += 3
         elif vol_ratio > 2:    tech_score += 2
         elif vol_ratio > 1.5:  tech_score += 1
         if abs(change_pct) > 8:   tech_score += 3
         elif abs(change_pct) > 5: tech_score += 2
         elif abs(change_pct) > 3: tech_score += 1
-        if macd_bullish and change_pct > 0:             tech_score += 2
-        if stoch_k < 20 or stoch_k > 80:                tech_score += 1
+        if macd_bullish and change_pct > 0:              tech_score += 2
+        if stoch_k < 20 or stoch_k > 80:                 tech_score += 1
         if obv_trend == "ACUMULACION" and change_pct > 0: tech_score += 2
         if abs(mom1m) > 15:  tech_score += 2
         elif abs(mom1m) > 8: tech_score += 1
         if support_touches >= 3: tech_score += 2
 
-        # ── Semanal ─────────────────────────────────────────────────────
+        # ── Semanal ──────────────────────────────────────────────────────
         weekly_trend = "N/D"
         try:
             rw = s.get(
@@ -665,7 +686,7 @@ def get_market_data(ticker):
                     weekly_trend = "ALCISTA" if wc[-1] > sum(wc[-10:]) / 10 else "BAJISTA"
         except: pass
 
-        # ── Mensual ─────────────────────────────────────────────────────
+        # ── Mensual ──────────────────────────────────────────────────────
         monthly_trend = "N/D"
         try:
             rm = s.get(
@@ -678,7 +699,6 @@ def get_market_data(ticker):
                     monthly_trend = "ALCISTA" if mc[-1] > sum(mc[-6:]) / 6 else "BAJISTA"
         except: pass
 
-        # Confluencia de timeframes
         daily_trend = "ALCISTA" if price > sma50 else "BAJISTA"
         tf_bullish  = [daily_trend, weekly_trend, monthly_trend].count("ALCISTA")
         tf_bearish  = [daily_trend, weekly_trend, monthly_trend].count("BAJISTA")
@@ -741,21 +761,15 @@ def get_market_data(ticker):
 
 def get_fundamentals(ticker):
     """
-    Obtiene P/E, short interest, earnings próximos, histórico de beats e
-    insiders. Todo en una sola petición a Yahoo Finance quoteSummary.
+    P/E, short interest, earnings próximos, histórico de beats e insiders.
+    Una sola petición a Yahoo Finance quoteSummary.
     """
     result = {
-        "pe_ratio":      None,
-        "short_interest": None,
-        "revenue_growth": None,
-        "profit_margins": None,
-        "rec_key":        "hold",
-        "analyst_target": None,
-        "analyst_upside": None,
-        "earnings_days":  None,
-        "earnings_beats": 0,
-        "insider_buys":   0,
-        "insider_sells":  0,
+        "pe_ratio": None, "short_interest": None,
+        "revenue_growth": None, "profit_margins": None,
+        "rec_key": "hold", "analyst_target": None, "analyst_upside": None,
+        "earnings_days": None, "earnings_beats": 0,
+        "insider_buys": 0, "insider_sells": 0,
     }
     modules = "defaultKeyStatistics,financialData,calendarEvents,earningsHistory,insiderTransactions"
     try:
@@ -779,26 +793,23 @@ def get_fundamentals(ticker):
         result["rec_key"]        = fin.get("recommendationKey", "hold")
 
         target  = _raw(fin, "targetMeanPrice", 0) or 0
-        current = _raw(fin, "currentPrice", 0)    or 0
+        current = _raw(fin, "currentPrice",    0) or 0
         if target and current:
             result["analyst_target"] = round(target, 2)
             result["analyst_upside"] = round(((target - current) / current) * 100, 1)
 
-        # Earnings próximos
         dates = data.get("calendarEvents", {}).get("earnings", {}).get("earningsDate", [])
         if dates:
             days = (datetime.fromtimestamp(dates[0]["raw"]) - datetime.now()).days
             if 0 <= days <= 21:
                 result["earnings_days"] = days
 
-        # Histórico de beats (últimos 4 trimestres)
         history = data.get("earningsHistory", {}).get("history", [])
         result["earnings_beats"] = sum(
             1 for h in history[-4:]
             if (_raw(h, "surprisePercent", 0) or 0) > 0
         )
 
-        # Insider transactions (últimos 30 días)
         for t in data.get("insiderTransactions", {}).get("transactions", [])[:10]:
             days_ago = (datetime.now() - datetime.fromtimestamp(_raw(t, "startDate", 0) or 0)).days
             if days_ago <= 30:
@@ -817,16 +828,14 @@ def get_fundamentals(ticker):
 
 def get_sentiment(ticker, sector):
     """
-    Obtiene noticias recientes (NewsAPI + RSS Yahoo Finance),
-    calcula sentimiento básico por palabras clave y el rendimiento
-    del ETF sectorial correspondiente.
+    Noticias NewsAPI + RSS Yahoo Finance + rendimiento ETF sectorial.
+    Calcula sentimiento básico por palabras clave.
     """
     news_items      = []
     sentiment_score = 0
     positive_words  = ["beat","surge","jump","upgrade","buy","strong","growth","record","partnership","contract"]
     negative_words  = ["miss","fall","drop","downgrade","sell","weak","loss","cut","investigation","lawsuit"]
 
-    # NewsAPI
     if NEWS_API_KEY:
         try:
             r = requests.get(
@@ -842,14 +851,12 @@ def get_sentiment(ticker, sector):
                     sentiment_score -= sum(1 for w in negative_words if w in tl)
         except: pass
 
-    # RSS Yahoo Finance
     try:
         feed = feedparser.parse(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US")
         for e in feed.entries[:4]:
             news_items.append(e.title)
     except: pass
 
-    # ETF sectorial
     sector_perf = None
     etf = SECTOR_ETFS.get(sector)
     if etf:
@@ -872,13 +879,14 @@ def get_sentiment(ticker, sector):
     }
 
 # ═══════════════════════════════════════════════════════════════════════
-# CAPA 5 — MOMENTUM INSTITUCIONAL (sin coste, sin IA)
+# CAPA 5 — MOMENTUM INSTITUCIONAL (sin IA, sin coste)
 # ═══════════════════════════════════════════════════════════════════════
 
 def get_inst_signal(tech):
     """
     Infiere actividad institucional desde volumen, precio y OBV.
     Devuelve (señal textual, boost de confianza).
+    El boost se aplica ANTES del formateo para que la confianza sea coherente.
     """
     vol_ratio  = tech.get("vol_ratio", 1)
     obv_trend  = tech.get("obv_trend", "NEUTRAL")
@@ -917,12 +925,18 @@ def call_ai(prompt, max_tokens=700):
         return None
 
 
-def _build_auto_prompt(tech, fund, sent, inst_signal):
-    """Prompt para análisis automático. Solo llama si score técnico >= 5."""
-    fg       = market_context["fear_greed"]
-    sp500    = market_context["sp500_change"]
-    vix      = market_context["vix"]
-    fg_str   = _fg_label(fg)
+def _build_auto_prompt(tech, fund, sent, inst_signal, conf_boost):
+    """
+    Prompt para análisis automático.
+    Exige convergencia real entre capas. La IA debe ser muy selectiva.
+    El boost institucional ya está calculado — se informa a la IA para que
+    lo tenga en cuenta pero no lo infle artificialmente.
+    """
+    fg      = market_context["fear_greed"]
+    sp500   = market_context["sp500_change"]
+    vix     = market_context["vix"]
+    fg_str  = _fg_label(fg)
+
     news_txt  = "\n".join(f"- {h}" for h in sent["news"][:5]) or "- Sin noticias"
     macro_txt = "\n".join(f"- {h}" for h in market_context.get("macro_news", [])[:4]) or "- Sin noticias macro"
     econ_txt  = "\n".join(f"- {h}" for h in market_context.get("economic_events", [])[:3]) or "- Sin eventos"
@@ -934,11 +948,20 @@ def _build_auto_prompt(tech, fund, sent, inst_signal):
     earn_txt = (f"EARNINGS EN {fund['earnings_days']} DÍAS — {fund.get('earnings_beats',0)}/4 últimos beats"
                 if fund.get("earnings_days") is not None else "Sin earnings próximos")
 
-    return f"""Eres el mejor analista cuantitativo del mundo. Analiza esta acción buscando la señal con mayor convicción.
+    return f"""Eres el mejor analista cuantitativo del mundo. Tu misión es encontrar las pocas oportunidades REALES del mercado.
+
+REGLA CRÍTICA: Solo emites señal cuando hay CONVERGENCIA entre al menos 4 de estas 5 capas:
+  1. Técnico (RSI, MACD, volumen, estructura)
+  2. Timeframes (diario + semanal + mensual alineados)
+  3. Fundamental (valoración, analistas, insiders)
+  4. Sentimiento (noticias, contexto macro)
+  5. Institucional (volumen anómalo, OBV)
+Si no hay convergencia real en 4 capas → NO_SIGNAL obligatorio.
+Prefiere NO_SIGNAL a una señal mediocre. La calidad importa más que la cantidad.
 
 MACRO
 Fear&Greed: {fg}/100 — {fg_str}
-S&P500: {sp500:+.2f}% | VIX: {vix} {'— ALTA VOLATILIDAD' if vix > 25 else '— mercado tranquilo'}
+S&P500: {sp500:+.2f}% | VIX: {vix} {'— ALTA VOLATILIDAD' if vix > 25 else ''}
 Noticias macro: {macro_txt}
 Eventos económicos: {econ_txt}
 
@@ -949,7 +972,7 @@ Confluencia: {tech['tf_confluence']} | Estructura: {tech['structure']}
 SMA20: ${tech['sma20']} | SMA50: ${tech['sma50']} | SMA200: ${tech.get('sma200','N/D')} | VWAP: ${tech['vwap']} ({'SOBRE' if tech['price'] > tech['vwap'] else 'BAJO'} VWAP)
 RSI(14): {tech['rsi']} {'— SOBREVENTA EXTREMA' if tech['rsi']<25 else '— sobreventa' if tech['rsi']<32 else '— SOBRECOMPRA EXTREMA' if tech['rsi']>75 else '— sobrecompra' if tech['rsi']>68 else ''}
 MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Estocástico K: {tech['stoch_k']} {'— SOBREVENTA' if tech['stoch_k']<20 else '— SOBRECOMPRA' if tech['stoch_k']>80 else ''}
-Volumen: {tech['vol_ratio']}x media {'— INSTITUCIONAL MASIVO' if tech['vol_ratio']>3 else '— elevado' if tech['vol_ratio']>1.5 else ''} | OBV: {tech['obv_trend']} | ATR: ${tech['atr']}
+Volumen: {tech['vol_ratio']}x media | OBV: {tech['obv_trend']} | ATR: ${tech['atr']}
 Momentum: 1m {tech['mom1m']:+.1f}% | 3m {tech['mom3m']:+.1f}%
 Fibonacci: 23.6%=${tech['fib236']} | 38.2%=${tech['fib382']} | 50%=${tech['fib500']} | 61.8%=${tech['fib618']}
 Soporte: ${tech['rl']} ({tech['support_touches']} toques) | Resistencia: ${tech['rh']}
@@ -966,12 +989,12 @@ Noticias: {sent['sentiment_label']} (score {sent['sentiment_score']}) | Analista
 {news_txt}
 
 INSTITUCIONAL
-{inst_signal}
+{inst_signal} | Boost calculado: +{conf_boost}%
 
 INSTRUCCIONES
-Analiza internamente buscando CONVERGENCIA entre capas. NO expliques el proceso ni las capas.
-Confianza mínima para señal: {CONF_NORMAL}%. Si no hay convicción real: NO_SIGNAL.
-Responde EXACTAMENTE en este formato, sin texto adicional:
+Confianza mínima aceptable: {CONF_NORMAL}%. Por debajo → NO_SIGNAL.
+No expliques el proceso. Ve directo al resultado.
+Responde EXACTAMENTE en este formato:
 
 SEÑAL: COMPRAR o VENDER
 CONFIANZA: [X]%
@@ -979,35 +1002,39 @@ CONFIANZA: [X]%
 📈 OBJETIVO: [+/-X%] → $[precio] en [X días/semanas] — [razón en 5 palabras]
 🛑 STOP LOSS: $[precio en soporte/Fibonacci] — prob. stop: [X]%
 ⚖️ RATIO R/B: [X]:1
-💬 POR QUÉ: [2-3 frases concretas. Qué pasa técnica/fundamentalmente, por qué ahora]
-⚡ CATALIZADOR: [factor más importante que moverá el precio]
-❌ INVALIDACIÓN: [precio o evento exacto que cancela la tesis]
+💬 POR QUÉ: [2-3 frases concretas — qué converge, por qué ahora]
+⚡ CATALIZADOR: [factor más importante]
+❌ INVALIDACIÓN: [precio o evento exacto]
 
-Si no hay convicción: NO_SIGNAL"""
+Si no hay convergencia real en 4 capas: NO_SIGNAL"""
 
 
 def _build_manual_prompt(tech, fund, sent):
-    """Prompt para !analizar — siempre da respuesta completa aunque sea NEUTRAL."""
+    """
+    Prompt para !analizar — siempre da respuesta completa aunque sea NEUTRAL.
+    Más directo y conciso que el automático.
+    """
     fg     = market_context["fear_greed"]
     fg_str = _fg_label(fg)
     return f"""Eres el mejor analista del mundo. El usuario solicita análisis de {tech['ticker']} ({tech['name']}).
-Da SIEMPRE análisis completo. Si no hay señal clara di NEUTRAL con toda la info igualmente.
-NO expliques el proceso. Ve directo al resultado.
+Da SIEMPRE análisis completo. Si no hay señal clara: NEUTRAL con toda la info igualmente.
+No expliques el proceso. Ve directo al resultado.
 
 Precio: ${tech['price']} ({tech['change_pct']:+.2f}% hoy)
 RSI: {tech['rsi']} | MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Volumen: {tech['vol_ratio']}x
 SMA20: ${tech['sma20']} | SMA50: ${tech['sma50']} | VWAP: ${tech['vwap']}
 Tendencia: {tech['daily_trend']} diario | {tech['weekly_trend']} semanal | {tech['tf_confluence']}
-Soporte: ${tech['rl']} | Resistencia: ${tech['rh']}
+Soporte: ${tech['rl']} ({tech['support_touches']} toques) | Resistencia: ${tech['rh']}
 Fib 38.2%: ${tech['fib382']} | 61.8%: ${tech['fib618']}
+Momentum: 1m {tech['mom1m']:+.1f}% | 3m {tech['mom3m']:+.1f}%
 Fear&Greed: {fg}/100 ({fg_str}) | VIX: {market_context['vix']}
 P/E: {fund.get('pe_ratio','N/D')} | Short: {fund.get('short_interest','N/D')}% | Analistas: {fund.get('rec_key','N/D')}
 Sentimiento noticias: {sent['sentiment_label']}
 
-Responde EXACTAMENTE así, sin texto adicional:
+Responde EXACTAMENTE así:
 SEÑAL: COMPRAR / VENDER / NEUTRAL
 CONFIANZA: [X]%
-📊 SITUACIÓN: [1 frase — dónde está la acción ahora y por qué es relevante]
+📊 SITUACIÓN: [1 frase — dónde está la acción ahora y por qué importa]
 🎯 ENTRADA ÓPTIMA: $[precio]
 📈 OBJETIVO: [+/-X%] → $[precio] en [plazo] — [razón]
 🛑 STOP LOSS: $[precio] — prob. stop: [X]%
@@ -1020,11 +1047,10 @@ CONFIANZA: [X]%
 # FORMATEO DE ALERTAS DISCORD
 # ═══════════════════════════════════════════════════════════════════════
 
-def format_alert(tech, ai_response, session_tag=""):
+def format_alert(tech, ai_response, conf_final, session_tag=""):
     """
     Formatea la respuesta de la IA en mensaje Discord limpio.
-    Extrae SEÑAL y CONFIANZA para el header.
-    El cuerpo muestra todo lo demás sin repetir esos campos.
+    Recibe conf_final ya con boost aplicado para que el header sea coherente.
     Devuelve (texto_formateado, señal, confianza).
     """
     # Extraer señal
@@ -1034,20 +1060,11 @@ def format_alert(tech, ai_response, session_tag=""):
             signal = "VENDER" if "VENDER" in line else "COMPRAR"
             break
 
-    # Extraer confianza
-    conf = 0
-    for line in ai_response.splitlines():
-        if "CONFIANZA:" in line:
-            digits = "".join(c for c in line if c.isdigit())
-            if digits:
-                conf = int(digits[:3])
-            break
-
     # Emoji por nivel y dirección
     is_buy = signal == "COMPRAR"
-    if conf >= CONF_EXCEPCIONAL:
+    if conf_final >= CONF_EXCEPCIONAL:
         emoji = "⚡" if is_buy else "💀"
-    elif conf >= CONF_FUERTE:
+    elif conf_final >= CONF_FUERTE:
         emoji = "🔥" if is_buy else "🔴"
     else:
         emoji = "🟢" if is_buy else "🔴"
@@ -1067,34 +1084,34 @@ def format_alert(tech, ai_response, session_tag=""):
         f"{emoji}  **{signal}  —  {tech['ticker']}**{sess}\n"
         f"{tech['name']}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰  **${tech['price']}**  ({sign}{tech['change_pct']}% hoy)  ·  {conf}% confianza\n"
+        f"💰  **${tech['price']}**  ({sign}{tech['change_pct']}% hoy)  ·  {conf_final}% confianza\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{body}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐  {now} hora España"
     )
-    return text, signal, conf
+    return text, signal
 
 # ═══════════════════════════════════════════════════════════════════════
-# ANÁLISIS COMPLETO (automático y manual comparten esta función)
+# ANÁLISIS COMPLETO — automático y manual en una sola función
 # ═══════════════════════════════════════════════════════════════════════
 
 def analyze_ticker(ticker, name="", sector="Unknown", force=False):
     """
-    Análisis completo con las 6 capas para un ticker.
+    Análisis completo con las 6 capas.
 
     force=False (automático):
-        - Respeta score técnico mínimo (5)
-        - Respeta límites diarios (fuertes, ventas)
-        - Rechaza NO_SIGNAL de la IA
-        - Devuelve None si no hay señal válida
+        - Respeta score técnico mínimo (SCORE_MINIMO)
+        - Aplica boost institucional antes del formateo
+        - Respeta límites diarios
+        - Rechaza NO_SIGNAL y confianza insuficiente
 
     force=True (manual, !analizar):
         - Sin filtros de score
         - Sin límites diarios
         - Siempre devuelve resultado (aunque sea NEUTRAL)
 
-    Retorna (texto_alerta, señal, confianza, tech) o None si no hay señal.
+    Retorna (texto, señal, confianza, tech) o None si no hay señal válida.
     """
     print(f"  Analizando {ticker}...")
 
@@ -1104,18 +1121,22 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False):
         print(f"    {ticker}: sin datos de mercado")
         return None
 
-    # Filtro de score (solo automático)
-    if not force and tech["tech_score"] < 5:
-        print(f"    {ticker}: score {tech['tech_score']} insuficiente")
+    # Filtro de score solo en automático
+    if not force and tech["tech_score"] < SCORE_MINIMO:
+        print(f"    {ticker}: score {tech['tech_score']} insuficiente (mín {SCORE_MINIMO})")
         return None
 
     # Capas 3, 4, 5
-    fund         = get_fundamentals(ticker)
-    sent         = get_sentiment(ticker, sector or tech["sector"])
+    fund              = get_fundamentals(ticker)
+    sent              = get_sentiment(ticker, sector or tech["sector"])
     inst_signal, boost = get_inst_signal(tech)
 
     # Capa 6 — IA
-    prompt      = _build_manual_prompt(tech, fund, sent) if force else _build_auto_prompt(tech, fund, sent, inst_signal)
+    if force:
+        prompt = _build_manual_prompt(tech, fund, sent)
+    else:
+        prompt = _build_auto_prompt(tech, fund, sent, inst_signal, boost)
+
     ai_response = call_ai(prompt, max_tokens=650 if force else 800)
     if not ai_response:
         return None
@@ -1126,36 +1147,51 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False):
         save_state()
         return None
 
-    # Formatear alerta
-    session_tag = _session_label(datetime.now(SPAIN_TZ))
-    text, signal, conf = format_alert(tech, ai_response, session_tag)
+    # Extraer confianza de la respuesta de la IA
+    conf_ia = 0
+    for line in ai_response.splitlines():
+        if "CONFIANZA:" in line:
+            digits = "".join(c for c in line if c.isdigit())
+            if digits:
+                conf_ia = int(digits[:3])
+            break
 
-    # Aplicar boost institucional
-    conf = min(conf + boost, 99)
+    # Aplicar boost institucional ANTES del formateo (confianza coherente en Discord)
+    conf_final = min(conf_ia + boost, 99) if not force else conf_ia
 
-    # Límites diarios (solo automático)
+    # Controles de límites solo en automático
     if not force:
-        if conf < CONF_NORMAL:
-            print(f"    {ticker}: confianza {conf}% insuficiente")
+        if conf_final < CONF_NORMAL:
+            print(f"    {ticker}: confianza {conf_final}% insuficiente (mín {CONF_NORMAL}%)")
             return None
-        if signal == "VENDER" and ventas_hoy() >= MAX_VENTAS_DIA:
-            print(f"    {ticker}: límite de ventas diario alcanzado")
+
+        # Extraer señal para verificar límites
+        signal_check = "COMPRAR"
+        for line in ai_response.splitlines():
+            if line.startswith("SEÑAL:"):
+                signal_check = "VENDER" if "VENDER" in line else "COMPRAR"
+                break
+
+        puede, motivo = puede_enviar_alerta(signal_check, conf_final)
+        if not puede:
+            print(f"    {ticker}: {motivo}")
             return None
-        if CONF_FUERTE <= conf < CONF_EXCEPCIONAL and fuertes_hoy() >= MAX_FUERTES_DIA:
-            print(f"    {ticker}: límite de fuertes diario alcanzado")
-            return None
+
+    # Formatear alerta con confianza final ya correcta
+    session_tag = _session_label(datetime.now(SPAIN_TZ))
+    text, signal = format_alert(tech, ai_response, conf_final, session_tag)
 
     # Actualizar watch_signals
     watch_signals[ticker] = {
         "last_analyzed": datetime.now().isoformat(),
-        "developing":    conf >= CONF_FUERTE,
+        "developing":    conf_final >= CONF_FUERTE,
     }
     save_state()
 
-    nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
-    print(f"    {ticker}: {nivel} {signal} {conf}%")
+    nivel = "EXCEPCIONAL ⚡" if conf_final >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf_final >= CONF_FUERTE else "NORMAL 🟢"
+    print(f"    {ticker}: {nivel} {signal} {conf_final}%")
 
-    return text, signal, conf, tech
+    return text, signal, conf_final, tech
 
 # ═══════════════════════════════════════════════════════════════════════
 # CICLO AUTOMÁTICO DE VIGILANCIA — cada 5 minutos
@@ -1163,20 +1199,26 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False):
 
 def watch_cycle():
     """
-    1. quick_scan() — detecta candidatos sin IA
-    2. Para los mejores candidatos, analyze_ticker()
-    3. Envía alertas respetando todos los límites
-    No se ejecuta fuera del horario 09:00-23:00 hora España.
+    1. quick_scan() — candidatos sin IA
+    2. analyze_ticker() para los mejores
+    3. Envía alertas respetando límites diarios
+    No corre fuera del horario 09:00-23:00 hora España.
     """
     now = datetime.now(SPAIN_TZ)
     if now.hour < 9 or now.hour >= 23:
+        return
+
+    # Si ya alcanzamos el límite diario no tiene sentido analizar más
+    # (las Excepcionales sí pueden seguir)
+    if alertas_hoy() >= MAX_ALERTAS_DIA:
+        print(f"  Límite diario de {MAX_ALERTAS_DIA} alertas alcanzado — ciclo omitido")
         return
 
     candidates = quick_scan()
     if not candidates:
         return
 
-    # Añadir muestra aleatoria del universo para rotación diaria
+    # Rotación: muestra aleatoria del universo para no depender solo del screener
     not_analyzed = [
         t for t in UNIVERSE
         if not already_alerted_today(t)
@@ -1187,12 +1229,11 @@ def watch_cycle():
     seen_in_candidates = {c["ticker"] for c in candidates}
     rotation_items = [
         {"ticker": t, "name": t, "sector": "Unknown", "score": 0}
-        for t in rotation
-        if t not in seen_in_candidates
+        for t in rotation if t not in seen_in_candidates
     ]
 
     to_analyze = candidates + rotation_items
-    print(f"\n[{now.strftime('%H:%M')} ES] {len(to_analyze)} candidatos para análisis profundo")
+    print(f"\n[{now.strftime('%H:%M')} ES] {len(to_analyze)} candidatos | alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA}")
 
     alerts_this_cycle = 0
 
@@ -1235,14 +1276,11 @@ def watch_cycle():
 
 def listen_commands(init=False):
     """
-    Revisa #solicitud-en-concreto buscando comandos !analizar TICKER.
+    Revisa #solicitud-en-concreto buscando !analizar TICKER.
 
-    init=True (al arrancar):
-        Marca todos los mensajes existentes como vistos sin procesarlos.
-        Evita re-procesar comandos antiguos tras un reinicio.
-
-    init=False (loop normal):
-        Procesa solo mensajes nuevos no vistos.
+    init=True: marca mensajes existentes como vistos sin procesarlos
+               (evita reprocesar comandos antiguos tras reinicio)
+    init=False: procesa solo mensajes nuevos
     """
     global last_cmd_msg_id, processed_cmd_ids
 
@@ -1265,17 +1303,14 @@ def listen_commands(init=False):
         if not messages:
             return
 
-        # Actualizar puntero al mensaje más reciente
         last_cmd_msg_id = messages[0]["id"]
 
-        # Al arrancar: marcar todo como visto sin procesar
         if init:
             for m in messages:
                 processed_cmd_ids.add(m["id"])
             print(f"  Comandos: {len(messages)} mensajes previos ignorados")
             return
 
-        # Procesar mensajes nuevos en orden cronológico (del más antiguo al más nuevo)
         for msg in reversed(messages):
             msg_id = msg.get("id")
             if msg_id in processed_cmd_ids:
@@ -1288,7 +1323,6 @@ def listen_commands(init=False):
             text = msg.get("content", "").strip()
             print(f"  Mensaje en solicitudes: {text[:60]}")
 
-            # Extraer tickers de líneas con !analizar
             tickers = []
             for line in text.splitlines():
                 line = line.strip().lower()
@@ -1339,10 +1373,7 @@ def listen_commands(init=False):
 # ═══════════════════════════════════════════════════════════════════════
 
 def weekly_report():
-    """
-    Revisa todas las predicciones, compara precios actuales con objetivos
-    y stops, y publica un resumen visual en #aciertos-bot.
-    """
+    """Revisa predicciones, compara con precios actuales, publica resumen."""
     now = datetime.now(SPAIN_TZ)
     wins, losses, pending = [], [], []
 
@@ -1354,7 +1385,6 @@ def weekly_report():
         signal      = p.get("signal", "COMPRAR")
         days_passed = (datetime.now() - datetime.fromisoformat(p["date"])).days
 
-        # Precio actual
         current = entry
         try:
             r = requests.get(
@@ -1418,11 +1448,9 @@ def weekly_report():
     send_acierto("\n".join(lines))
     send_log(f"📊 Resumen dominical: {len(wins)} aciertos / {len(losses)} stops / {len(pending)} pendientes")
 
-# ═══════════════════════════════════════════════════════════════════════
-# RESUMEN PERIÓDICO — #log-bot (lunes y jueves 09:00)
-# ═══════════════════════════════════════════════════════════════════════
 
 def weekly_summary():
+    """Resumen de actividad en #log-bot (lunes y jueves 09:00)."""
     now     = datetime.now(SPAIN_TZ)
     total   = len([p for p in predictions if p["result"] != "pending"])
     wins    = len([p for p in predictions if p["result"] == "win"])
@@ -1439,44 +1467,26 @@ def weekly_summary():
     )
 
 # ═══════════════════════════════════════════════════════════════════════
-# RESET DIARIO — 00:01
-# ═══════════════════════════════════════════════════════════════════════
-
-def reset_daily_counters():
-    """
-    Los límites diarios se calculan dinámicamente desde predictions
-    (fecha de hoy), así que no hay nada que resetear en memoria.
-    Simplemente logueamos el nuevo día.
-    """
-    print("  Nuevo día — contadores basados en predictions, sin reset necesario")
-    send_log("🔄 Nuevo día — límites diarios reseteados automáticamente")
-
-# ═══════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════════
 
 def _session_label(now):
     m = now.hour * 60 + now.minute
-    if  900 <= m < 930:  return "PREMARKET"
+    if  900 <= m <  930: return "PREMARKET"
     if  930 <= m < 1380: return "MERCADO"
     if 1380 <= m < 1440: return "AFTERHOURS"
     return "FUERA DE MERCADO"
 
 # ═══════════════════════════════════════════════════════════════════════
-# MAIN — arranca todo y mantiene el loop
+# MAIN
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
     now = datetime.now(SPAIN_TZ)
-    print(f"StockBot Pro v3 — {now.strftime('%H:%M %d/%m/%Y')}")
+    print(f"StockBot Pro v4 — {now.strftime('%H:%M %d/%m/%Y')}")
 
-    # 1. Cargar estado desde disco
     load_state()
-
-    # 2. Status: arrancando
     update_status(f"⚙️  **Arrancando...**\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
-
-    # 3. Contexto macro
     update_status("⚙️  **Cargando contexto macro...**")
     update_market_context()
 
@@ -1485,47 +1495,38 @@ def main():
     sp500   = market_context["sp500_change"]
     vix     = market_context["vix"]
     total_h = alertas_hoy()
-    fuertes = fuertes_hoy()
 
-    # 4. Log de arranque en #log-bot
     send_log(
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 **StockBot v3 arrancado** — {now.strftime('%H:%M %d/%m/%Y')}\n"
+        f"🤖 **StockBot v4 arrancado** — {now.strftime('%H:%M %d/%m/%Y')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 Fear&Greed: {fg}/100 ({fg_str})\n"
         f"📈 S&P500: {sp500:+.2f}%  |  VIX: {vix}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Alertas hoy: {total_h}  |  Fuertes: {fuertes}/{MAX_FUERTES_DIA}\n"
+        f"📊 Alertas hoy: {total_h}/{MAX_ALERTAS_DIA}\n"
         f"🟢 Vigilancia activa cada 5 min"
     )
 
-    # 5. Instrucciones en Discord (borra duplicados)
     print("  Publicando instrucciones...")
     post_instrucciones()
     print("  Instrucciones publicadas")
 
-    # 6. Status: activo
     update_status(
         f"🟢  **Activo** — vigilando mercado\n"
         f"📡 Fear&Greed: {fg} ({fg_str}) | VIX: {vix}\n"
         f"🕐  {now.strftime('%H:%M  %d/%m/%Y')}"
     )
 
-    # 7. Primer ciclo de análisis inmediato al arrancar
     watch_cycle()
-
-    # 8. Marcar mensajes existentes como vistos (evita reprocesar al reiniciar)
     listen_commands(init=True)
 
-    # 9. Schedules
     schedule.every(5).minutes.do(watch_cycle)
     schedule.every().day.at("09:00").do(update_market_context)
-    schedule.every().day.at("00:01").do(reset_daily_counters)
+    schedule.every().day.at("00:01").do(lambda: send_log("🔄 Nuevo día — límites reseteados automáticamente"))
     schedule.every().sunday.at("10:00").do(weekly_report)
     schedule.every().monday.at("09:00").do(weekly_summary)
     schedule.every().thursday.at("09:00").do(weekly_summary)
 
-    # 10. Loop principal
     last_cmd_check    = 0.0
     last_status_check = 0.0
 
@@ -1533,12 +1534,10 @@ def main():
         schedule.run_pending()
         ts = time.time()
 
-        # Comandos manuales cada 30 segundos
         if ts - last_cmd_check >= 30:
             listen_commands()
             last_cmd_check = ts
 
-        # Heartbeat de status cada 5 minutos
         if ts - last_status_check >= 300:
             now_loop = datetime.now(SPAIN_TZ)
             fg_loop  = market_context["fear_greed"]
