@@ -35,6 +35,7 @@ DISCORD_SOLICITUD_ID     = "1478470481693900841"
 DISCORD_INSTRUCCIONES_ID = "1478470715509440748"
 DISCORD_STATUS_ID        = "1478471477568475248"
 ANTHROPIC_API_KEY        = os.environ.get("ANTHROPIC_API_KEY")
+_ai_client               = None   # singleton — se crea la primera vez que se necesita
 NEWS_API_KEY             = os.environ.get("NEWS_API_KEY")
 
 SPAIN_TZ = pytz.timezone("Europe/Madrid")
@@ -363,8 +364,10 @@ def save_state():
         (econ_calendar,   ECON_CALENDAR_FILE),
     ]:
         try:
-            with open(filepath, "w") as f:
+            tmp_path = filepath + ".tmp"
+            with open(tmp_path, "w") as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp_path, filepath)  # atómico en POSIX
         except Exception as e:
             print(f"  ERROR guardando {filepath}: {e}")
 
@@ -473,9 +476,20 @@ def _session_label(now):
     return "FUERA DE MERCADO"
 
 
+def _to_aware(dt_str, default="2000-01-01T00:00:00+00:00"):
+    """Parsea un string ISO y lo convierte a timezone-aware (SPAIN_TZ)."""
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        if dt.tzinfo is None:
+            dt = SPAIN_TZ.localize(dt)
+        return dt.astimezone(SPAIN_TZ)
+    except Exception:
+        return datetime.fromisoformat(default).astimezone(SPAIN_TZ)
+
+
 def is_premarket():
     now = datetime.now(SPAIN_TZ)
-    return 9 <= now.hour < 15 and now.minute < 30 if now.hour == 15 else 9 <= now.hour < 15
+    return (9 <= now.hour < 15) or (now.hour == 15 and now.minute < 30)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -616,7 +630,7 @@ def update_econ_calendar():
             for keyword, event_name in high_impact_keywords.items():
                 if keyword.lower() in title.lower() and event_name not in found_events:
                     found_events.append(event_name)
-    except: pass
+    except Exception: pass
 
     # También revisar macro_news del contexto
     for news in market_context.get("macro_news", []):
@@ -755,7 +769,7 @@ def post_instrucciones():
                         headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=5,
                     )
                     time.sleep(0.5)
-    except: pass
+    except Exception: pass
 
     resolved  = len([p for p in predictions if p.get("result") != "pending"])
     rules_cnt = len(learnings.get("rules", []))
@@ -812,7 +826,7 @@ def update_market_context():
         r = requests.get("https://api.alternative.me/fng/", timeout=8)
         if r.status_code == 200:
             fg = int(r.json()["data"][0]["value"])
-    except: pass
+    except Exception: pass
 
     sp500_change, vix = 0.0, 15.0
     for symbol, key in [("SPY", "sp500"), ("^VIX", "vix")]:
@@ -829,7 +843,7 @@ def update_market_context():
                     else:
                         vix = round(closes[-1], 1)
             time.sleep(0.5)
-        except: pass
+        except Exception: pass
 
     macro_news, econ_events = [], []
     if NEWS_API_KEY:
@@ -840,7 +854,7 @@ def update_market_context():
             )
             if r.status_code == 200:
                 macro_news = [a.get("title", "") for a in r.json().get("articles", [])[:6]]
-        except: pass
+        except Exception: pass
         try:
             r = requests.get(
                 f"https://newsapi.org/v2/everything?q=Federal+Reserve+OR+CPI+OR+inflation&language=en&sortBy=publishedAt&pageSize=4&apiKey={NEWS_API_KEY}",
@@ -848,7 +862,7 @@ def update_market_context():
             )
             if r.status_code == 200:
                 econ_events = [a.get("title", "") for a in r.json().get("articles", [])[:4]]
-        except: pass
+        except Exception: pass
 
     market_context.update({
         "fear_greed": fg, "sp500_change": sp500_change, "vix": vix,
@@ -972,9 +986,8 @@ def calc_weighted_tf_confluence(tech):
 
     if score >= 0.8:   label = "CONFLUENCIA ALCISTA FUERTE"
     elif score >= 0.5: label = "MAYORIA ALCISTA"
-    elif score <= 0.2: label = "CONFLUENCIA BAJISTA FUERTE"
-    elif score <= 0.5: label = "MAYORIA BAJISTA"
-    else:              label = "SIN CONFLUENCIA"
+    elif score > 0.2:  label = "MAYORIA BAJISTA"
+    else:              label = "CONFLUENCIA BAJISTA FUERTE"
 
     return round(score, 2), f"{label} ({raw_pct}% ponderado — régimen {regime}: D{int(w_d*100)}%/S{int(w_w*100)}%/M{int(w_m*100)}%)"
 
@@ -1370,7 +1383,7 @@ def get_market_data(ticker):
         try:
             s.get(f"https://finance.yahoo.com/quote/{ticker}/", headers=hdrs, timeout=8)
             time.sleep(1.0)
-        except: pass
+        except Exception: pass
 
         data, status = _yahoo_get(s, host, ticker, "1d", "1y", hdrs)
         if not data:
@@ -1400,12 +1413,28 @@ def get_market_data(ticker):
         sma50      = sum(closes[-50:]) / 50
         sma200     = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
 
-        ema12 = ema26 = closes[-1]
-        for i in range(min(26, len(closes))):
-            ema12 = closes[-(i+1)] * (2/13) + ema12 * (11/13)
-            ema26 = closes[-(i+1)] * (2/27) + ema26 * (25/27)
-        macd         = ema12 - ema26
-        macd_signal  = macd * 0.9
+        # MACD: EMA12 y EMA26 inicializadas con SMA, señal = EMA9 del MACD
+        k12, k26, k9 = 2/13, 2/27, 2/10
+        if len(closes) >= 26:
+            ema12 = sum(closes[:12]) / 12
+            for c in closes[12:26]:
+                ema12 = c * k12 + ema12 * (1 - k12)
+            ema26 = sum(closes[:26]) / 26
+            macd_hist = []
+            for c in closes[26:]:
+                ema12 = c * k12 + ema12 * (1 - k12)
+                ema26 = c * k26 + ema26 * (1 - k26)
+                macd_hist.append(ema12 - ema26)
+            macd = macd_hist[-1] if macd_hist else 0.0
+            if len(macd_hist) >= 9:
+                macd_signal = sum(macd_hist[:9]) / 9
+                for mv in macd_hist[9:]:
+                    macd_signal = mv * k9 + macd_signal * (1 - k9)
+            else:
+                macd_signal = 0.0
+        else:
+            macd = 0.0
+            macd_signal = 0.0
         macd_bullish = macd > macd_signal
 
         gains, losses_list = [], []
@@ -1494,7 +1523,7 @@ def get_market_data(ticker):
                 closes_w = [c for c in data_w["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
                 if len(closes_w) >= 10:
                     weekly_trend = "ALCISTA" if closes_w[-1] > sum(closes_w[-10:]) / 10 else "BAJISTA"
-            except: pass
+            except Exception: pass
 
         # ── Mensual ───────────────────────────────────────────────────
         monthly_trend = "N/D"
@@ -1505,7 +1534,7 @@ def get_market_data(ticker):
                 mc = [c for c in data_m["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
                 if len(mc) >= 6:
                     monthly_trend = "ALCISTA" if mc[-1] > sum(mc[-6:]) / 6 else "BAJISTA"
-            except: pass
+            except Exception: pass
 
         daily_trend = "ALCISTA" if price > sma50 else "BAJISTA"
         tf_bullish  = [daily_trend, weekly_trend, monthly_trend].count("ALCISTA")
@@ -1520,7 +1549,17 @@ def get_market_data(ticker):
         if tf_bearish >= 2: tech_score += 2
 
         # ── Divergencias (solo si 2 timeframes) ──────────────────────
-        div_type, div_desc = detect_divergence(closes, rsi, closes_w, rsi)
+        # Calcular RSI semanal para la detección de divergencias
+        rsi_w = None
+        if len(closes_w) >= 15:
+            gains_w, losses_w_rsi = [], []
+            for i in range(1, 15):
+                d_w = closes_w[-i] - closes_w[-i-1]
+                (gains_w if d_w >= 0 else losses_w_rsi).append(abs(d_w))
+            avg_gain_w = sum(gains_w) / 14
+            avg_loss_w = sum(losses_w_rsi) / 14 if losses_w_rsi else 0.001
+            rsi_w = 100 - (100 / (1 + avg_gain_w / avg_loss_w))
+        div_type, div_desc = detect_divergence(closes, rsi, closes_w, rsi_w)
 
         # ── Confluencia dinámica ponderada ────────────────────────────
         tf_tech = {"daily_trend": daily_trend, "weekly_trend": weekly_trend,
@@ -1607,7 +1646,7 @@ def get_fundamentals(ticker):
 
         dates = data.get("calendarEvents", {}).get("earnings", {}).get("earningsDate", [])
         if dates:
-            days = (datetime.fromtimestamp(dates[0]["raw"]) - datetime.now()).days
+            days = (datetime.fromtimestamp(dates[0]["raw"], tz=SPAIN_TZ) - datetime.now(SPAIN_TZ)).days
             if 0 <= days <= 21:
                 result["earnings_days"] = days
 
@@ -1617,7 +1656,7 @@ def get_fundamentals(ticker):
         )
 
         for t in data.get("insiderTransactions", {}).get("transactions", [])[:10]:
-            days_ago = (datetime.now() - datetime.fromtimestamp(_raw(t, "startDate", 0) or 0)).days
+            days_ago = (datetime.now(SPAIN_TZ) - datetime.fromtimestamp(_raw(t, "startDate", 0) or 0, tz=SPAIN_TZ)).days
             if days_ago <= 30:
                 txt = t.get("transactionText", "")
                 if "Purchase" in txt: result["insider_buys"]  += 1
@@ -1652,14 +1691,14 @@ def get_sentiment(ticker, sector):
                     tl = title.lower()
                     sentiment_score += sum(1 for w in positive_words if w in tl)
                     sentiment_score -= sum(1 for w in negative_words if w in tl)
-        except: pass
+        except Exception: pass
 
     # RSS Yahoo Finance
     try:
         feed = feedparser.parse(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US")
         for e in feed.entries[:3]:
             news_items.append(f"[YAHOO] {e.title}")
-    except: pass
+    except Exception: pass
 
     # Investing.com
     investing_news = get_investing_news(ticker)
@@ -1685,7 +1724,7 @@ def get_sentiment(ticker, sector):
                 closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
                 if len(closes) >= 2:
                     sector_perf = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 2)
-        except: pass
+        except Exception: pass
 
     # Bias sectorial por geopolítica
     sector_geo_bias = market_context.get("sector_bias", {}).get(etf, "neutral") if etf else "neutral"
@@ -1883,7 +1922,7 @@ def update_prediction_results():
                 if not closes:
                     continue
                 current    = closes[-1]
-                days_since = (datetime.now() - datetime.fromisoformat(p["date"])).days
+                days_since = (datetime.now(SPAIN_TZ) - _to_aware(p["date"])).days
                 hit_target = (signal == "COMPRAR" and current >= target) or (signal == "VENDER" and current <= target)
                 hit_stop   = (signal == "COMPRAR" and current <= stop)   or (signal == "VENDER" and current >= stop)
                 expired    = days_since > 30
@@ -1891,7 +1930,7 @@ def update_prediction_results():
                     p["result"] = "win";  p["exit_price"] = round(current, 2); p["days_to_result"] = days_since
                 elif hit_stop or expired:
                     p["result"] = "loss"; p["exit_price"] = round(current, 2); p["days_to_result"] = days_since
-        except: pass
+        except Exception: pass
         time.sleep(0.3)
     save_state()
 
@@ -1900,9 +1939,11 @@ def update_prediction_results():
 # ═══════════════════════════════════════════════════════════════════════
 
 def call_ai(prompt, max_tokens=700):
+    global _ai_client
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        msg    = client.messages.create(
+        if _ai_client is None:
+            _ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg    = _ai_client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
@@ -2358,7 +2399,7 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
         pasa, pf_resumen = pre_filter_convergence(tech, fund, sent, inst_signal, boost, special_signals)
         if not pasa:
             print(f"    {ticker}: prefiltro {pf_resumen}")
-            watch_signals[ticker] = {"last_analyzed": datetime.now().isoformat(), "developing": False}
+            watch_signals[ticker] = {"last_analyzed": datetime.now(SPAIN_TZ).isoformat(), "developing": False}
             save_state()
             return None
         print(f"    {ticker}: prefiltro OK — {pf_resumen}")
@@ -2374,7 +2415,7 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
         return None
 
     if not force and "NO_SIGNAL" in ai_response:
-        watch_signals[ticker] = {"last_analyzed": datetime.now().isoformat(), "developing": False}
+        watch_signals[ticker] = {"last_analyzed": datetime.now(SPAIN_TZ).isoformat(), "developing": False}
         save_state()
         return None
 
@@ -2382,9 +2423,9 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
     conf_ia = 0
     for line in ai_response.splitlines():
         if "CONFIANZA:" in line:
-            digits = "".join(c for c in line if c.isdigit())
-            if digits:
-                conf_ia = int(digits[:3])
+            m_conf = re.search(r"CONFIANZA:\s*(\d+)", line)
+            if m_conf:
+                conf_ia = int(m_conf.group(1))
             break
 
     conf_final = min(conf_ia + boost, 99) if not force else conf_ia
@@ -2421,7 +2462,7 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
     text, signal = format_alert(tech, ai_response, conf_final, session_tag, signal_type)
 
     watch_signals[ticker] = {
-        "last_analyzed": datetime.now().isoformat(),
+        "last_analyzed": datetime.now(SPAIN_TZ).isoformat(),
         "developing":    conf_final >= CONF_FUERTE,
     }
     save_state()
@@ -2582,7 +2623,7 @@ def cmd_pendientes():
                 closes = [c for c in closes if c]
                 if closes:
                     current_price = closes[-1]
-        except: pass
+        except Exception: pass
 
         entry  = p.get("entry", 0)
         target = p.get("target", 0)
@@ -2627,8 +2668,8 @@ def watch_cycle():
         t for t in UNIVERSE
         if not already_alerted_today(t)
         and (t not in watch_signals
-             or (datetime.now() - datetime.fromisoformat(
-                 watch_signals[t].get("last_analyzed", "2000-01-01")
+             or (datetime.now(SPAIN_TZ) - _to_aware(
+                 watch_signals[t].get("last_analyzed", "2000-01-01T00:00:00+00:00")
              )).total_seconds() > 86400)
     ]
     rotation = random.sample(not_analyzed, min(4, len(not_analyzed)))
@@ -2658,7 +2699,7 @@ def watch_cycle():
 
         last = watch_signals.get(ticker, {}).get("last_analyzed")
         if last:
-            elapsed = (datetime.now() - datetime.fromisoformat(last)).total_seconds()
+            elapsed = (datetime.now(SPAIN_TZ) - _to_aware(last)).total_seconds()
             if elapsed < 3600:
                 continue
 
@@ -2751,10 +2792,15 @@ def listen_commands(init=False):
                 parts = line.split()
                 if len(parts) >= 2:
                     t = parts[1].upper().strip()
-                    if t not in tickers:
+                    if re.match(r'^[A-Z]{1,5}$', t) and t not in tickers:
                         tickers.append(t)
 
             if not tickers:
+                continue
+
+            # Seguridad: owner check
+            if not is_owner(user_id):
+                send_solicitud("⛔ No tienes permiso para usar !analizar.")
                 continue
 
             # Seguridad: rate limit
@@ -2808,9 +2854,9 @@ def weekly_report():
     pending = [p for p in predictions if p.get("result") == "pending"]
 
     week_ago  = now - timedelta(days=7)
-    wins_w    = [p for p in wins    if datetime.fromisoformat(p["date"]) >= week_ago]
-    losses_w  = [p for p in losses  if datetime.fromisoformat(p["date"]) >= week_ago]
-    pending_w = [p for p in pending if datetime.fromisoformat(p["date"]) >= week_ago]
+    wins_w    = [p for p in wins    if _to_aware(p["date"]) >= week_ago]
+    losses_w  = [p for p in losses  if _to_aware(p["date"]) >= week_ago]
+    pending_w = [p for p in pending if _to_aware(p["date"]) >= week_ago]
 
     total    = len(wins_w) + len(losses_w)
     win_rate = round(len(wins_w) / total * 100) if total > 0 else 0
@@ -2897,6 +2943,14 @@ def weekly_summary():
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
+    # Validar variables de entorno críticas antes de arrancar
+    missing = [name for name, val in [
+        ("DISCORD_TOKEN", DISCORD_TOKEN),
+        ("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY),
+    ] if not val]
+    if missing:
+        raise SystemExit(f"ERROR: variables de entorno no configuradas: {', '.join(missing)}")
+
     now = datetime.now(SPAIN_TZ)
     print(f"StockBot Pro v5.1 — {now.strftime('%H:%M %d/%m/%Y')}")
 
