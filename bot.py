@@ -56,6 +56,13 @@ SCORE_MINIMO = 8   # subido de 6 a 8 para reducir llamadas IA innecesarias
 # Cola de calidad: hora a partir de la cual se desbloquean normales/fuertes
 HORA_DESBLOQUEO = 14   # 14:00 hora España
 
+# Seguridad y monitorización
+OWNER_DISCORD_ID      = os.environ.get("OWNER_DISCORD_ID", "")  # tu user ID de Discord
+MAX_ANALIZAR_POR_HORA = 3      # máximo !analizar por usuario por hora
+COSTE_MAX_DIA         = 0.50   # alerta si se supera este gasto estimado ($)
+MAX_429_SEGUIDOS      = 5      # ciclos con mayoría de 429 antes de pausa larga
+PAUSA_429_MINUTOS     = 20     # minutos de pausa si Yahoo está bloqueando fuerte
+
 # Aprendizaje
 LEARN_MIN_PREDS = 20
 LEARN_MIN_L3    = 40
@@ -302,6 +309,15 @@ market_regime  = {
 status_msg_id     = None
 last_cmd_msg_id   = None
 processed_cmd_ids = set()
+
+# Rate limiting !analizar
+cmd_rate_limit    = {}   # {user_id: [timestamps]}
+
+# Watchdog
+ciclos_429_seguidos = 0
+pausa_429_hasta     = None
+coste_estimado_hoy  = 0.0
+ai_calls_hoy        = 0
 
 # ═══════════════════════════════════════════════════════════════════════
 # PERSISTENCIA
@@ -1891,6 +1907,7 @@ def call_ai(prompt, max_tokens=700):
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
+        track_ai_cost()
         return msg.content[0].text.strip()
     except Exception as e:
         print(f"    IA error: {e}")
@@ -2418,9 +2435,181 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
 # CICLO AUTOMÁTICO — cada 5 minutos
 # ═══════════════════════════════════════════════════════════════════════
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# SEGURIDAD — rate limiting, whitelist, watchdog, monitorización
+# ═══════════════════════════════════════════════════════════════════════
+
+def check_rate_limit(user_id):
+    """Máximo MAX_ANALIZAR_POR_HORA por usuario por hora."""
+    now = time.time()
+    if user_id not in cmd_rate_limit:
+        cmd_rate_limit[user_id] = []
+    # Limpiar timestamps de hace más de 1 hora
+    cmd_rate_limit[user_id] = [t for t in cmd_rate_limit[user_id] if now - t < 3600]
+    if len(cmd_rate_limit[user_id]) >= MAX_ANALIZAR_POR_HORA:
+        return False
+    cmd_rate_limit[user_id].append(now)
+    return True
+
+
+def is_owner(user_id):
+    """Solo el dueño puede usar !analizar si OWNER_DISCORD_ID está configurado."""
+    if not OWNER_DISCORD_ID:
+        return True   # si no está configurado, cualquiera puede usar
+    return str(user_id) == str(OWNER_DISCORD_ID)
+
+
+def track_ai_cost():
+    """Registra una llamada IA y alerta si se supera el gasto diario."""
+    global coste_estimado_hoy, ai_calls_hoy
+    coste_estimado_hoy += 0.00548
+    ai_calls_hoy       += 1
+    if coste_estimado_hoy >= COSTE_MAX_DIA:
+        send_log(
+            f"⚠️ ALERTA COSTE: gasto estimado hoy ${coste_estimado_hoy:.3f} "
+            f"({ai_calls_hoy} llamadas IA) — superado límite ${COSTE_MAX_DIA}"
+        )
+
+
+def reset_daily_counters():
+    """Resetea contadores diarios a medianoche."""
+    global coste_estimado_hoy, ai_calls_hoy
+    coste_estimado_hoy = 0.0
+    ai_calls_hoy       = 0
+    send_log("🔄 Nuevo día — límites y contadores reseteados")
+
+
+def check_429_watchdog(errores_429, total_intentos):
+    """
+    Si el 80%+ de intentos del ciclo son 429, incrementa contador.
+    Si llega a MAX_429_SEGUIDOS ciclos, pausa el bot PAUSA_429_MINUTOS minutos.
+    """
+    global ciclos_429_seguidos, pausa_429_hasta
+    if total_intentos == 0:
+        return False
+
+    tasa_429 = errores_429 / total_intentos
+    if tasa_429 >= 0.8:
+        ciclos_429_seguidos += 1
+        if ciclos_429_seguidos >= MAX_429_SEGUIDOS:
+            pausa_429_hasta = datetime.now(SPAIN_TZ) + timedelta(minutes=PAUSA_429_MINUTOS)
+            ciclos_429_seguidos = 0
+            send_log(
+                f"⚠️ Yahoo bloqueando fuerte ({int(tasa_429*100)}% de 429 en {MAX_429_SEGUIDOS} ciclos) "
+                f"— pausando {PAUSA_429_MINUTOS} min hasta las {pausa_429_hasta.strftime('%H:%M')}"
+            )
+            return True
+    else:
+        ciclos_429_seguidos = 0
+    return False
+
+
+def is_paused_429():
+    """Devuelve True si el bot está en pausa por 429 masivos."""
+    global pausa_429_hasta
+    if pausa_429_hasta and datetime.now(SPAIN_TZ) < pausa_429_hasta:
+        return True
+    if pausa_429_hasta and datetime.now(SPAIN_TZ) >= pausa_429_hasta:
+        pausa_429_hasta = None
+        send_log("✅ Pausa Yahoo terminada — reanudando análisis")
+    return False
+
+
+def daily_summary():
+    """Resumen diario a las 22:00h en #log."""
+    now      = datetime.now(SPAIN_TZ)
+    resolved = len([p for p in predictions if p.get("result") != "pending"])
+    pending  = len([p for p in predictions if p.get("result") == "pending"])
+    wins     = len([p for p in predictions if p.get("result") == "win"])
+    losses   = len([p for p in predictions if p.get("result") == "loss"])
+    rate     = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0
+
+    send_log(
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 RESUMEN DIARIO — {now.strftime('%d/%m/%Y')}\n"
+        f"🤖 Llamadas IA: {ai_calls_hoy} | Coste est: ${coste_estimado_hoy:.3f}\n"
+        f"📈 Alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA}\n"
+        f"🎯 Historial: {wins}✅ {losses}❌ {pending}⏳ | Acierto: {rate}%\n"
+        f"🧠 Reglas aprendidas: {len(learnings.get('rules', []))}\n"
+        f"📡 Régimen: {market_regime.get('regime','?')} | F&G: {market_context.get('fear_greed',50)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def cmd_estado():
+    """Responde a !estado con situación actual del bot."""
+    now      = datetime.now(SPAIN_TZ)
+    fg       = market_context.get("fear_greed", 50)
+    regime   = market_regime.get("regime", "?")
+    pending  = [p for p in predictions if p.get("result") == "pending"]
+    wins     = len([p for p in predictions if p.get("result") == "win"])
+    losses   = len([p for p in predictions if p.get("result") == "loss"])
+    rate     = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0
+    eco_warn = "\n⚠️ ALTO IMPACTO: " + ", ".join(econ_calendar.get("high_impact_today", [])) if econ_calendar.get("is_high_impact") else ""
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📡 **ESTADO — {now.strftime('%H:%M %d/%m/%Y')}**",
+        f"Régimen: {regime} | F&G: {fg}/100 ({_fg_label(fg)}) | VIX: {market_context.get('vix',0)}{eco_warn}",
+        f"Alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA} | Cola calidad: {'activa hasta 14:00' if now.hour < HORA_DESBLOQUEO else 'desbloqueada'}",
+        f"Llamadas IA hoy: {ai_calls_hoy} | Coste est: ${coste_estimado_hoy:.3f}",
+        f"Historial: {wins}✅ {losses}❌ | Acierto: {rate}%",
+        f"Predicciones pendientes: {len(pending)}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    send_solicitud("\n".join(lines))
+
+
+def cmd_pendientes():
+    """Responde a !pendientes con lista de predicciones activas."""
+    pending = [p for p in predictions if p.get("result") == "pending"]
+    if not pending:
+        send_solicitud("⏳ No hay predicciones pendientes ahora mismo.")
+        return
+
+    lines = ["━━━━━━━━━━━━━━━━━━━━━━━━━━━", "⏳ **PREDICCIONES PENDIENTES**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for p in sorted(pending, key=lambda x: x["date"], reverse=True):
+        # Intentar obtener precio actual
+        current_price = None
+        try:
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{p['ticker']}?interval=1d&range=1d",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=6,
+            )
+            if r.status_code == 200:
+                closes = r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", [])
+                closes = [c for c in closes if c]
+                if closes:
+                    current_price = closes[-1]
+        except: pass
+
+        entry  = p.get("entry", 0)
+        target = p.get("target", 0)
+        signal = p.get("signal", "?")
+        days   = (datetime.now(SPAIN_TZ) - datetime.fromisoformat(p["date"]).astimezone(SPAIN_TZ)).days
+        stype  = f" [{p.get('signal_type','NORMAL')}]" if p.get("signal_type","NORMAL") != "NORMAL" else ""
+
+        if current_price:
+            chg     = round(((current_price - entry) / entry) * 100, 1) if entry else 0
+            to_tgt  = round(((target - current_price) / current_price) * 100, 1) if target and current_price else 0
+            price_str = f"${current_price:.2f} ({chg:+.1f}%) | falta {to_tgt:+.1f}% para objetivo"
+        else:
+            price_str = f"entrada ${entry:.2f} → objetivo ${target:.2f}"
+
+        lines.append(f"{'📈' if signal=='COMPRAR' else '📉'} **{p['ticker']}**{stype} — {price_str} | {days}d")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    send_solicitud("\n".join(lines))
+
 def watch_cycle():
     now = datetime.now(SPAIN_TZ)
     if now.hour < 9 or now.hour >= 23:
+        return
+
+    # Watchdog 429 — si Yahoo está bloqueando fuerte, pausar
+    if is_paused_429():
+        print(f"  ⏸️ Pausa Yahoo activa hasta {pausa_429_hasta.strftime('%H:%M')}")
         return
 
     solo_excepcionales = alertas_hoy() >= MAX_ALERTAS_DIA
@@ -2456,6 +2645,8 @@ def watch_cycle():
     print(f"\n[{now.strftime('%H:%M')} ES] {len(to_analyze)} candidatos | alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA} | {regime}{eco_flag}{pm_flag}")
 
     alerts_this_cycle = 0
+    errores_429_ciclo  = 0
+    intentos_ciclo     = 0
 
     for item in to_analyze:
         if alerts_this_cycle >= MAX_AI_POR_CICLO:
@@ -2471,6 +2662,7 @@ def watch_cycle():
             if elapsed < 3600:
                 continue
 
+        intentos_ciclo += 1
         result = analyze_ticker(
             ticker,
             item.get("name", ticker),
@@ -2478,6 +2670,9 @@ def watch_cycle():
             solo_excepcionales=solo_excepcionales,
         )
         if not result:
+            # Detectar si fue 429 (el ticker queda sin datos)
+            if ticker not in watch_signals or not watch_signals.get(ticker, {}).get("last_analyzed"):
+                errores_429_ciclo += 1
             time.sleep(2)
             continue
 
@@ -2492,6 +2687,9 @@ def watch_cycle():
 
     if alerts_this_cycle > 0:
         print(f"  {alerts_this_cycle} alerta(s) este ciclo")
+
+    # Watchdog 429
+    check_429_watchdog(errores_429_ciclo, intentos_ciclo)
 
 # ═══════════════════════════════════════════════════════════════════════
 # COMANDOS MANUALES
@@ -2534,7 +2732,17 @@ def listen_commands(init=False):
             if msg.get("author", {}).get("bot"):
                 continue
 
-            text = msg.get("content", "").strip()
+            text    = msg.get("content", "").strip()
+            user_id = msg.get("author", {}).get("id", "")
+
+            # Comandos de consulta — sin restricción
+            if text.strip().lower() == "!estado":
+                cmd_estado()
+                continue
+            if text.strip().lower() == "!pendientes":
+                cmd_pendientes()
+                continue
+
             tickers = []
             for line in text.splitlines():
                 line = line.strip().lower()
@@ -2549,8 +2757,13 @@ def listen_commands(init=False):
             if not tickers:
                 continue
 
+            # Seguridad: rate limit
+            if not check_rate_limit(user_id):
+                send_solicitud(f"⏳ Máximo {MAX_ANALIZAR_POR_HORA} análisis por hora. Intenta más tarde.")
+                continue
+
             for ticker in tickers:
-                print(f"  !analizar {ticker}")
+                print(f"  !analizar {ticker} (user: {user_id})")
                 send_solicitud(f"🔍  Analizando **{ticker}**... dame unos segundos.")
                 update_status(f"🔍  Analizando **{ticker}** bajo demanda...")
 
@@ -2724,7 +2937,8 @@ def main():
 
     schedule.every(5).minutes.do(watch_cycle)
     schedule.every().day.at("09:00").do(update_market_context)
-    schedule.every().day.at("00:01").do(lambda: send_log("🔄 Nuevo día — límites reseteados"))
+    schedule.every().day.at("00:01").do(reset_daily_counters)
+    schedule.every().day.at("22:00").do(daily_summary)
     schedule.every().sunday.at("10:00").do(weekly_report)
     schedule.every().monday.at("09:00").do(weekly_summary)
     schedule.every().thursday.at("09:00").do(weekly_summary)
