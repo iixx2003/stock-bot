@@ -47,11 +47,11 @@ CONF_EXCEPCIONAL = 94
 # Límites diarios
 MAX_ALERTAS_DIA       = 3
 MAX_VENTAS_DIA        = 1
-MAX_AI_POR_CICLO      = 4
+MAX_AI_POR_CICLO      = 1   # máx llamadas IA por ciclo — optimizado coste
 MAX_PRE_EARNINGS_DIA  = 1   # máximo señales PRE-EARNINGS al día
 
 # Score técnico mínimo
-SCORE_MINIMO = 6
+SCORE_MINIMO = 8   # subido de 6 a 8 para reducir llamadas IA innecesarias
 
 # Cola de calidad: hora a partir de la cual se desbloquean normales/fuertes
 HORA_DESBLOQUEO = 14   # 14:00 hora España
@@ -2195,6 +2195,88 @@ def format_alert(tech, ai_response, conf_final, session_tag="", signal_type="NOR
 # ANÁLISIS COMPLETO
 # ═══════════════════════════════════════════════════════════════════════
 
+
+def pre_filter_convergence(tech, fund, sent, inst_signal, boost, special_signals):
+    """
+    Prefiltro de convergencia SIN llamar a la IA.
+    Evalúa las 5 capas con los datos ya descargados.
+    Solo devuelve True si hay convergencia en al menos 3 de 5 capas.
+    Ahorro estimado: ~85% de llamadas IA → ~$4/mes en vez de $38.
+    """
+    capas_ok = 0
+    motivos  = []
+
+    # Capa 1: Técnico
+    rsi       = tech.get("rsi", 50)
+    vol_ratio = tech.get("vol_ratio", 1)
+    macd_bull = tech.get("macd_bullish", False)
+    structure = tech.get("structure", "")
+    tf_conf   = tech.get("tf_confluence", "")
+    stoch     = tech.get("stoch_k", 50)
+    obv       = tech.get("obv_trend", "")
+    div_type  = tech.get("divergence_type")
+
+    rsi_ok = rsi < 35 or rsi > 65
+    vol_ok = vol_ratio > 1.5
+    dir_ok = (macd_bull or "ALCISTA" in structure or "ALCISTA" in tf_conf
+              or stoch < 25 or stoch > 75 or obv == "ACUMULACION" or div_type)
+
+    if rsi_ok and vol_ok and dir_ok:
+        capas_ok += 1
+        motivos.append(f"tecnico RSI{rsi:.0f} vol{vol_ratio}x")
+
+    # Capa 2: Timeframes
+    bull_tf = sum([
+        tech.get("daily_trend")   == "ALCISTA",
+        tech.get("weekly_trend")  == "ALCISTA",
+        tech.get("monthly_trend") == "ALCISTA",
+    ])
+    bear_tf = sum([
+        tech.get("daily_trend")   == "BAJISTA",
+        tech.get("weekly_trend")  == "BAJISTA",
+        tech.get("monthly_trend") == "BAJISTA",
+    ])
+    if bull_tf >= 2 or bear_tf >= 2:
+        capas_ok += 1
+        motivos.append(f"TF {bull_tf}bull/{bear_tf}bear")
+
+    # Capa 3: Fundamental
+    upside   = fund.get("analyst_upside", 0) or 0
+    ins_buys = fund.get("insider_buys", 0)
+    beats    = fund.get("earnings_beats", 0)
+    short    = fund.get("short_interest", 0) or 0
+    squeeze  = special_signals.get("squeeze")
+    insider  = special_signals.get("insider")
+    pre_earn = special_signals.get("pre_earnings")
+
+    if abs(upside) > 5 or ins_buys >= 2 or beats >= 3 or short > 15 or squeeze or insider or pre_earn:
+        capas_ok += 1
+        motivos.append(f"fund upside{upside:+.0f}% ins{ins_buys}")
+
+    # Capa 4: Sentimiento
+    sent_score  = sent.get("sentiment_score", 0)
+    sector_perf = sent.get("sector_perf", 0) or 0
+    st          = sent.get("stocktwits") or {}
+    st_extreme  = (st.get("bullish_pct", 50) > 70 or st.get("bearish_pct", 50) > 70)
+
+    if sent_score > 1 or abs(sector_perf) > 0.5 or st_extreme:
+        capas_ok += 1
+        motivos.append(f"sent score{sent_score} sect{sector_perf:+.1f}%")
+
+    # Capa 5: Institucional
+    if inst_signal != "NEUTRAL" or boost >= 3:
+        capas_ok += 1
+        motivos.append(f"inst {inst_signal} +{boost}")
+
+    # Señales especiales siempre pasan (PRE-EARNINGS, SQUEEZE, INSIDERS)
+    if squeeze or insider or pre_earn:
+        capas_ok = max(capas_ok, 3)
+        motivos.append("bypass-especial")
+
+    pasa    = capas_ok >= 3
+    resumen = f"{capas_ok}/5 — {' | '.join(motivos) if motivos else 'sin convergencia'}"
+    return pasa, resumen
+
 def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcionales=False):
     print(f"  Analizando {ticker}...")
 
@@ -2253,6 +2335,16 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
                 signal_type = "PRE_EARNINGS"
             boost = min(boost + 4, 15)
             print(f"    {ticker}: {pe_desc}")
+
+    # Prefiltro de convergencia — evita llamadas IA innecesarias (~85% ahorro)
+    if not force:
+        pasa, pf_resumen = pre_filter_convergence(tech, fund, sent, inst_signal, boost, special_signals)
+        if not pasa:
+            print(f"    {ticker}: prefiltro {pf_resumen}")
+            watch_signals[ticker] = {"last_analyzed": datetime.now().isoformat(), "developing": False}
+            save_state()
+            return None
+        print(f"    {ticker}: prefiltro OK — {pf_resumen}")
 
     # Construir prompt
     if force:
