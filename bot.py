@@ -513,7 +513,7 @@ def quick_scan():
 
     all_candidates = sorted(candidates, key=lambda x: x["score"], reverse=True) + developing
     print(f"  Quick scan: {len(candidates)} urgentes + {len(developing)} en desarrollo")
-    return all_candidates[:20]
+    return all_candidates[:15]
 
 # ═══════════════════════════════════════════════════════════════════════
 # CAPA 2 — DATOS DE MERCADO (Yahoo Finance, 3 timeframes)
@@ -546,6 +546,10 @@ def get_market_data(ticker):
             f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y",
             headers=hdrs, timeout=15,
         )
+        if r.status_code == 429:
+            print(f"    {ticker}: Yahoo HTTP 429 — esperando 5s")
+            time.sleep(5)
+            return None
         if r.status_code != 200:
             print(f"    {ticker}: Yahoo HTTP {r.status_code}")
             return None
@@ -1226,7 +1230,7 @@ def watch_cycle():
         and (t not in watch_signals
              or (datetime.now() - datetime.fromisoformat(watch_signals[t].get("last_analyzed", "2000-01-01"))).total_seconds() > 86400)
     ]
-    rotation = random.sample(not_analyzed, min(6, len(not_analyzed)))
+    rotation = random.sample(not_analyzed, min(4, len(not_analyzed)))
     seen_in_candidates = {c["ticker"] for c in candidates}
     rotation_items = [
         {"ticker": t, "name": t, "sector": "Unknown", "score": 0}
@@ -1266,7 +1270,7 @@ def watch_cycle():
 
         nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
         print(f"    → Alerta enviada: {ticker} {nivel} ({signal}, {conf}%)")
-        time.sleep(3)
+        time.sleep(4)
 
     if alerts_this_cycle > 0:
         print(f"  {alerts_this_cycle} alerta(s) enviada(s) este ciclo")
