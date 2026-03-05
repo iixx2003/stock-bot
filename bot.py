@@ -1096,7 +1096,7 @@ def format_alert(tech, ai_response, conf_final, session_tag=""):
 # ANÁLISIS COMPLETO — automático y manual en una sola función
 # ═══════════════════════════════════════════════════════════════════════
 
-def analyze_ticker(ticker, name="", sector="Unknown", force=False):
+def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcionales=False):
     """
     Análisis completo con las 6 capas.
 
@@ -1164,6 +1164,9 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False):
         if conf_final < CONF_NORMAL:
             print(f"    {ticker}: confianza {conf_final}% insuficiente (mín {CONF_NORMAL}%)")
             return None
+        if solo_excepcionales and conf_final < CONF_EXCEPCIONAL:
+            print(f"    {ticker}: límite normal alcanzado, descartado (no es Excepcional)")
+            return None
 
         # Extraer señal para verificar límites
         signal_check = "COMPRAR"
@@ -1208,11 +1211,9 @@ def watch_cycle():
     if now.hour < 9 or now.hour >= 23:
         return
 
-    # Si ya alcanzamos el límite diario no tiene sentido analizar más
-    # (las Excepcionales sí pueden seguir)
-    if alertas_hoy() >= MAX_ALERTAS_DIA:
-        print(f"  Límite diario de {MAX_ALERTAS_DIA} alertas alcanzado — ciclo omitido")
-        return
+    # Si el límite diario está alcanzado, seguimos buscando solo Excepcionales (94%+)
+    # Solo omitimos completamente si ya no puede haber nada que enviar
+    solo_excepcionales = alertas_hoy() >= MAX_ALERTAS_DIA
 
     candidates = quick_scan()
     if not candidates:
@@ -1253,7 +1254,7 @@ def watch_cycle():
             if elapsed < 3600:
                 continue
 
-        result = analyze_ticker(ticker, item.get("name", ticker), item.get("sector", "Unknown"))
+        result = analyze_ticker(ticker, item.get("name", ticker), item.get("sector", "Unknown"), solo_excepcionales=solo_excepcionales)
         if not result:
             time.sleep(2)
             continue
