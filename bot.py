@@ -2382,7 +2382,23 @@ def pre_filter_convergence(tech, fund, sent, inst_signal, boost, special_signals
         capas_ok = max(capas_ok, 3)
         motivos.append("bypass-especial")
 
-    pasa    = capas_ok >= 3
+    # En BEAR extremo (F&G < 25): umbral 2/5 pero exige score técnico ≥ 8 (calidad antes que cantidad)
+    bear_extremo = (
+        market_regime.get("regime") == "BEAR"
+        and market_context.get("fear_greed", 50) < 25
+    )
+    umbral = 2 if bear_extremo else 3
+    tech_score = tech.get("tech_score", 0)
+
+    if bear_extremo and capas_ok >= 2 and tech_score < 8:
+        motivos.append(f"BEAR-calidad: score {tech_score} insuficiente (mín 8)")
+        pasa = False
+    else:
+        pasa = capas_ok >= umbral
+
+    if bear_extremo and pasa:
+        motivos.append("BEAR-extremo-2/5")
+
     resumen = f"{capas_ok}/5 — {' | '.join(motivos) if motivos else 'sin convergencia'}"
     return pasa, resumen
 
