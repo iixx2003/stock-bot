@@ -19,6 +19,7 @@ Añadidos sobre v5:
 """
 
 import os, time, json, random, schedule, requests, feedparser, anthropic, re
+import yfinance as yf
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pytz
@@ -1348,64 +1349,25 @@ def quick_scan():
 # CAPA 2 — DATOS DE MERCADO con divergencias y premarket
 # ═══════════════════════════════════════════════════════════════════════
 
-def _yahoo_get(session, host, ticker, interval, range_, hdrs):
-    try:
-        r = session.get(
-            f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={range_}",
-            headers=hdrs, timeout=15,
-        )
-        if r.status_code == 429:
-            print(f"    {ticker}: Yahoo 429 ({interval}) — esperando 8s")
-            time.sleep(8)
-            return None, 429
-        if r.status_code != 200:
-            return None, r.status_code
-        return r.json(), 200
-    except Exception as e:
-        print(f"    {ticker}: Yahoo excepción ({interval}) — {e}")
-        return None, 0
-
-
 def get_market_data(ticker):
     try:
-        ua = random.choice([
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-        ])
-        hdrs = {
-            "User-Agent": ua, "Accept": "application/json",
-            "Referer": f"https://finance.yahoo.com/quote/{ticker}/",
-        }
-        host = random.choice(["query1", "query2", "query2"])
-        s    = requests.Session()
-        try:
-            s.get(f"https://finance.yahoo.com/quote/{ticker}/", headers=hdrs, timeout=8)
-            time.sleep(1.0)
-        except Exception: pass
-
-        data, status = _yahoo_get(s, host, ticker, "1d", "1y", hdrs)
-        if not data:
-            if status != 429:
-                print(f"    {ticker}: Yahoo HTTP {status}")
-            return None
-
-        chart = data.get("chart", {}).get("result", [])
-        if not chart:
+        t    = yf.Ticker(ticker)
+        hist = t.history(period="2y", interval="1d")
+        if hist.empty or len(hist) < 50:
             print(f"    {ticker}: sin datos en Yahoo")
             return None
 
-        res     = chart[0]
-        meta    = res.get("meta", {})
-        q       = res["indicators"]["quote"][0]
-        closes  = [c for c in q.get("close",  []) if c is not None]
-        volumes = [v for v in q.get("volume", []) if v is not None]
-        highs   = [h for h in q.get("high",   []) if h is not None]
-        lows    = [l for l in q.get("low",    []) if l is not None]
+        closes  = hist["Close"].dropna().tolist()
+        volumes = hist["Volume"].dropna().tolist()
+        highs   = hist["High"].dropna().tolist()
+        lows    = hist["Low"].dropna().tolist()
 
         if len(closes) < 50:
             return None
+
+        # Semanal y mensual sin requests adicionales (resample en pandas)
+        closes_w = hist["Close"].resample("W").last().dropna().tolist()
+        closes_m = hist["Close"].resample("ME").last().dropna().tolist()
 
         price      = closes[-1]
         change_pct = ((price - closes[-2]) / closes[-2]) * 100
@@ -1513,28 +1475,13 @@ def get_market_data(ticker):
         elif abs(mom1m) > 8: tech_score += 1
         if support_touches >= 3: tech_score += 2
 
-        # ── Semanal ───────────────────────────────────────────────────
-        weekly_trend = "N/D"
-        closes_w     = []
-        time.sleep(1.2)
-        data_w, _ = _yahoo_get(s, host, ticker, "1wk", "1y", hdrs)
-        if data_w:
-            try:
-                closes_w = [c for c in data_w["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
-                if len(closes_w) >= 10:
-                    weekly_trend = "ALCISTA" if closes_w[-1] > sum(closes_w[-10:]) / 10 else "BAJISTA"
-            except Exception: pass
-
-        # ── Mensual ───────────────────────────────────────────────────
+        # ── Semanal y mensual (ya calculados arriba via resample) ────────
+        weekly_trend  = "N/D"
         monthly_trend = "N/D"
-        time.sleep(1.2)
-        data_m, _ = _yahoo_get(s, host, ticker, "1mo", "3y", hdrs)
-        if data_m:
-            try:
-                mc = [c for c in data_m["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
-                if len(mc) >= 6:
-                    monthly_trend = "ALCISTA" if mc[-1] > sum(mc[-6:]) / 6 else "BAJISTA"
-            except Exception: pass
+        if len(closes_w) >= 10:
+            weekly_trend = "ALCISTA" if closes_w[-1] > sum(closes_w[-10:]) / 10 else "BAJISTA"
+        if len(closes_m) >= 6:
+            monthly_trend = "ALCISTA" if closes_m[-1] > sum(closes_m[-6:]) / 6 else "BAJISTA"
 
         daily_trend = "ALCISTA" if price > sma50 else "BAJISTA"
         tf_bullish  = [daily_trend, weekly_trend, monthly_trend].count("ALCISTA")
@@ -1567,8 +1514,8 @@ def get_market_data(ticker):
         weighted_score, weighted_desc = calc_weighted_tf_confluence(tf_tech)
 
         return {
-            "ticker": ticker, "name": meta.get("longName", ticker),
-            "sector": meta.get("sector", "Unknown"),
+            "ticker": ticker, "name": ticker,
+            "sector": "Unknown",
             "price": round(price, 2), "change_pct": round(change_pct, 2),
             "sma20": round(sma20, 2), "sma50": round(sma50, 2),
             "sma200": round(sma200, 2) if sma200 else None,
@@ -2714,6 +2661,13 @@ def watch_cycle():
             # Detectar si fue 429 (el ticker queda sin datos)
             if ticker not in watch_signals or not watch_signals.get(ticker, {}).get("last_analyzed"):
                 errores_429_ciclo += 1
+                # Marcar cooldown para no reintentar hasta ~20 min
+                watch_signals[ticker] = {
+                    "last_analyzed": (datetime.now(SPAIN_TZ) - timedelta(minutes=40)).isoformat(),
+                    "developing": False,
+                    "reason": "429_cooldown",
+                }
+                save_state()
             time.sleep(2)
             continue
 
