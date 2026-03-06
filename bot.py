@@ -314,6 +314,7 @@ processed_cmd_ids = set()
 
 # Rate limiting !analizar
 cmd_rate_limit    = {}   # {user_id: [timestamps]}
+_hist_cache       = {}   # {ticker: DataFrame} — batch prefetch
 
 # Watchdog
 ciclos_429_seguidos = 0
@@ -1349,10 +1350,42 @@ def quick_scan():
 # CAPA 2 — DATOS DE MERCADO con divergencias y premarket
 # ═══════════════════════════════════════════════════════════════════════
 
+def prefetch_tickers(tickers):
+    """Descarga historial de todos los tickers en un solo request batch."""
+    global _hist_cache
+    _hist_cache = {}
+    if not tickers:
+        return
+    try:
+        print(f"  Descargando batch de {len(tickers)} tickers...")
+        if len(tickers) == 1:
+            hist = yf.Ticker(tickers[0]).history(period="2y", interval="1d")
+            if not hist.empty:
+                _hist_cache[tickers[0]] = hist
+        else:
+            data = yf.download(
+                tickers, period="2y", interval="1d",
+                group_by="ticker", auto_adjust=True,
+                progress=False, threads=True,
+            )
+            for t in tickers:
+                try:
+                    h = data[t].dropna(how="all")
+                    if not h.empty:
+                        _hist_cache[t] = h
+                except Exception:
+                    pass
+        print(f"  Batch OK: {len(_hist_cache)}/{len(tickers)} con datos")
+    except Exception as e:
+        print(f"  Error batch download: {e}")
+
+
 def get_market_data(ticker):
     try:
-        t    = yf.Ticker(ticker)
-        hist = t.history(period="2y", interval="1d")
+        if ticker in _hist_cache:
+            hist = _hist_cache[ticker]
+        else:
+            hist = yf.Ticker(ticker).history(period="2y", interval="1d")
         if hist.empty or len(hist) < 50:
             print(f"    {ticker}: sin datos en Yahoo")
             return None
@@ -2635,6 +2668,9 @@ def watch_cycle():
     alerts_this_cycle = 0
     errores_429_ciclo  = 0
     intentos_ciclo     = 0
+
+    # Descarga batch de todos los tickers antes del loop (1 request en vez de N)
+    prefetch_tickers([item["ticker"] for item in to_analyze])
 
     for item in to_analyze:
         if alerts_this_cycle >= MAX_AI_POR_CICLO:
