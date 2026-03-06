@@ -1350,48 +1350,55 @@ def quick_scan():
 # CAPA 2 — DATOS DE MERCADO con divergencias y premarket
 # ═══════════════════════════════════════════════════════════════════════
 
-def _fetch_yfinance_candles(ticker, session):
-    """Descarga 2 años de OHLCV diario desde Yahoo Finance con sesión autenticada."""
-    import yfinance as yf
+def _fetch_stooq_candles(ticker):
+    """Descarga 2 años de OHLCV diario desde Stooq (sin bloqueo de IPs cloud)."""
+    import pandas as pd
+    from io import StringIO
     try:
-        t = yf.Ticker(ticker, session=session)
-        hist = t.history(period="2y", interval="1d", auto_adjust=True)
-        if hist is None or len(hist) < 50:
+        # Stooq usa sufijo .us para acciones americanas
+        symbol = ticker.lower()
+        url = f"https://stooq.com/q/d/l/?s={symbol}.us&i=d"
+        r = requests.get(url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        if r.status_code != 200 or not r.text.strip() or "No data" in r.text:
             return None
-        hist.index = hist.index.tz_convert("UTC") if hist.index.tzinfo else hist.index.tz_localize("UTC")
-        return hist
+        df = pd.read_csv(StringIO(r.text))
+        if df.empty or "Close" not in df.columns:
+            return None
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        df.index = df.index.tz_localize("UTC")
+        # Últimos 2 años
+        cutoff = df.index[-1] - pd.DateOffset(years=2)
+        df = df[df.index >= cutoff].dropna(how="all")
+        return df if len(df) >= 50 else None
     except Exception as e:
         return None
 
 
 def prefetch_tickers(tickers):
-    """Descarga historial de todos los tickers vía yfinance con sesión para evitar 429 en cloud."""
+    """Descarga historial de todos los tickers vía Stooq (funciona en IPs cloud)."""
     global _hist_cache
     _hist_cache = {}
     if not tickers:
         return
-    print(f"  Descargando historial de {len(tickers)} tickers vía yfinance...")
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    })
-    errors = 0
+    print(f"  Descargando historial de {len(tickers)} tickers vía Stooq...")
+    errors_detail = []
     for t in tickers:
         try:
-            hist = _fetch_yfinance_candles(t, session)
+            hist = _fetch_stooq_candles(t)
             if hist is not None and len(hist) >= 50:
                 _hist_cache[t] = hist
             else:
-                errors += 1
-                if errors <= 3:
-                    print(f"    {t}: sin datos suficientes de yfinance")
-            time.sleep(0.5)
+                errors_detail.append(t)
+            time.sleep(0.3)
         except Exception as e:
             print(f"    {t}: error prefetch — {e}")
-            errors += 1
-    print(f"  yfinance OK: {len(_hist_cache)}/{len(tickers)} con datos")
+            errors_detail.append(t)
+    if errors_detail:
+        print(f"    Sin datos: {', '.join(errors_detail[:5])}{'...' if len(errors_detail) > 5 else ''}")
+    print(f"  Stooq OK: {len(_hist_cache)}/{len(tickers)} con datos")
 
 
 def get_market_data(ticker):
@@ -1399,9 +1406,7 @@ def get_market_data(ticker):
         if ticker in _hist_cache:
             hist = _hist_cache[ticker]
         else:
-            session = requests.Session()
-            session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-            hist = _fetch_yfinance_candles(ticker, session)
+            hist = _fetch_stooq_candles(ticker)
         if hist is None or hist.empty or len(hist) < 50:
             print(f"    {ticker}: sin datos de mercado")
             return None
