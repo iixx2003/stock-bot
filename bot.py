@@ -1350,10 +1350,12 @@ def quick_scan():
 # CAPA 2 — DATOS DE MERCADO con divergencias y premarket
 # ═══════════════════════════════════════════════════════════════════════
 
-def _fetch_finnhub_candles(ticker):
+def _fetch_finnhub_candles(ticker, verbose=False):
     """Descarga 2 años de OHLCV diario desde Finnhub. Devuelve DataFrame compatible con get_market_data."""
     import pandas as pd
     if not FINNHUB_TOKEN:
+        if verbose:
+            print(f"    [{ticker}] ERROR: FINNHUB_TOKEN no configurado en variables de entorno")
         return None
     to_ts   = int(time.time())
     from_ts = to_ts - 2 * 365 * 24 * 3600
@@ -1362,9 +1364,13 @@ def _fetch_finnhub_candles(ticker):
     try:
         r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
+            if verbose:
+                print(f"    [{ticker}] Finnhub HTTP {r.status_code}: {r.text[:200]}")
             return None
         d = r.json()
         if d.get("s") != "ok" or not d.get("t"):
+            if verbose:
+                print(f"    [{ticker}] Finnhub status='{d.get('s')}' candles={len(d.get('t', []))}")
             return None
         df = pd.DataFrame({
             "Open":   d["o"],
@@ -1374,7 +1380,9 @@ def _fetch_finnhub_candles(ticker):
             "Volume": d["v"],
         }, index=pd.to_datetime(d["t"], unit="s", utc=True))
         return df.dropna(how="all")
-    except Exception:
+    except Exception as e:
+        if verbose:
+            print(f"    [{ticker}] Finnhub excepción: {e}")
         return None
 
 
@@ -1384,10 +1392,16 @@ def prefetch_tickers(tickers):
     _hist_cache = {}
     if not tickers:
         return
+    if not FINNHUB_TOKEN:
+        print("  ERROR CRÍTICO: FINNHUB_TOKEN no está configurado. Sin datos de mercado.")
+        return
     print(f"  Descargando historial de {len(tickers)} tickers vía Finnhub...")
+    _first_fail_logged = False
     for t in tickers:
         try:
-            hist = _fetch_finnhub_candles(t)
+            hist = _fetch_finnhub_candles(t, verbose=not _first_fail_logged)
+            if hist is None and not _first_fail_logged:
+                _first_fail_logged = True
             if hist is not None and len(hist) >= 50:
                 _hist_cache[t] = hist
             time.sleep(1.1)   # Finnhub free: 60 llamadas/min → seguro con ~0.9 req/s
