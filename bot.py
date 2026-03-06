@@ -38,6 +38,7 @@ ANTHROPIC_API_KEY        = os.environ.get("ANTHROPIC_API_KEY")
 _ai_client               = None   # singleton — se crea la primera vez que se necesita
 NEWS_API_KEY             = os.environ.get("NEWS_API_KEY")
 FINNHUB_TOKEN            = os.environ.get("FINNHUB_TOKEN")
+TWELVE_DATA_KEY          = os.environ.get("TWELVE_DATA_KEY")
 
 SPAIN_TZ = pytz.timezone("Europe/Madrid")
 
@@ -1350,55 +1351,66 @@ def quick_scan():
 # CAPA 2 — DATOS DE MERCADO con divergencias y premarket
 # ═══════════════════════════════════════════════════════════════════════
 
-def _fetch_stooq_candles(ticker):
-    """Descarga 2 años de OHLCV diario desde Stooq (sin bloqueo de IPs cloud)."""
+def _fetch_twelve_data_candles(ticker):
+    """Descarga hasta 500 días de OHLCV diario desde Twelve Data (funciona en IPs cloud)."""
     import pandas as pd
-    from io import StringIO
+    if not TWELVE_DATA_KEY:
+        return None
     try:
-        # Stooq usa sufijo .us para acciones americanas
-        symbol = ticker.lower()
-        url = f"https://stooq.com/q/d/l/?s={symbol}.us&i=d"
-        r = requests.get(url, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
-        if r.status_code != 200 or not r.text.strip() or "No data" in r.text:
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": ticker,
+            "interval": "1day",
+            "outputsize": 500,
+            "apikey": TWELVE_DATA_KEY,
+            "format": "JSON",
+        }
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            print(f"    [{ticker}] Twelve Data HTTP {r.status_code}")
             return None
-        df = pd.read_csv(StringIO(r.text))
-        if df.empty or "Close" not in df.columns:
+        data = r.json()
+        if data.get("status") == "error":
+            print(f"    [{ticker}] Twelve Data error: {data.get('message','')}")
             return None
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.set_index("Date").sort_index()
+        values = data.get("values", [])
+        if len(values) < 50:
+            return None
+        df = pd.DataFrame(values)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.set_index("datetime").sort_index()
         df.index = df.index.tz_localize("UTC")
-        # Últimos 2 años
-        cutoff = df.index[-1] - pd.DateOffset(years=2)
-        df = df[df.index >= cutoff].dropna(how="all")
-        return df if len(df) >= 50 else None
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
+                                  "close": "Close", "volume": "Volume"})
+        return df[["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
     except Exception as e:
+        print(f"    [{ticker}] Twelve Data excepción: {e}")
         return None
 
 
 def prefetch_tickers(tickers):
-    """Descarga historial de todos los tickers vía Stooq (funciona en IPs cloud)."""
+    """Descarga historial de todos los tickers vía Twelve Data (funciona en IPs cloud)."""
     global _hist_cache
     _hist_cache = {}
     if not tickers:
         return
-    print(f"  Descargando historial de {len(tickers)} tickers vía Stooq...")
-    errors_detail = []
+    if not TWELVE_DATA_KEY:
+        print("  ERROR: TWELVE_DATA_KEY no configurado — añade la variable en Railway")
+        return
+    print(f"  Descargando historial de {len(tickers)} tickers vía Twelve Data...")
+    ok = 0
     for t in tickers:
         try:
-            hist = _fetch_stooq_candles(t)
+            hist = _fetch_twelve_data_candles(t)
             if hist is not None and len(hist) >= 50:
                 _hist_cache[t] = hist
-            else:
-                errors_detail.append(t)
-            time.sleep(0.3)
+                ok += 1
+            time.sleep(0.85)  # Twelve Data free: 8 req/min → seguro con ~1.1 req/s
         except Exception as e:
             print(f"    {t}: error prefetch — {e}")
-            errors_detail.append(t)
-    if errors_detail:
-        print(f"    Sin datos: {', '.join(errors_detail[:5])}{'...' if len(errors_detail) > 5 else ''}")
-    print(f"  Stooq OK: {len(_hist_cache)}/{len(tickers)} con datos")
+    print(f"  Twelve Data OK: {ok}/{len(tickers)} con datos")
 
 
 def get_market_data(ticker):
@@ -1406,7 +1418,7 @@ def get_market_data(ticker):
         if ticker in _hist_cache:
             hist = _hist_cache[ticker]
         else:
-            hist = _fetch_stooq_candles(ticker)
+            hist = _fetch_twelve_data_candles(ticker)
         if hist is None or hist.empty or len(hist) < 50:
             print(f"    {ticker}: sin datos de mercado")
             return None
