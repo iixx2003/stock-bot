@@ -19,7 +19,6 @@ Añadidos sobre v5:
 """
 
 import os, time, json, random, schedule, requests, feedparser, anthropic, re
-import yfinance as yf
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pytz
@@ -38,6 +37,7 @@ DISCORD_STATUS_ID        = "1478471477568475248"
 ANTHROPIC_API_KEY        = os.environ.get("ANTHROPIC_API_KEY")
 _ai_client               = None   # singleton — se crea la primera vez que se necesita
 NEWS_API_KEY             = os.environ.get("NEWS_API_KEY")
+FINNHUB_TOKEN            = os.environ.get("FINNHUB_TOKEN")
 
 SPAIN_TZ = pytz.timezone("Europe/Madrid")
 
@@ -1350,34 +1350,50 @@ def quick_scan():
 # CAPA 2 — DATOS DE MERCADO con divergencias y premarket
 # ═══════════════════════════════════════════════════════════════════════
 
+def _fetch_finnhub_candles(ticker):
+    """Descarga 2 años de OHLCV diario desde Finnhub. Devuelve DataFrame compatible con get_market_data."""
+    import pandas as pd
+    if not FINNHUB_TOKEN:
+        return None
+    to_ts   = int(time.time())
+    from_ts = to_ts - 2 * 365 * 24 * 3600
+    url = "https://finnhub.io/api/v1/stock/candle"
+    params = {"symbol": ticker, "resolution": "D", "from": from_ts, "to": to_ts, "token": FINNHUB_TOKEN}
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        if d.get("s") != "ok" or not d.get("t"):
+            return None
+        df = pd.DataFrame({
+            "Open":   d["o"],
+            "High":   d["h"],
+            "Low":    d["l"],
+            "Close":  d["c"],
+            "Volume": d["v"],
+        }, index=pd.to_datetime(d["t"], unit="s", utc=True))
+        return df.dropna(how="all")
+    except Exception:
+        return None
+
+
 def prefetch_tickers(tickers):
-    """Descarga historial de todos los tickers en un solo request batch."""
+    """Descarga historial de todos los tickers vía Finnhub (evita rate limits de Yahoo en IPs cloud)."""
     global _hist_cache
     _hist_cache = {}
     if not tickers:
         return
-    try:
-        print(f"  Descargando batch de {len(tickers)} tickers...")
-        if len(tickers) == 1:
-            hist = yf.Ticker(tickers[0]).history(period="2y", interval="1d")
-            if not hist.empty:
-                _hist_cache[tickers[0]] = hist
-        else:
-            data = yf.download(
-                tickers, period="2y", interval="1d",
-                group_by="ticker", auto_adjust=True,
-                progress=False, threads=True,
-            )
-            for t in tickers:
-                try:
-                    h = data[t].dropna(how="all")
-                    if not h.empty:
-                        _hist_cache[t] = h
-                except Exception:
-                    pass
-        print(f"  Batch OK: {len(_hist_cache)}/{len(tickers)} con datos")
-    except Exception as e:
-        print(f"  Error batch download: {e}")
+    print(f"  Descargando historial de {len(tickers)} tickers vía Finnhub...")
+    for t in tickers:
+        try:
+            hist = _fetch_finnhub_candles(t)
+            if hist is not None and len(hist) >= 50:
+                _hist_cache[t] = hist
+            time.sleep(1.1)   # Finnhub free: 60 llamadas/min → seguro con ~0.9 req/s
+        except Exception as e:
+            print(f"    {t}: error prefetch — {e}")
+    print(f"  Finnhub OK: {len(_hist_cache)}/{len(tickers)} con datos")
 
 
 def get_market_data(ticker):
@@ -1385,9 +1401,9 @@ def get_market_data(ticker):
         if ticker in _hist_cache:
             hist = _hist_cache[ticker]
         else:
-            hist = yf.Ticker(ticker).history(period="2y", interval="1d")
-        if hist.empty or len(hist) < 50:
-            print(f"    {ticker}: sin datos en Yahoo")
+            hist = _fetch_finnhub_candles(ticker)
+        if hist is None or hist.empty or len(hist) < 50:
+            print(f"    {ticker}: sin datos de mercado")
             return None
 
         closes  = hist["Close"].dropna().tolist()
