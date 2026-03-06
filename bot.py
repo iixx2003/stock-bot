@@ -1351,7 +1351,7 @@ def quick_scan():
 # CAPA 2 — DATOS DE MERCADO con divergencias y premarket
 # ═══════════════════════════════════════════════════════════════════════
 
-def _fetch_twelve_data_candles(ticker):
+def _fetch_twelve_data_candles(ticker, _retry=True):
     """Descarga hasta 500 días de OHLCV diario desde Twelve Data (funciona en IPs cloud)."""
     import pandas as pd
     if not TWELVE_DATA_KEY:
@@ -1371,7 +1371,13 @@ def _fetch_twelve_data_candles(ticker):
             return None
         data = r.json()
         if data.get("status") == "error":
-            print(f"    [{ticker}] Twelve Data error: {data.get('message','')}")
+            msg = data.get("message", "")
+            # Rate limit: esperamos 60s y reintentamos una vez
+            if "run out of API credits" in msg and _retry:
+                print(f"    [{ticker}] Rate limit — esperando 62s...")
+                time.sleep(62)
+                return _fetch_twelve_data_candles(ticker, _retry=False)
+            print(f"    [{ticker}] Twelve Data error: {msg}")
             return None
         values = data.get("values", [])
         if len(values) < 50:
@@ -1407,7 +1413,7 @@ def prefetch_tickers(tickers):
             if hist is not None and len(hist) >= 50:
                 _hist_cache[t] = hist
                 ok += 1
-            time.sleep(0.85)  # Twelve Data free: 8 req/min → seguro con ~1.1 req/s
+            time.sleep(8)  # Plan free: 8 req/min → 1 req cada 8s (seguro)
         except Exception as e:
             print(f"    {t}: error prefetch — {e}")
     print(f"  Twelve Data OK: {ok}/{len(tickers)} con datos")
