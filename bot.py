@@ -44,6 +44,15 @@ TWELVE_DATA_KEY          = os.environ.get("TWELVE_DATA_KEY")
 _td_last_call = 0.0
 _TD_MIN_INTERVAL = 8.0  # segundos entre llamadas
 
+# Símbolos inválidos en Twelve Data (se puebla en sesión, no persiste)
+_td_invalid_symbols: set = set()
+
+# Cooldown de score bajo: {ticker: ciclos_restantes_a_saltar}
+_score_cooldown: dict = {}
+SCORE_COOLDOWN_CICLOS = 5  # saltar N ciclos si falla por score repetidamente
+SCORE_FAIL_THRESHOLD  = 3  # fallos consecutivos antes de activar cooldown
+_score_fail_count: dict = {}  # {ticker: nº fallos consecutivos}
+
 def _td_rate_limit():
     """Bloquea hasta que haya pasado el intervalo mínimo entre llamadas."""
     global _td_last_call
@@ -1390,6 +1399,10 @@ def _fetch_twelve_data_candles(ticker, _retry=True):
                 print(f"    [{ticker}] Rate limit — esperando 62s...")
                 time.sleep(62)
                 return _fetch_twelve_data_candles(ticker, _retry=False)
+            # Símbolo inválido: blacklist en sesión para no reintentar
+            if "symbol" in msg.lower() and ("missing" in msg.lower() or "invalid" in msg.lower()):
+                _td_invalid_symbols.add(ticker)
+                _hist_cache[ticker] = None  # evita segunda llamada en get_market_data
             print(f"    [{ticker}] Twelve Data error: {msg}")
             return None
         values = data.get("values", [])
@@ -1418,9 +1431,15 @@ def prefetch_tickers(tickers):
     if not TWELVE_DATA_KEY:
         print("  ERROR: TWELVE_DATA_KEY no configurado — añade la variable en Railway")
         return
-    print(f"  Descargando historial de {len(tickers)} tickers vía Twelve Data...")
+    # Filtrar símbolos ya conocidos como inválidos
+    valid = [t for t in tickers if t not in _td_invalid_symbols]
+    skipped = len(tickers) - len(valid)
+    if skipped:
+        print(f"  Descargando historial de {len(valid)} tickers ({skipped} inválidos omitidos)...")
+    else:
+        print(f"  Descargando historial de {len(valid)} tickers vía Twelve Data...")
     ok = 0
-    for t in tickers:
+    for t in valid:
         try:
             hist = _fetch_twelve_data_candles(t)
             if hist is not None and len(hist) >= 50:
@@ -1429,7 +1448,7 @@ def prefetch_tickers(tickers):
             # rate limit gestionado globalmente por _td_rate_limit() en _fetch_twelve_data_candles
         except Exception as e:
             print(f"    {t}: error prefetch — {e}")
-    print(f"  Twelve Data OK: {ok}/{len(tickers)} con datos")
+    print(f"  Twelve Data OK: {ok}/{len(valid)} con datos")
 
 
 def get_market_data(ticker):
@@ -2368,6 +2387,12 @@ def pre_filter_convergence(tech, fund, sent, inst_signal, boost, special_signals
     return pasa, resumen
 
 def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcionales=False):
+    # Cooldown de score bajo: saltar si falló N ciclos consecutivos
+    if not force and _score_cooldown.get(ticker, 0) > 0:
+        _score_cooldown[ticker] -= 1
+        print(f"  Saltando {ticker} (cooldown score: {_score_cooldown[ticker]} ciclos restantes)")
+        return None
+
     print(f"  Analizando {ticker}...")
 
     tech = get_market_data(ticker)
@@ -2375,9 +2400,21 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
         print(f"    {ticker}: sin datos de mercado")
         return None
 
-    if not force and tech["tech_score"] < SCORE_MINIMO:
-        print(f"    {ticker}: score {tech['tech_score']} insuficiente (mín {SCORE_MINIMO})")
+    score_minimo_efectivo = max(7, SCORE_MINIMO - 1) if (
+        market_regime.get("regime") == "BEAR" and market_context.get("fear_greed", 50) < 25
+    ) else SCORE_MINIMO
+
+    if not force and tech["tech_score"] < score_minimo_efectivo:
+        print(f"    {ticker}: score {tech['tech_score']} insuficiente (mín {score_minimo_efectivo})")
+        _score_fail_count[ticker] = _score_fail_count.get(ticker, 0) + 1
+        if _score_fail_count[ticker] >= SCORE_FAIL_THRESHOLD:
+            _score_cooldown[ticker] = SCORE_COOLDOWN_CICLOS
+            _score_fail_count[ticker] = 0
+            print(f"    {ticker}: activado cooldown {SCORE_COOLDOWN_CICLOS} ciclos por score bajo repetido")
         return None
+
+    # Score OK — resetear contador de fallos
+    _score_fail_count[ticker] = 0
 
     fund               = get_fundamentals(ticker)
     sent               = get_sentiment(ticker, sector or tech["sector"])
