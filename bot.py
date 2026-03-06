@@ -1350,64 +1350,48 @@ def quick_scan():
 # CAPA 2 — DATOS DE MERCADO con divergencias y premarket
 # ═══════════════════════════════════════════════════════════════════════
 
-def _fetch_finnhub_candles(ticker, verbose=False):
-    """Descarga 2 años de OHLCV diario desde Finnhub. Devuelve DataFrame compatible con get_market_data."""
-    import pandas as pd
-    if not FINNHUB_TOKEN:
-        if verbose:
-            print(f"    [{ticker}] ERROR: FINNHUB_TOKEN no configurado en variables de entorno")
-        return None
-    to_ts   = int(time.time())
-    from_ts = to_ts - 2 * 365 * 24 * 3600
-    url = "https://finnhub.io/api/v1/stock/candle"
-    params = {"symbol": ticker, "resolution": "D", "from": from_ts, "to": to_ts, "token": FINNHUB_TOKEN}
+def _fetch_yfinance_candles(ticker, session):
+    """Descarga 2 años de OHLCV diario desde Yahoo Finance con sesión autenticada."""
+    import yfinance as yf
     try:
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code != 200:
-            if verbose:
-                print(f"    [{ticker}] Finnhub HTTP {r.status_code}: {r.text[:200]}")
+        t = yf.Ticker(ticker, session=session)
+        hist = t.history(period="2y", interval="1d", auto_adjust=True)
+        if hist is None or len(hist) < 50:
             return None
-        d = r.json()
-        if d.get("s") != "ok" or not d.get("t"):
-            if verbose:
-                print(f"    [{ticker}] Finnhub status='{d.get('s')}' candles={len(d.get('t', []))}")
-            return None
-        df = pd.DataFrame({
-            "Open":   d["o"],
-            "High":   d["h"],
-            "Low":    d["l"],
-            "Close":  d["c"],
-            "Volume": d["v"],
-        }, index=pd.to_datetime(d["t"], unit="s", utc=True))
-        return df.dropna(how="all")
+        hist.index = hist.index.tz_convert("UTC") if hist.index.tzinfo else hist.index.tz_localize("UTC")
+        return hist
     except Exception as e:
-        if verbose:
-            print(f"    [{ticker}] Finnhub excepción: {e}")
         return None
 
 
 def prefetch_tickers(tickers):
-    """Descarga historial de todos los tickers vía Finnhub (evita rate limits de Yahoo en IPs cloud)."""
+    """Descarga historial de todos los tickers vía yfinance con sesión para evitar 429 en cloud."""
     global _hist_cache
     _hist_cache = {}
     if not tickers:
         return
-    if not FINNHUB_TOKEN:
-        print("  ERROR CRÍTICO: FINNHUB_TOKEN no está configurado. Sin datos de mercado.")
-        return
-    print(f"  Descargando historial de {len(tickers)} tickers vía Finnhub...")
-    _first_fail_logged = False
+    print(f"  Descargando historial de {len(tickers)} tickers vía yfinance...")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+    errors = 0
     for t in tickers:
         try:
-            hist = _fetch_finnhub_candles(t, verbose=not _first_fail_logged)
-            if hist is None and not _first_fail_logged:
-                _first_fail_logged = True
+            hist = _fetch_yfinance_candles(t, session)
             if hist is not None and len(hist) >= 50:
                 _hist_cache[t] = hist
-            time.sleep(1.1)   # Finnhub free: 60 llamadas/min → seguro con ~0.9 req/s
+            else:
+                errors += 1
+                if errors <= 3:
+                    print(f"    {t}: sin datos suficientes de yfinance")
+            time.sleep(0.5)
         except Exception as e:
             print(f"    {t}: error prefetch — {e}")
-    print(f"  Finnhub OK: {len(_hist_cache)}/{len(tickers)} con datos")
+            errors += 1
+    print(f"  yfinance OK: {len(_hist_cache)}/{len(tickers)} con datos")
 
 
 def get_market_data(ticker):
@@ -1415,7 +1399,9 @@ def get_market_data(ticker):
         if ticker in _hist_cache:
             hist = _hist_cache[ticker]
         else:
-            hist = _fetch_finnhub_candles(ticker)
+            session = requests.Session()
+            session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            hist = _fetch_yfinance_candles(ticker, session)
         if hist is None or hist.empty or len(hist) < 50:
             print(f"    {ticker}: sin datos de mercado")
             return None
