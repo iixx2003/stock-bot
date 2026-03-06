@@ -40,6 +40,18 @@ NEWS_API_KEY             = os.environ.get("NEWS_API_KEY")
 FINNHUB_TOKEN            = os.environ.get("FINNHUB_TOKEN")
 TWELVE_DATA_KEY          = os.environ.get("TWELVE_DATA_KEY")
 
+# Rate limiter global para Twelve Data (Basic 8: 8 req/min)
+_td_last_call = 0.0
+_TD_MIN_INTERVAL = 8.0  # segundos entre llamadas
+
+def _td_rate_limit():
+    """Bloquea hasta que haya pasado el intervalo mínimo entre llamadas."""
+    global _td_last_call
+    elapsed = time.time() - _td_last_call
+    if elapsed < _TD_MIN_INTERVAL:
+        time.sleep(_TD_MIN_INTERVAL - elapsed)
+    _td_last_call = time.time()
+
 SPAIN_TZ = pytz.timezone("Europe/Madrid")
 
 # Umbrales de confianza
@@ -1356,6 +1368,7 @@ def _fetch_twelve_data_candles(ticker, _retry=True):
     import pandas as pd
     if not TWELVE_DATA_KEY:
         return None
+    _td_rate_limit()
     try:
         url = "https://api.twelvedata.com/time_series"
         params = {
@@ -1413,7 +1426,7 @@ def prefetch_tickers(tickers):
             if hist is not None and len(hist) >= 50:
                 _hist_cache[t] = hist
                 ok += 1
-            time.sleep(8)  # Plan free: 8 req/min → 1 req cada 8s (seguro)
+            # rate limit gestionado globalmente por _td_rate_limit() en _fetch_twelve_data_candles
         except Exception as e:
             print(f"    {t}: error prefetch — {e}")
     print(f"  Twelve Data OK: {ok}/{len(tickers)} con datos")
