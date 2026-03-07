@@ -1,21 +1,21 @@
 """
-StockBot Pro v5.1
+StockBot Pro v5.2
 ───────────────────────────────────────────────────────────────────────
-Añadidos sobre v5:
-  - Cola de calidad: solo Excepcionales antes de las 14:00h
-  - Premarket dedicado: gap >3%, volumen pre-mercado, etiqueta PREMARKET
-  - Stocktwits: sentimiento retail (peso bajo)
-  - Investing.com: noticias serias + calendario económico (peso alto)
-  - Put/call ratio: actividad institucional en opciones
-  - Contexto geopolítico: ajusta sectores automáticamente
-  - Señal PRE-EARNINGS: 1/día, solo compra, mínimo 3/4 beats
-  - Short squeeze detector
-  - Insiders masivos: 3+ compras en 7 días
-  - Gap de apertura >3%
-  - Divergencias RSI/precio (solo si aparece en 2 timeframes)
-  - Confluencia dinámica de timeframes según régimen
-  - Memoria de catalizadores por sector
-  - Calendario económico: más conservador en días Fed/CPI/NFP
+Añadidos sobre v5.2:
+  - Macro actualizada cada 30 min durante sesión USA (15:00-22:30)
+  - MAX_AI dinámico: 3 en BULL/LATERAL, 1 en BEAR
+  - Learning engine arranca con 5 predicciones (era 20)
+  - Sentimiento con detección de negaciones y contexto (anti falsos positivos)
+  - Cooldown de score reducido: 3 ciclos (era 5)
+  - Franja suave pre-apertura USA 15:00-15:30: mínimo CONF_FUERTE
+  - Reset diario completo: incluye _score_fail_count y _score_cooldown
+  - Parsing de confianza blindado: regex robusto + validación 0-99
+  - Régimen con fallback al valor anterior si falla SPY
+  - Stop Loss real de la IA guardado en predicción (con fallback técnico)
+  - Sector real obtenido de assetProfile (quoteSummary)
+  - Notificación inmediata a Discord cuando predicción se resuelve (win/loss)
+  - Target dinámico por régimen: BULL 18%, LATERAL 12%, BEAR 8%
+  - Circuit breaker: 3 pérdidas seguidas → umbral +5% durante 24h
 """
 
 import os, time, json, random, schedule, requests, feedparser, anthropic, re
@@ -52,7 +52,7 @@ _td_credits_reset_at: float = 0.0
 
 # Cooldown de score bajo: {ticker: ciclos_restantes_a_saltar}
 _score_cooldown: dict = {}
-SCORE_COOLDOWN_CICLOS = 5  # saltar N ciclos si falla por score repetidamente
+SCORE_COOLDOWN_CICLOS = 3  # saltar N ciclos si falla por score repetidamente (era 5)
 SCORE_FAIL_THRESHOLD  = 3  # fallos consecutivos antes de activar cooldown
 _score_fail_count: dict = {}  # {ticker: nº fallos consecutivos}
 
@@ -74,7 +74,7 @@ CONF_EXCEPCIONAL = 94
 # Límites diarios
 MAX_ALERTAS_DIA       = 3
 MAX_VENTAS_DIA        = 1
-MAX_AI_POR_CICLO      = 1   # máx llamadas IA por ciclo — optimizado coste
+MAX_AI_POR_CICLO      = 3   # máx llamadas IA por ciclo (1 en BEAR, 3 en BULL/LATERAL)
 MAX_PRE_EARNINGS_DIA  = 1   # máximo señales PRE-EARNINGS al día
 
 # Score técnico mínimo
@@ -90,11 +90,11 @@ COSTE_MAX_DIA         = 0.50   # alerta si se supera este gasto estimado ($)
 MAX_429_SEGUIDOS      = 5      # ciclos con mayoría de 429 antes de pausa larga
 PAUSA_429_MINUTOS     = 20     # minutos de pausa si Yahoo está bloqueando fuerte
 
-# Aprendizaje
-LEARN_MIN_PREDS = 20
-LEARN_MIN_L3    = 40
-LEARN_MIN_L4    = 60
-LEARN_MIN_L5    = 80
+# Aprendizaje — umbrales bajados para activar antes (v5.2)
+LEARN_MIN_PREDS = 5    # era 20 — nivel 1 y 2
+LEARN_MIN_L3    = 15   # era 40
+LEARN_MIN_L4    = 30   # era 60
+LEARN_MIN_L5    = 50   # era 80
 
 # Archivos de persistencia
 PREDICTIONS_FILE      = "/app/data/predictions.json"
@@ -347,6 +347,13 @@ pausa_429_hasta     = None
 coste_estimado_hoy  = 0.0
 ai_calls_hoy        = 0
 
+# Circuit breaker — 3 pérdidas consecutivas → umbral +5% durante 24h
+_cb_consecutive_losses = 0
+_cb_active_until       = None   # datetime o None
+CB_MAX_LOSSES          = 3
+CB_CONF_BOOST          = 5      # puntos extra al umbral mínimo
+CB_DURATION_HOURS      = 24
+
 # ═══════════════════════════════════════════════════════════════════════
 # PERSISTENCIA
 # ═══════════════════════════════════════════════════════════════════════
@@ -399,16 +406,31 @@ def save_state():
             print(f"  ERROR guardando {filepath}: {e}")
 
 
-def save_prediction(ticker, signal, tech, conf, signal_type="NORMAL"):
+def _target_multiplier(signal):
+    """Target dinámico según régimen: BULL=18%, LATERAL=12%, BEAR=8%."""
+    regime = market_regime.get("regime", "LATERAL")
+    mults = {"BULL": 0.18, "LATERAL": 0.12, "BEAR": 0.08}
+    pct = mults.get(regime, 0.12)
+    return (1 + pct) if signal == "COMPRAR" else (1 - pct)
+
+
+def save_prediction(ticker, signal, tech, conf, signal_type="NORMAL", stop_ia=None):
     """Guarda predicción enriquecida con tipo de señal."""
+    price = tech.get("price", 0)
+    # Stop loss: usar el de la IA si es válido, sino fallback técnico
+    if stop_ia and price > 0:
+        stop_val = round(stop_ia, 2)
+    else:
+        stop_val = round(tech.get("rl", price * 0.93), 2)
     predictions.append({
         "ticker": ticker, "signal": signal, "confidence": conf,
         "signal_type": signal_type,   # NORMAL / PRE_EARNINGS / SHORT_SQUEEZE / INSIDER_MASSIVE
         "date": datetime.now(SPAIN_TZ).isoformat(),
         "result": "pending", "exit_price": None, "days_to_result": None,
-        "entry":  round(tech.get("price", 0), 2),
-        "target": round(tech.get("price", 0) * (1.15 if signal == "COMPRAR" else 0.85), 2),
-        "stop":   round(tech.get("rl", tech.get("price", 0) * 0.93), 2),
+        "entry":  round(price, 2),
+        "target": round(price * _target_multiplier(signal), 2),
+        "stop":   stop_val,
+        "stop_source": "ia" if stop_ia else "tecnico",
         "rsi": tech.get("rsi"), "rsi_zone": tech.get("rsi_zone"),
         "macd_bullish": tech.get("macd_bullish"), "stoch_k": tech.get("stoch_k"),
         "vol_ratio": tech.get("vol_ratio"), "obv_trend": tech.get("obv_trend"),
@@ -464,7 +486,9 @@ def pre_earnings_hoy():
 
 
 def puede_enviar_alerta(signal, conf, signal_type="NORMAL"):
-    now_hour = datetime.now(SPAIN_TZ).hour
+    now = datetime.now(SPAIN_TZ)
+    now_hour   = now.hour
+    now_minute = now.minute
 
     # Excepcional siempre pasa
     if conf >= CONF_EXCEPCIONAL:
@@ -473,6 +497,15 @@ def puede_enviar_alerta(signal, conf, signal_type="NORMAL"):
     # Cola de calidad: antes de HORA_DESBLOQUEO solo Excepcionales
     if now_hour < HORA_DESBLOQUEO:
         return False, f"cola de calidad activa hasta las {HORA_DESBLOQUEO}:00"
+
+    # Franja suave pre-apertura USA (15:00–15:30): umbral FUERTE mínimo
+    if now_hour == 15 and now_minute < 30 and conf < CONF_FUERTE:
+        return False, f"pre-apertura USA — confianza mínima {CONF_FUERTE}% hasta las 15:30"
+
+    # Circuit breaker: racha de pérdidas → umbral mínimo elevado
+    if circuit_breaker_active() and conf < (CONF_NORMAL + CB_CONF_BOOST):
+        until_str = _cb_active_until.strftime("%d/%m %H:%M") if _cb_active_until else "?"
+        return False, f"circuit breaker activo — mínimo {CONF_NORMAL + CB_CONF_BOOST}% hasta {until_str}"
 
     # Límite total
     if alertas_hoy() >= MAX_ALERTAS_DIA:
@@ -804,7 +837,7 @@ def post_instrucciones():
     eco_warn  = "⚠️ ALTO IMPACTO HOY" if econ_calendar.get("is_high_impact") else ""
 
     _discord_post(DISCORD_INSTRUCCIONES_ID, f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📖  **CÓMO FUNCIONA STOCKBOT PRO v5.1**
+📖  **CÓMO FUNCIONA STOCKBOT PRO v5.2**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍  **Análisis automático**
 Vigila ~{len(UNIVERSE)} acciones cada 5 min.
@@ -918,6 +951,7 @@ def detect_market_regime():
             spy_closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
 
         if not spy_closes or len(spy_closes) < 20:
+            print("  detect_market_regime: datos SPY insuficientes — manteniendo régimen anterior")
             return
 
         price  = spy_closes[-1]
@@ -966,7 +1000,7 @@ def detect_market_regime():
         if prev != regime and prev != "UNKNOWN":
             send_log(f"🔄 Cambio régimen: {prev} → {regime}")
     except Exception as e:
-        print(f"  detect_market_regime error: {e}")
+        print(f"  detect_market_regime error: {e} — manteniendo régimen anterior ({market_regime.get('regime','?')})")
 
 
 def get_regime_conf_adjustment():
@@ -1654,7 +1688,7 @@ def get_market_data(ticker):
             "daily_trend": daily_trend, "weekly_trend": weekly_trend,
             "monthly_trend": monthly_trend, "tf_confluence": tf_conf,
             "tech_score": max(tech_score, 0),
-            # Nuevos en v5.1
+            # Nuevos en v5.2
             "divergence_type": div_type,
             "divergence_desc": div_desc,
             "weighted_tf_score": weighted_score,
@@ -1676,8 +1710,9 @@ def get_fundamentals(ticker):
         "rec_key": "hold", "analyst_target": None, "analyst_upside": None,
         "earnings_days": None, "earnings_beats": 0,
         "insider_buys": 0, "insider_sells": 0,
+        "sector": None,
     }
-    modules = "defaultKeyStatistics,financialData,calendarEvents,earningsHistory,insiderTransactions"
+    modules = "defaultKeyStatistics,financialData,calendarEvents,earningsHistory,insiderTransactions,assetProfile"
     try:
         r = requests.get(
             f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules={modules}",
@@ -1689,9 +1724,12 @@ def get_fundamentals(ticker):
         if r.status_code != 200:
             return result
 
-        data  = r.json().get("quoteSummary", {}).get("result", [{}])[0]
-        stats = data.get("defaultKeyStatistics", {})
-        fin   = data.get("financialData", {})
+        data    = r.json().get("quoteSummary", {}).get("result", [{}])[0]
+        stats   = data.get("defaultKeyStatistics", {})
+        fin     = data.get("financialData", {})
+        profile = data.get("assetProfile", {})
+        if profile.get("sector"):
+            result["sector"] = profile["sector"]
 
         def _raw(d, key, default=None):
             return (d.get(key) or {}).get("raw", default)
@@ -1735,6 +1773,27 @@ def get_fundamentals(ticker):
 # CAPA 4 — SENTIMIENTO enriquecido: NewsAPI + Stocktwits + Investing.com
 # ═══════════════════════════════════════════════════════════════════════
 
+def _score_headline(title, positive_words, negative_words):
+    """Puntúa un titular teniendo en cuenta negaciones de contexto."""
+    tl = title.lower()
+    negation_ctx = ["not", "no ", "never", "downgrade", "cut", "miss", "disappoints",
+                    "lower", "concern", "risk", "warn", "below", "slump", "despite"]
+    score = 0
+    for w in positive_words:
+        if w in tl:
+            # Si hay palabras de negación en los 40 caracteres previos al keyword, no contar como positivo
+            idx = tl.find(w)
+            context_window = tl[max(0, idx - 40):idx]
+            if any(n in context_window for n in negation_ctx):
+                score -= 1  # falso positivo → penalizar levemente
+            else:
+                score += 1
+    for w in negative_words:
+        if w in tl:
+            score -= 1
+    return score
+
+
 def get_sentiment(ticker, sector):
     news_items      = []
     sentiment_score = 0
@@ -1752,9 +1811,7 @@ def get_sentiment(ticker, sector):
                 for a in r.json().get("articles", [])[:6]:
                     title = a.get("title", "")
                     news_items.append(f"[NEWS] {title}")
-                    tl = title.lower()
-                    sentiment_score += sum(1 for w in positive_words if w in tl)
-                    sentiment_score -= sum(1 for w in negative_words if w in tl)
+                    sentiment_score += _score_headline(title, positive_words, negative_words)
         except Exception: pass
 
     # RSS Yahoo Finance
@@ -1768,9 +1825,7 @@ def get_sentiment(ticker, sector):
     investing_news = get_investing_news(ticker)
     for n in investing_news:
         news_items.append(f"[INVESTING] {n}")
-        tl = n.lower()
-        sentiment_score += sum(1 for w in positive_words if w in tl) * 2   # peso doble por ser fuente seria
-        sentiment_score -= sum(1 for w in negative_words if w in tl) * 2
+        sentiment_score += _score_headline(n, positive_words, negative_words) * 2  # peso doble por ser fuente seria
 
     # Stocktwits
     st_data = get_stocktwits_sentiment(ticker)
@@ -1992,14 +2047,33 @@ def update_prediction_results():
                 expired    = days_since > 30
                 if hit_target:
                     p["result"] = "win";  p["exit_price"] = round(current, 2); p["days_to_result"] = days_since
+                    chg = round(((current - p["entry"]) / p["entry"]) * 100, 1) if p.get("signal") == "COMPRAR" else round(((p["entry"] - current) / p["entry"]) * 100, 1)
+                    _cb_register_result("win")
+                    send_acierto(
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"✅ **{ticker}** — TARGET ALCANZADO\n"
+                        f"📈 Entrada: ${p['entry']} → Salida: ${round(current,2)} ({chg:+.1f}%)\n"
+                        f"📅 {days_since} día(s) | {p.get('signal_type','NORMAL')}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    )
                 elif hit_stop or expired:
                     p["result"] = "loss"; p["exit_price"] = round(current, 2); p["days_to_result"] = days_since
+                    chg = round(((current - p["entry"]) / p["entry"]) * 100, 1) if p.get("signal") == "COMPRAR" else round(((p["entry"] - current) / p["entry"]) * 100, 1)
+                    motivo = "STOP LOSS" if hit_stop else "EXPIRADA (30d)"
+                    _cb_register_result("loss")
+                    send_acierto(
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"❌ **{ticker}** — {motivo}\n"
+                        f"📉 Entrada: ${p['entry']} → Salida: ${round(current,2)} ({chg:+.1f}%)\n"
+                        f"📅 {days_since} día(s) | {p.get('signal_type','NORMAL')}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    )
         except Exception: pass
         time.sleep(0.3)
     save_state()
 
 # ═══════════════════════════════════════════════════════════════════════
-# CAPA 6 — IA con prompts adaptativos v5.1
+# CAPA 6 — IA con prompts adaptativos v5.2
 # ═══════════════════════════════════════════════════════════════════════
 
 def call_ai(prompt, max_tokens=700):
@@ -2057,7 +2131,7 @@ def _build_learning_context():
 
 def _build_auto_prompt(tech, fund, sent, inst_signal, conf_boost, special_signals=None):
     """
-    Prompt automático v5.1 con todas las nuevas capas:
+    Prompt automático v5.2 con todas las nuevas capas:
     - Premarket / gap
     - Stocktwits
     - Investing.com
@@ -2446,7 +2520,9 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
     _score_fail_count[ticker] = 0
 
     fund               = get_fundamentals(ticker)
-    sent               = get_sentiment(ticker, sector or tech["sector"])
+    # Sector real de fundamentales tiene prioridad sobre el pasado como parámetro
+    sector_real = fund.get("sector") or sector or tech.get("sector", "Unknown")
+    sent               = get_sentiment(ticker, sector_real)
     inst_signal, boost = get_inst_signal(tech)
 
     # Detectar señales especiales
@@ -2517,14 +2593,22 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
         save_state()
         return None
 
-    # Extraer confianza
-    conf_ia = 0
+    # Extraer confianza — regex robusto con validación de rango
+    conf_ia  = 0
+    stop_ia  = None  # stop loss que devuelve la IA
     for line in ai_response.splitlines():
         if "CONFIANZA:" in line:
-            m_conf = re.search(r"CONFIANZA:\s*(\d+)", line)
+            m_conf = re.search(r"CONFIANZA:\s*(\d{1,3})", line)
             if m_conf:
-                conf_ia = int(m_conf.group(1))
-            break
+                parsed = int(m_conf.group(1))
+                conf_ia = max(0, min(parsed, 99))  # forzar rango 0-99
+        if "STOP" in line and "LOSS" in line:
+            m_stop = re.search(r"\$?([\d]+\.?[\d]*)", line)
+            if m_stop:
+                try:
+                    stop_ia = float(m_stop.group(1))
+                except ValueError:
+                    pass
 
     conf_final = min(conf_ia + boost, 99) if not force else conf_ia
 
@@ -2568,7 +2652,7 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
     nivel = "EXCEPCIONAL ⚡" if conf_final >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf_final >= CONF_FUERTE else "NORMAL 🟢"
     print(f"    {ticker}: {nivel} {signal} {conf_final}% [{signal_type}]")
 
-    return text, signal, conf_final, tech, signal_type
+    return text, signal, conf_final, tech, signal_type, stop_ia
 
 # ═══════════════════════════════════════════════════════════════════════
 # CICLO AUTOMÁTICO — cada 5 minutos
@@ -2613,9 +2697,11 @@ def track_ai_cost():
 
 def reset_daily_counters():
     """Resetea contadores diarios a medianoche."""
-    global coste_estimado_hoy, ai_calls_hoy
+    global coste_estimado_hoy, ai_calls_hoy, _score_fail_count, _score_cooldown
     coste_estimado_hoy = 0.0
     ai_calls_hoy       = 0
+    _score_fail_count  = {}
+    _score_cooldown    = {}
     send_log("🔄 Nuevo día — límites y contadores reseteados")
 
 
@@ -2642,6 +2728,32 @@ def check_429_watchdog(errores_429, total_intentos):
     else:
         ciclos_429_seguidos = 0
     return False
+
+
+def circuit_breaker_active():
+    """Devuelve True si el circuit breaker está activo (umbral subido por rachas de pérdidas)."""
+    global _cb_active_until
+    if _cb_active_until and datetime.now(SPAIN_TZ) < _cb_active_until:
+        return True
+    if _cb_active_until and datetime.now(SPAIN_TZ) >= _cb_active_until:
+        _cb_active_until = None
+        send_log("✅ Circuit breaker desactivado — umbrales normales restablecidos")
+    return False
+
+
+def _cb_register_result(result):
+    """Registra win/loss en el circuit breaker y activa si hay racha de pérdidas."""
+    global _cb_consecutive_losses, _cb_active_until
+    if result == "win":
+        _cb_consecutive_losses = 0
+    elif result == "loss":
+        _cb_consecutive_losses += 1
+        if _cb_consecutive_losses >= CB_MAX_LOSSES and not circuit_breaker_active():
+            _cb_active_until = datetime.now(SPAIN_TZ) + timedelta(hours=CB_DURATION_HOURS)
+            send_log(
+                f"⚠️ CIRCUIT BREAKER activado — {CB_MAX_LOSSES} pérdidas seguidas\n"
+                f"Umbral mínimo +{CB_CONF_BOOST}% durante {CB_DURATION_HOURS}h hasta {_cb_active_until.strftime('%d/%m %H:%M')}"
+            )
 
 
 def is_paused_429():
@@ -2793,8 +2905,11 @@ def watch_cycle():
     # Descarga batch de todos los tickers antes del loop (1 request en vez de N)
     prefetch_tickers([item["ticker"] for item in to_analyze])
 
+    _regime_now = market_regime.get("regime", "LATERAL")
+    _max_ai_ciclo = 1 if _regime_now == "BEAR" else MAX_AI_POR_CICLO
+
     for item in to_analyze:
-        if alerts_this_cycle >= MAX_AI_POR_CICLO:
+        if alerts_this_cycle >= _max_ai_ciclo:
             break
 
         ticker = item["ticker"]
@@ -2828,9 +2943,9 @@ def watch_cycle():
             time.sleep(2)
             continue
 
-        text, signal, conf, tech, signal_type = result
+        text, signal, conf, tech, signal_type, stop_ia = result
         send_alert(text)
-        save_prediction(ticker, signal, tech, conf, signal_type)
+        save_prediction(ticker, signal, tech, conf, signal_type, stop_ia)
         alerts_this_cycle += 1
 
         nivel = "EXCEPCIONAL ⚡" if conf >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf >= CONF_FUERTE else "NORMAL 🟢"
@@ -2935,12 +3050,12 @@ def listen_commands(init=False):
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                     )
                 else:
-                    text_alert, signal, conf, tech, signal_type = result
+                    text_alert, signal, conf, tech, signal_type, _stop = result
                     send_solicitud(text_alert)
 
                 fg_loop = market_context["fear_greed"]
                 update_status(
-                    f"🟢  **Activo v5.1** — vigilando mercado\n"
+                    f"🟢  **Activo v5.2** — vigilando mercado\n"
                     f"📡 F&G: {fg_loop} ({_fg_label(fg_loop)}) | VIX: {market_context['vix']} | {market_regime.get('regime','?')}\n"
                     f"🕐  {now_es.strftime('%H:%M')} — si no cambia en 10 min el bot está caído"
                 )
@@ -2986,7 +3101,7 @@ def weekly_report():
 
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "📊  **RESUMEN SEMANAL v5.1**",
+        "📊  **RESUMEN SEMANAL v5.2**",
         f"Semana {(now-timedelta(days=7)).strftime('%d/%m')} → {now.strftime('%d/%m/%Y')}",
         f"Régimen: {market_regime.get('regime','?')}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -3053,6 +3168,15 @@ def weekly_summary():
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════
 
+def _update_macro_if_market_hours():
+    """Actualiza macro solo durante horario de mercado (15:00-22:30 España)."""
+    now = datetime.now(SPAIN_TZ)
+    if now.weekday() >= 5:
+        return
+    if (now.hour == 15 and now.minute >= 0) or (15 < now.hour < 22) or (now.hour == 22 and now.minute <= 30):
+        update_market_context()
+
+
 def main():
     # Validar variables de entorno críticas antes de arrancar
     missing = [name for name, val in [
@@ -3063,10 +3187,10 @@ def main():
         raise SystemExit(f"ERROR: variables de entorno no configuradas: {', '.join(missing)}")
 
     now = datetime.now(SPAIN_TZ)
-    print(f"StockBot Pro v5.1 — {now.strftime('%H:%M %d/%m/%Y')}")
+    print(f"StockBot Pro v5.2 — {now.strftime('%H:%M %d/%m/%Y')}")
 
     load_state()
-    update_status(f"⚙️  **Arrancando v5.1...**\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
+    update_status(f"⚙️  **Arrancando v5.2...**\n🕐  {now.strftime('%H:%M  %d/%m/%Y')}")
     update_market_context()   # incluye régimen + geopolítica + calendario
 
     fg     = market_context["fear_greed"]
@@ -3079,7 +3203,7 @@ def main():
 
     send_log(
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 **StockBot v5.1** — {now.strftime('%H:%M %d/%m/%Y')}\n"
+        f"🤖 **StockBot v5.2** — {now.strftime('%H:%M %d/%m/%Y')}\n"
         f"📡 F&G: {fg}/100 ({fg_str}) | S&P500: {sp500:+.2f}% | VIX: {vix}\n"
         f"🔄 Régimen: {regime} | Universo: {len(UNIVERSE)} acciones\n"
         f"🧠 Reglas: {rules} | Eventos macro: {eco}\n"
@@ -3092,7 +3216,7 @@ def main():
     print("  Instrucciones publicadas")
 
     update_status(
-        f"🟢  **Activo v5.1** — vigilando mercado\n"
+        f"🟢  **Activo v5.2** — vigilando mercado\n"
         f"📡 F&G: {fg} ({fg_str}) | VIX: {vix} | {regime}\n"
         f"🕐  {now.strftime('%H:%M  %d/%m/%Y')}"
     )
@@ -3101,6 +3225,7 @@ def main():
     listen_commands(init=True)
 
     schedule.every(5).minutes.do(watch_cycle)
+    schedule.every(30).minutes.do(_update_macro_if_market_hours)
     schedule.every().day.at("09:00").do(update_market_context)
     schedule.every().day.at("00:01").do(reset_daily_counters)
     schedule.every().day.at("22:00").do(daily_summary)
@@ -3130,7 +3255,7 @@ def main():
             else:
                 day_txt = f"🕐  {now_loop.strftime('%H:%M')} — si no cambia en 10 min el bot está caído"
             update_status(
-                f"🟢  **Activo v5.1** — vigilando mercado\n"
+                f"🟢  **Activo v5.2** — vigilando mercado\n"
                 f"📡 F&G: {fg_loop} ({_fg_label(fg_loop)}) | VIX: {market_context['vix']} | {market_regime.get('regime','?')}{eco_warn}\n"
                 f"{day_txt}"
             )
