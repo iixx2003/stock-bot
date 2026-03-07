@@ -2743,6 +2743,9 @@ def cmd_pendientes():
 
 def watch_cycle():
     now = datetime.now(SPAIN_TZ)
+    # Fin de semana: mercado cerrado, no escanear
+    if now.weekday() >= 5:  # 5=sábado, 6=domingo
+        return
     if now.hour < 9 or now.hour >= 23:
         return
 
