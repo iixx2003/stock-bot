@@ -881,12 +881,19 @@ def update_market_context():
     global market_context
     print("  Actualizando contexto macro...")
 
+    # Fear & Greed del mercado de acciones (CNN) — fallback a crypto (alternative.me)
     fg = 50
     try:
-        r = requests.get("https://api.alternative.me/fng/", timeout=8)
-        if r.status_code == 200:
-            fg = int(r.json()["data"][0]["value"])
-    except Exception: pass
+        import fear_and_greed
+        info = fear_and_greed.get()
+        fg = int(info.value)
+    except Exception:
+        try:
+            r = requests.get("https://api.alternative.me/fng/", timeout=8)
+            if r.status_code == 200:
+                fg = int(r.json()["data"][0]["value"])
+        except Exception:
+            pass
 
     sp500_change, vix = 0.0, 15.0
     for symbol, key in [("SPY", "sp500"), ("^VIX", "vix")]:

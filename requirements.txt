@@ -4,3 +4,4 @@ anthropic==0.49.0
 schedule==1.2.2
 pytz==2024.1
 pandas==2.2.3
+fear-and-greed==0.4.0
