@@ -47,6 +47,9 @@ _TD_MIN_INTERVAL = 8.0  # segundos entre llamadas
 # Símbolos inválidos en Twelve Data (se puebla en sesión, no persiste)
 _td_invalid_symbols: set = set()
 
+# Créditos agotados: timestamp UTC en que se puede volver a intentar (medianoche UTC)
+_td_credits_reset_at: float = 0.0
+
 # Cooldown de score bajo: {ticker: ciclos_restantes_a_saltar}
 _score_cooldown: dict = {}
 SCORE_COOLDOWN_CICLOS = 5  # saltar N ciclos si falla por score repetidamente
@@ -1375,7 +1378,14 @@ def quick_scan():
 def _fetch_twelve_data_candles(ticker, _retry=True):
     """Descarga hasta 500 días de OHLCV diario desde Twelve Data (funciona en IPs cloud)."""
     import pandas as pd
+    global _td_credits_reset_at
     if not TWELVE_DATA_KEY:
+        return None
+    # Créditos agotados: no llamar hasta medianoche UTC
+    now = time.time()
+    if _td_credits_reset_at and now < _td_credits_reset_at:
+        remaining = int(_td_credits_reset_at - now)
+        print(f"    [{ticker}] Twelve Data sin créditos — reset en {remaining//3600}h {(remaining%3600)//60}m. Saltando.")
         return None
     _td_rate_limit()
     try:
@@ -1394,11 +1404,14 @@ def _fetch_twelve_data_candles(ticker, _retry=True):
         data = r.json()
         if data.get("status") == "error":
             msg = data.get("message", "")
-            # Rate limit: esperamos 60s y reintentamos una vez
-            if "run out of API credits" in msg and _retry:
-                print(f"    [{ticker}] Rate limit — esperando 62s...")
-                time.sleep(62)
-                return _fetch_twelve_data_candles(ticker, _retry=False)
+            # Créditos diarios agotados: bloquear hasta medianoche UTC y no reintentar
+            if "run out of API credits" in msg:
+                import datetime as _dt
+                tomorrow = _dt.datetime.now(_dt.timezone.utc).replace(
+                    hour=0, minute=2, second=0, microsecond=0
+                ) + _dt.timedelta(days=1)
+                _td_credits_reset_at = tomorrow.timestamp()
+                print(f"    [{ticker}] Twelve Data: créditos agotados. Bloqueado hasta {tomorrow.strftime('%Y-%m-%d %H:%M UTC')}.")
             # Símbolo inválido: blacklist en sesión para no reintentar
             if "symbol" in msg.lower() and ("missing" in msg.lower() or "invalid" in msg.lower()):
                 _td_invalid_symbols.add(ticker)
