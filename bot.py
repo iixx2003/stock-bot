@@ -3123,10 +3123,16 @@ def main():
             now_loop = datetime.now(SPAIN_TZ)
             fg_loop  = market_context["fear_greed"]
             eco_warn = " ⚠️ALTO IMPACTO" if econ_calendar.get("is_high_impact") else ""
+            if now_loop.weekday() == 5:
+                day_txt = "🗓️ Hoy es **sábado** — mercado cerrado. El domingo resumen semanal a las 10:00"
+            elif now_loop.weekday() == 6:
+                day_txt = "🗓️ Hoy es **domingo** — mercado cerrado. El lunes abrimos a las 15:30"
+            else:
+                day_txt = f"🕐  {now_loop.strftime('%H:%M')} — si no cambia en 10 min el bot está caído"
             update_status(
                 f"🟢  **Activo v5.1** — vigilando mercado\n"
                 f"📡 F&G: {fg_loop} ({_fg_label(fg_loop)}) | VIX: {market_context['vix']} | {market_regime.get('regime','?')}{eco_warn}\n"
-                f"🕐  {now_loop.strftime('%H:%M')} — si no cambia en 10 min el bot está caído"
+                f"{day_txt}"
             )
             last_status_check = ts
 
