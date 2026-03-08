@@ -16,7 +16,7 @@ except ImportError:
 # Caché de precios: ticker → (price, change_pct, timestamp)
 _price_cache = {}
 _price_lock  = threading.Lock()
-_PRICE_TTL   = 180   # 3 min
+_PRICE_TTL   = 15    # 15 seg (live)
 
 # Caché de earnings: ticker → (date_str_or_None, timestamp)
 _earnings_cache = {}
@@ -64,7 +64,7 @@ def is_premarket_now():
 
 
 def _fetch_price(ticker):
-    """Devuelve (price, change_pct) con caché de 3 min. Nunca lanza excepción."""
+    """Devuelve (price, change_pct) con caché de 15 seg. Nunca lanza excepción."""
     now_ts = time.time()
     with _price_lock:
         cached = _price_cache.get(ticker)
@@ -1475,7 +1475,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
     <div class="sh" style="margin-bottom:0;flex:1;min-width:200px">📡 Señales activas — {{ pending_ct }} predicciones en curso</div>
     <span style="font-size:11px;color:var(--t3);background:var(--s2);border:1px solid var(--b1);border-radius:6px;padding:4px 10px;white-space:nowrap">
-      💡 Precio actualiza cada 3 min
+      💡 Precio actualiza cada 15 seg
     </span>
   </div>
 
@@ -1504,44 +1504,12 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
   </div>
   {% endif %}
 
-  <!-- ── POSITION SIZING CARD ── -->
-  <div class="card ps-card" style="margin-bottom:16px;padding:16px 18px">
-    <div style="display:flex;align-items:flex-start;gap:20px;flex-wrap:wrap">
-
-      <!-- Capital input -->
-      <div style="flex:0 0 auto">
-        <div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.5px;text-transform:uppercase;margin-bottom:7px">💰 Tu capital disponible</div>
-        <div class="ps-input-wrap">
-          <select id="ps-currency" class="ps-currency" onchange="recalcPositions()">
-            <option value="USD">$</option>
-            <option value="EUR">€</option>
-          </select>
-          <input type="number" id="ps-capital" class="ps-capital" placeholder="10 000" min="1" step="1"
-            oninput="recalcPositions()" onchange="recalcPositions()">
-        </div>
-        <div style="font-size:10px;color:var(--t3);margin-top:5px">Se guarda automáticamente</div>
-      </div>
-
-      <!-- Riesgo base slider -->
-      <div style="flex:0 0 auto">
-        <div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.5px;text-transform:uppercase;margin-bottom:7px">⚙️ % capital por señal</div>
-        <div class="ps-risk-wrap">
-          <input type="range" id="ps-risk" class="ps-risk-range" min="1" max="99" step="1" value="10" oninput="recalcPositions()">
-          <span id="ps-risk-val" class="ps-risk-val">10%</span>
-        </div>
-        <div style="font-size:10px;color:var(--t3);margin-top:5px">Del capital total a asignar por señal</div>
-      </div>
-
-      <!-- Resumen vivo -->
-      <div style="flex:1;min-width:220px">
-        <div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.5px;text-transform:uppercase;margin-bottom:7px">📊 Resumen de exposición</div>
-        <div class="ps-summary" id="ps-summary">
-          <span style="color:var(--t3);font-size:12px">Introduce tu capital para ver el sizing →</span>
-        </div>
-      </div>
-
-    </div>
-  </div>
+  <!-- inputs ocultos para mantener compatibilidad con recalcPositions -->
+  <input type="hidden" id="ps-capital">
+  <input type="hidden" id="ps-risk" value="10">
+  <input type="hidden" id="ps-currency" value="USD">
+  <span id="ps-risk-val" style="display:none">10%</span>
+  <div id="ps-summary" style="display:none"></div>
 
   {% if pending %}
   <div class="card" style="margin-bottom:20px;padding:0">
@@ -3346,7 +3314,7 @@ function refreshLivePrices() {
 
 // Arrancar en vivo: primera llamada inmediata, luego cada 30s
 refreshLivePrices();
-setInterval(refreshLivePrices, 30000);
+setInterval(refreshLivePrices, 15000);
 
 function closeSizerModal() {
   const m = document.getElementById('sizer-modal');
