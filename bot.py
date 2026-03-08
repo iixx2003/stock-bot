@@ -2062,7 +2062,7 @@ def update_prediction_results():
                 hit_stop   = (signal == "COMPRAR" and current <= stop)   or (signal == "VENDER" and current >= stop)
                 expired    = days_since > 30
                 if hit_target:
-                    p["result"] = "win";  p["exit_price"] = round(current, 2); p["days_to_result"] = days_since
+                    p["result"] = "win";  p["exit_price"] = round(current, 2); p["days_to_result"] = days_since; p["exit_reason"] = "TARGET"
                     chg = round(((current - p["entry"]) / p["entry"]) * 100, 1) if p.get("signal") == "COMPRAR" else round(((p["entry"] - current) / p["entry"]) * 100, 1)
                     _cb_register_result("win")
                     send_acierto(
@@ -2073,9 +2073,9 @@ def update_prediction_results():
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                     )
                 elif hit_stop or expired:
-                    p["result"] = "loss"; p["exit_price"] = round(current, 2); p["days_to_result"] = days_since
-                    chg = round(((current - p["entry"]) / p["entry"]) * 100, 1) if p.get("signal") == "COMPRAR" else round(((p["entry"] - current) / p["entry"]) * 100, 1)
                     motivo = "STOP LOSS" if hit_stop else "EXPIRADA (30d)"
+                    p["result"] = "loss"; p["exit_price"] = round(current, 2); p["days_to_result"] = days_since; p["exit_reason"] = "STOP" if hit_stop else "EXPIRADA"
+                    chg = round(((current - p["entry"]) / p["entry"]) * 100, 1) if p.get("signal") == "COMPRAR" else round(((p["entry"] - current) / p["entry"]) * 100, 1)
                     _cb_register_result("loss")
                     send_acierto(
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2538,6 +2538,7 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
     fund               = get_fundamentals(ticker)
     # Sector real de fundamentales tiene prioridad sobre el pasado como parámetro
     sector_real = fund.get("sector") or sector or tech.get("sector", "Unknown")
+    tech["sector"] = sector_real  # persist sector real antes de guardar predicción
     sent               = get_sentiment(ticker, sector_real)
     inst_signal, boost = get_inst_signal(tech)
 
