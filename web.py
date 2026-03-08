@@ -794,7 +794,7 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
 .card-title{font-size:11px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:var(--t3);margin-bottom:16px}
 
 /* ── KPI GRID ── */
-.kpi-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:28px}
+.kpi-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:28px;position:relative;z-index:10}
 @media(max-width:1100px){.kpi-grid{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:700px){.kpi-grid{grid-template-columns:repeat(2,1fr)}}
 .kpi{
@@ -826,7 +826,7 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
   background:var(--s3);border:1px solid var(--b2);
   border-radius:10px;padding:12px 14px;
   font-size:12px;color:var(--t1);line-height:1.6;
-  white-space:nowrap;z-index:9999;
+  white-space:normal;z-index:9999;
   opacity:0;pointer-events:none;
   transition:opacity .15s,transform .15s;
   transform:translateX(-50%) translateY(-4px);
