@@ -1515,7 +1515,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
             <option value="USD">$</option>
             <option value="EUR">€</option>
           </select>
-          <input type="number" id="ps-capital" class="ps-capital" placeholder="10 000" min="100" step="500"
+          <input type="number" id="ps-capital" class="ps-capital" placeholder="10 000" min="1" step="1"
             oninput="recalcPositions()" onchange="recalcPositions()">
         </div>
         <div style="font-size:10px;color:var(--t3);margin-top:5px">Se guarda automáticamente</div>
