@@ -1690,6 +1690,8 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
                 data-entry="{{ p.entry|float }}"
                 data-stop="{{ p.stop|float }}"
                 data-target="{{ p.target|float if p.target else 0 }}"
+                data-target-pct="{{ p.target_pct|float if p.target_pct else 0 }}"
+                data-days="{{ p.days_remaining|int if p.days_remaining else 0 }}"
                 data-price="{{ p.current_price if p.current_price else p.entry|float }}"
                 data-confidence="{{ p.confidence|int }}"
                 data-stype="{{ p.get('signal_type','NORMAL') }}"
@@ -3081,8 +3083,7 @@ function recalcPositions() {
     const riskAmt   = shares * stopDist;
 
     if (shares < 1) {
-      const minCap = price > 0 ? Math.ceil(price / (adjAllocPct / 100)) : 0;
-      psCell.innerHTML = `<span class="ps-empty" style="font-size:10px">Mín. ${sym}${_fmtMoney(minCap)}<br>para 1 acción</span>`;
+      psCell.innerHTML = '<span class="ps-empty">—</span>';
       if (calcBtn) { calcBtn.style.display = 'block'; calcBtn.dataset.sym = sym; }
       return;
     }
@@ -3124,14 +3125,16 @@ function recalcPositions() {
 // Recalcular una fila cuando el usuario edita el importe manualmente
 // ── MODAL CALCULADORA DE POSICIÓN ────────────────────────────────────────
 function openSizerModal(btn) {
-  const sym     = (document.getElementById('ps-currency')?.value === 'EUR') ? '€' : '$';
-  const ticker  = btn.dataset.ticker;
-  const entry   = parseFloat(btn.dataset.entry)      || 0;
-  const stop    = parseFloat(btn.dataset.stop)        || 0;
-  const target  = parseFloat(btn.dataset.target)      || 0;
-  const price   = parseFloat(btn.dataset.price)       || entry;
-  const conf    = parseInt(btn.dataset.confidence)    || 80;
-  const capital = parseFloat(document.getElementById('ps-capital')?.value) || 0;
+  const sym       = (document.getElementById('ps-currency')?.value === 'EUR') ? '€' : '$';
+  const ticker    = btn.dataset.ticker;
+  const entry     = parseFloat(btn.dataset.entry)      || 0;
+  const stop      = parseFloat(btn.dataset.stop)        || 0;
+  const target    = parseFloat(btn.dataset.target)      || 0;
+  const targetPct = parseFloat(btn.dataset.targetPct)   || 0;
+  const days      = parseInt(btn.dataset.days)          || 0;
+  const price     = parseFloat(btn.dataset.price)       || entry;
+  const conf      = parseInt(btn.dataset.confidence)    || 80;
+  const capital   = parseFloat(document.getElementById('ps-capital')?.value) || 0;
   const stopDist = Math.abs(entry - stop);
   const upside   = target > 0 && entry > 0 ? ((target - entry) / entry * 100).toFixed(1) : null;
   const downside = stopDist > 0 && entry > 0 ? (stopDist / entry * 100).toFixed(1) : null;
@@ -3175,11 +3178,11 @@ function openSizerModal(btn) {
             value="${capital > 0 ? Math.round(capital * 0.1) : ''}"
             placeholder="Importe..."
             style="flex:1;background:transparent;border:none;color:var(--t1);font-size:16px;font-weight:700;padding:10px 12px;outline:none;font-family:inherit"
-            oninput="calcSizerModal(${entry},${stop},${price},${capital},'${sym}')">
+            oninput="calcSizerModal(${entry},${stop},${price},${capital},'${sym}',${target},${targetPct},${days})">
         </div>
         ${capital > 0 ? `
         <div style="display:flex;flex-direction:column;gap:4px">
-          ${[5,10,25,50].map(p => `<button onclick="setSizerAmt(${Math.round(capital*p/100)},${entry},${stop},${price},${capital},'${sym}')"
+          ${[5,10,25,50].map(p => `<button onclick="setSizerAmt(${Math.round(capital*p/100)},${entry},${stop},${price},${capital},'${sym}',${target},${targetPct},${days})"
             style="background:var(--s3);border:1px solid var(--b2);border-radius:6px;color:var(--t2);font-size:10px;font-weight:600;padding:3px 8px;cursor:pointer;white-space:nowrap">${p}%</button>`).join('')}
         </div>` : ''}
       </div>
@@ -3194,16 +3197,16 @@ function openSizerModal(btn) {
 
   modal.style.display = 'flex';
   // Auto-calcular si hay capital
-  if (capital > 0) calcSizerModal(entry, stop, price, capital, sym);
+  if (capital > 0) calcSizerModal(entry, stop, price, capital, sym, target, targetPct, days);
   setTimeout(() => document.getElementById('sm-amount')?.focus(), 50);
 }
 
-function setSizerAmt(val, entry, stop, price, capital, sym) {
+function setSizerAmt(val, entry, stop, price, capital, sym, target, targetPct, days) {
   const inp = document.getElementById('sm-amount');
-  if (inp) { inp.value = val; calcSizerModal(entry, stop, price, capital, sym); }
+  if (inp) { inp.value = val; calcSizerModal(entry, stop, price, capital, sym, target, targetPct, days); }
 }
 
-function calcSizerModal(entry, stop, price, capital, sym) {
+function calcSizerModal(entry, stop, price, capital, sym, target, targetPct, days) {
   const inp    = document.getElementById('sm-amount');
   const resEl  = document.getElementById('sm-result');
   if (!inp || !resEl) return;
@@ -3225,32 +3228,49 @@ function calcSizerModal(entry, stop, price, capital, sym) {
   const riskColor = riskPct && parseFloat(riskPct) > 5 ? 'var(--red)' : 'var(--yellow)';
 
   if (shares < 1) {
-    resEl.innerHTML = `<div style="text-align:center"><span style="color:var(--red);font-size:13px">⚠ Importe insuficiente para 1 acción</span><br><span style="color:var(--t3);font-size:11px;margin-top:4px;display:block">Precio actual: ${sym}${useP.toFixed(2)} · necesitas mínimo ${sym}${Math.ceil(useP)}</span></div>`;
+    resEl.innerHTML = `<div style="text-align:center"><span style="color:var(--red);font-size:13px">⚠ Necesitas mínimo ${sym}${Math.ceil(useP)} para 1 acción</span></div>`;
     return;
   }
 
+  // Ganancia potencial si se cumple la predicción
+  const tgt = target || 0;
+  const tPct = targetPct || (tgt > 0 && useP > 0 ? (tgt - useP) / useP * 100 : 0);
+  const profit = tgt > 0 ? (tgt - useP) * shares : (tPct > 0 ? (useP * tPct / 100) * shares : null);
+  const daysLeft = days || 0;
+
+  const profitBlock = profit !== null ? `
+    <div style="background:rgba(0,200,100,.1);border:1px solid rgba(0,200,100,.35);border-radius:10px;padding:16px 20px;margin-top:12px">
+      <div style="font-size:10px;font-weight:700;color:var(--green);letter-spacing:.5px;text-transform:uppercase;margin-bottom:10px">✨ Si se cumple la predicción</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+        <div>
+          <div style="font-size:26px;font-weight:800;color:var(--green)">+${sym}${_fmtMoney(profit)}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">ganancia estimada${tPct > 0 ? ' (+'+tPct.toFixed(1)+'% por acción)' : ''}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:16px;font-weight:700;color:var(--t1)">${sym}${_fmtMoney(realAmt + profit)}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">valor final de la posición</div>
+          ${daysLeft > 0 ? `<div style="font-size:11px;color:var(--yellow);margin-top:4px">📅 en ~${daysLeft} días</div>` : ''}
+        </div>
+      </div>
+    </div>` : '';
+
   resEl.innerHTML = `
     <div style="width:100%">
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
         <div style="text-align:center;background:var(--s3);border-radius:10px;padding:14px 10px">
-          <div style="font-size:28px;font-weight:800;color:var(--green)">${shares}</div>
-          <div style="font-size:11px;color:var(--t3);margin-top:2px">acciones</div>
+          <div style="font-size:30px;font-weight:800;color:var(--green)">${shares}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">acciones × ${sym}${useP.toFixed(2)}</div>
         </div>
         <div style="text-align:center;background:var(--s3);border-radius:10px;padding:14px 10px">
           <div style="font-size:24px;font-weight:800;color:var(--t1)">${sym}${_fmtMoney(realAmt)}</div>
           <div style="font-size:11px;color:var(--t3);margin-top:2px">${capPct ? capPct+'% del capital' : 'invertido'}</div>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        <div style="background:rgba(255,70,70,.08);border:1px solid rgba(255,70,70,.25);border-radius:8px;padding:10px 12px;text-align:center">
-          <div style="font-size:16px;font-weight:700;color:var(--red)">${sym}${riskAmt.toFixed(0)}</div>
-          <div style="font-size:10px;color:var(--t3);margin-top:2px">riesgo si salta stop${riskPct ? ' ('+riskPct+'%)' : ''}</div>
-        </div>
-        <div style="background:rgba(0,200,100,.08);border:1px solid rgba(0,200,100,.25);border-radius:8px;padding:10px 12px;text-align:center">
-          <div style="font-size:16px;font-weight:700;color:var(--green)">${sym}${useP.toFixed(2)}</div>
-          <div style="font-size:10px;color:var(--t3);margin-top:2px">precio por acción</div>
-        </div>
+      <div style="background:rgba(255,70,70,.08);border:1px solid rgba(255,70,70,.2);border-radius:8px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between">
+        <span style="font-size:11px;color:var(--t3)">Riesgo si salta el stop</span>
+        <span style="font-size:15px;font-weight:700;color:var(--red)">−${sym}${riskAmt.toFixed(0)}${riskPct ? ' <span style="font-size:11px;opacity:.7">('+riskPct+'%)</span>' : ''}</span>
       </div>
+      ${profitBlock}
     </div>`;
 }
 
