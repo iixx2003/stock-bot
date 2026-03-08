@@ -25,9 +25,19 @@ _PREV_CLOSE_TTL   = 86400
 
 # ─── Finnhub WebSocket (precios en tiempo real) ────────────────────────────────
 FINNHUB_KEY    = os.environ.get("FINNHUB_KEY", "GN255O5B9CERVXLC")
+_FH_MAX_SYMBOLS = 50   # límite plan gratuito Finnhub
 _fh_ws         = None   # instancia WebSocketApp activa
 _fh_subscribed = set()  # tickers suscritos actualmente
 _fh_lock       = threading.Lock()
+
+
+def _fh_trading_hours():
+    """True si es lunes-viernes entre las 09:00 y las 22:00 ES (premarket + mercado)."""
+    now = datetime.now(pytz.timezone("Europe/Madrid"))
+    if now.weekday() >= 5:
+        return False
+    t = now.hour * 60 + now.minute
+    return 540 <= t <= 1320   # 09:00–22:00
 
 
 def _fh_on_message(ws, message):
@@ -46,7 +56,6 @@ def _fh_on_message(ws, message):
             chg = round((price - prev_close) / prev_close * 100, 2) if prev_close else None
             with _price_lock:
                 old = _price_cache.get(ticker)
-                # Conservar chg anterior si aún no tenemos prev_close
                 if chg is None and old:
                     chg = old[1]
                 _price_cache[ticker] = (price, chg, now_ts)
@@ -64,13 +73,19 @@ def _fh_on_open(ws):
 
 
 def _fh_start():
-    """Hilo daemon: mantiene conexión WebSocket con Finnhub y reconecta si cae."""
+    """Hilo daemon: conecta solo en horario premarket/mercado (lun-vie 09-22h ES)."""
     global _fh_ws
     try:
         import websocket as _ws_lib
     except ImportError:
-        return  # websocket-client no instalado, funciona sin él (yfinance fallback)
+        return  # websocket-client no instalado — yfinance actúa de fallback
     while True:
+        # Fuera de horario: esperar sin conectar
+        if not _fh_trading_hours():
+            with _fh_lock:
+                _fh_ws = None
+            time.sleep(60)
+            continue
         try:
             ws = _ws_lib.WebSocketApp(
                 f"wss://ws.finnhub.io?token={FINNHUB_KEY}",
@@ -81,21 +96,36 @@ def _fh_start():
             )
             with _fh_lock:
                 _fh_ws = ws
+            # Hilo vigilante: cierra la conexión cuando termine el horario
+            def _watchdog(sock=ws):
+                while True:
+                    time.sleep(60)
+                    if not _fh_trading_hours():
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                        break
+            threading.Thread(target=_watchdog, daemon=True).start()
             ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception:
             pass
         with _fh_lock:
             _fh_ws = None
-        time.sleep(5)
+        # Reconectar rápido si sigue en horario; esperar si cerró por fin de sesión
+        time.sleep(5 if _fh_trading_hours() else 60)
 
 
 def _fh_sync_tickers(tickers):
-    """Suscribe tickers nuevos y desuscribe los que ya no hacen falta."""
-    new_set = set(tickers)
+    """Suscribe/desuscribe tickers respetando horario y límite del plan gratuito."""
+    if not _fh_trading_hours():
+        return
+    # Respetar límite de símbolos del plan gratuito
+    new_set = set(list(tickers)[:_FH_MAX_SYMBOLS])
     with _fh_lock:
-        ws     = _fh_ws
-        to_add = new_set - _fh_subscribed
-        to_rem = _fh_subscribed - new_set
+        ws        = _fh_ws
+        to_add    = new_set - _fh_subscribed
+        to_rem    = _fh_subscribed - new_set
         connected = ws and getattr(getattr(ws, "sock", None), "connected", False)
         if connected:
             for tk in to_add:
