@@ -535,21 +535,21 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
 /* ── TOOLTIP ── */
 .has-tooltip{position:relative}
 .has-tooltip .tooltip{
-  position:absolute;bottom:calc(100% + 10px);left:50%;transform:translateX(-50%);
+  position:absolute;top:calc(100% + 10px);left:50%;
   background:var(--s3);border:1px solid var(--b2);
   border-radius:10px;padding:12px 14px;
   font-size:12px;color:var(--t1);line-height:1.6;
   white-space:nowrap;z-index:500;
   opacity:0;pointer-events:none;
   transition:opacity .15s,transform .15s;
-  transform:translateX(-50%) translateY(4px);
+  transform:translateX(-50%) translateY(-4px);
   box-shadow:0 8px 24px rgba(0,0,0,.5);
   min-width:200px;
 }
 .has-tooltip:hover .tooltip{opacity:1;transform:translateX(-50%) translateY(0)}
 .tooltip::after{
-  content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);
-  border:6px solid transparent;border-top-color:var(--s3);
+  content:'';position:absolute;bottom:100%;left:50%;transform:translateX(-50%);
+  border:6px solid transparent;border-bottom-color:var(--s3);
 }
 .tt-row{display:flex;justify-content:space-between;gap:20px;padding:2px 0}
 .tt-range{color:var(--t2)}
@@ -571,7 +571,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 th{
   color:var(--t3);font-size:10px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
   padding:10px 14px;text-align:left;border-bottom:1px solid var(--b1);white-space:nowrap;
-  background:var(--s1);
+  background:var(--s1);overflow:visible;position:relative;
 }
 td{padding:11px 14px;border-bottom:1px solid rgba(26,36,64,.4);vertical-align:middle}
 tr:last-child td{border-bottom:none}
