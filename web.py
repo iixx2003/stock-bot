@@ -320,6 +320,7 @@ def build_payload():
     learnings = _rjson("learnings.json", {"rules": []})
     econ      = _rjson("econ_calendar.json", {})
     mctx      = _rjson("market_context.json", {})
+    ew        = _rjson("earnings_watch.json", {})
 
     pending = sorted(
         [p for p in preds if p.get("result") == "pending"],
@@ -527,6 +528,20 @@ def build_payload():
                     cal_data[dy]["pl"] = round(cal_data[dy]["pl"] + pl_v, 1)
             except Exception:
                 pass
+    # Earnings del universo agrupados por día (para el calendario)
+    _earnings_by_day = {}
+    for _tk, _info in ew.items():
+        try:
+            _ed = _dt_date.fromisoformat(_info["date"])
+            if _ed.year == _cal_y and _ed.month == _cal_m:
+                _t = _info.get("time", "")
+                _tag = "🌅" if "pre" in _t else "🌆" if "after" in _t else "🕐"
+                _earnings_by_day.setdefault(_ed.day, []).append((_tk, _tag))
+        except Exception:
+            pass
+    for _d in _earnings_by_day:
+        _earnings_by_day[_d].sort(key=lambda x: x[0])
+
     # Build calendar HTML (Python)
     _cal_html = '<div class="cal-grid">'
     for h in ["L", "M", "X", "J", "V", "S", "D"]:
@@ -536,6 +551,14 @@ def build_payload():
     for day in range(1, _days_in_month + 1):
         data = cal_data.get(day, {})
         today_cls = " today" if day == _today.day else ""
+        eday = _earnings_by_day.get(day, [])
+        # HTML de badges de earnings (máx 3 visibles + overflow)
+        earn_html = ""
+        if eday:
+            badges = "".join(f'<span class="cal-earn-badge" title="{tag}">{tk}</span>' for tk, tag in eday[:3])
+            if len(eday) > 3:
+                badges += f'<span class="cal-earn-more">+{len(eday)-3}</span>'
+            earn_html = f'<div class="cal-earn">{badges}</div>'
         if data:
             pl_v = data["pl"]
             clr = "#00e07a" if pl_v >= 0 else "#ff3b5c"
@@ -545,9 +568,10 @@ def build_payload():
             _cal_html += (f'<div class="cal-day has-data{today_cls}" style="border-color:{brd};background:{bg}">'
                           f'<span class="cal-num" style="color:{clr}">{day}</span>'
                           f'<span class="cal-pl" style="color:{clr}">{pl_str}</span>'
-                          f'<span class="cal-wl">{data["w"]}W·{data["l"]}L</span></div>')
+                          f'<span class="cal-wl">{data["w"]}W·{data["l"]}L</span>'
+                          f'{earn_html}</div>')
         else:
-            _cal_html += f'<div class="cal-day{today_cls}"><span class="cal-num">{day}</span></div>'
+            _cal_html += f'<div class="cal-day{today_cls}"><span class="cal-num">{day}</span>{earn_html}</div>'
     _cal_html += '</div>'
     cal_month_name = f"{_mname[_cal_m]} {_cal_y}"
 
@@ -727,6 +751,10 @@ def build_payload():
         "tm_trades":        tm_trades,
         "tm_max_days":      tm_max_days,
         "earnings_upcoming": earnings_upcoming,
+        "earnings_watch_all": sorted(
+            [{"ticker": tk, **info} for tk, info in ew.items()],
+            key=lambda x: (x["date"], x["ticker"])
+        ),
         "monthly_perf":     monthly_perf,
         "pl_per_trade":     pl_per_trade,
         "n_bot_trades":     n_trades,
@@ -1228,6 +1256,9 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 .cal-day.today .cal-num{color:var(--blue)}
 .cal-pl{font-size:11px;font-weight:700;line-height:1.2}
 .cal-wl{font-size:9px;color:var(--t3)}
+.cal-earn{display:flex;flex-wrap:wrap;gap:2px;margin-top:2px}
+.cal-earn-badge{font-size:8px;font-weight:700;background:rgba(155,109,255,.18);color:#b47fff;border-radius:3px;padding:1px 3px;line-height:1.4;cursor:default}
+.cal-earn-more{font-size:8px;color:var(--t3);padding:1px 2px}
 
 /* ── TIME MACHINE ── */
 .tm-wrap{padding:10px 0 4px}
@@ -1622,16 +1653,35 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
     <span id="signals-count" style="font-size:12px;color:var(--t3);white-space:nowrap;min-width:64px">{{ pending_ct }} señales</span>
   </div>
 
-  <!-- Earnings próximos -->
+  <!-- Earnings próximos — señales activas -->
   {% if earnings_upcoming %}
   <div class="card" style="margin-bottom:14px;padding:14px 16px">
-    <div class="card-title" style="margin-bottom:10px">📅 Próximos earnings en señales activas</div>
+    <div class="card-title" style="margin-bottom:10px">⚠️ Earnings en señales activas</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       {% for e in earnings_upcoming %}
       <div style="display:flex;align-items:center;gap:8px;background:var(--s2);border:1px solid {% if e.during %}rgba(155,109,255,.35){% else %}var(--b1){% endif %};border-radius:8px;padding:7px 12px">
         <span class="tk-link" onclick="openTickerModal('{{ e.ticker }}')" style="font-weight:700;font-size:13px">{{ e.ticker }}</span>
         <span style="font-size:11px;color:var(--t3)">{{ e.date }}</span>
         {% if e.during %}<span class="b-earn-sm">⚠️ en ventana</span>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Earnings próximos — universo completo -->
+  {% if earnings_watch_all %}
+  <div class="card" style="margin-bottom:14px;padding:14px 16px">
+    <div class="card-title" style="margin-bottom:10px">📅 Earnings próximos — universo ({{ earnings_watch_all|length }} acciones)</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      {% for e in earnings_watch_all %}
+      {% set t = e.time|default('') %}
+      {% set tag = '🌅' if 'pre' in t else ('🌆' if 'after' in t else '🕐') %}
+      <div style="display:flex;align-items:center;gap:6px;background:var(--s2);border:1px solid var(--b1);border-radius:7px;padding:5px 10px" title="{{ e.name|default(e.ticker) }} — {{ e.date }}">
+        <span style="font-size:10px">{{ tag }}</span>
+        <span class="tk-link" onclick="openTickerModal('{{ e.ticker }}')" style="font-weight:700;font-size:12px">{{ e.ticker }}</span>
+        <span style="font-size:10px;color:var(--t3)">{{ e.date[5:] }}</span>
+        <span style="font-size:10px;color:var(--t3)">{{ e.days_ahead }}d</span>
       </div>
       {% endfor %}
     </div>
