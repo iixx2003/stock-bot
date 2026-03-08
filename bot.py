@@ -103,6 +103,7 @@ LEARNINGS_FILE        = "/app/data/learnings.json"
 REGIME_FILE           = "/app/data/regime.json"
 CATALYST_MEMORY_FILE  = "/app/data/catalyst_memory.json"
 ECON_CALENDAR_FILE    = "/app/data/econ_calendar.json"
+MARKET_CONTEXT_FILE   = "/app/data/market_context.json"  # web dashboard
 
 # ═══════════════════════════════════════════════════════════════════════
 # UNIVERSO — igual que v5, incluido aquí por completitud
@@ -940,6 +941,14 @@ def update_market_context():
     fg_str = _fg_label(fg)
     print(f"  Fear&Greed: {fg} ({fg_str}) | S&P500: {sp500_change:+.2f}% | VIX: {vix}")
     send_log(f"📊 Macro — Fear&Greed: {fg} ({fg_str}) | S&P500: {sp500_change:+.2f}% | VIX: {vix}")
+
+    # Persistir market_context para el dashboard web
+    try:
+        import json as _json
+        with open(MARKET_CONTEXT_FILE, "w") as _f:
+            _json.dump(market_context, _f)
+    except Exception:
+        pass
 
     detect_market_regime()
     detect_geopolitical_context()
@@ -3239,6 +3248,14 @@ def main():
     schedule.every().sunday.at("10:00").do(weekly_report)
     schedule.every().monday.at("09:00").do(weekly_summary)
     schedule.every().thursday.at("09:00").do(weekly_summary)
+
+    # Dashboard web — hilo daemon (no afecta al bot si falla)
+    try:
+        import threading, web as _web
+        threading.Thread(target=_web.start_web, daemon=True).start()
+        print("  Dashboard web iniciado en puerto", os.environ.get("PORT", 8080))
+    except Exception as _we:
+        print(f"  Dashboard web no disponible: {_we}")
 
     last_cmd_check    = 0.0
     last_status_check = 0.0
