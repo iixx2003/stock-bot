@@ -3,6 +3,7 @@
 from flask import Flask, render_template_string, session, redirect, url_for, request, jsonify
 import json, os, time, threading, math
 from datetime import datetime, timedelta, date as _dt_date
+from calendar import monthrange as _mrange, month_name as _mname
 import pytz
 
 try:
@@ -324,6 +325,142 @@ def build_payload():
 
     rules = learnings.get("rules", [])
 
+    # ── Patrones por día de semana ──────────────────────────────────────
+    _DOW_NAMES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+    by_dow = {i: {"w": 0, "l": 0, "name": _DOW_NAMES[i]} for i in range(7)}
+    by_conf_range = {
+        "85-87%": {"w": 0, "l": 0, "label": "Normal (85–87%)"},
+        "88-93%": {"w": 0, "l": 0, "label": "Fuerte (88–93%)"},
+        "94%+":   {"w": 0, "l": 0, "label": "Excepcional (94%+)"},
+    }
+    all_by_date = sorted(
+        [p for p in preds if p.get("result") in ("win", "loss")],
+        key=lambda x: x.get("date", "")
+    )
+    for p in all_by_date:
+        if p.get("date"):
+            try:
+                dow = datetime.fromisoformat(p["date"][:10]).weekday()
+                by_dow[dow]["w" if p["result"] == "win" else "l"] += 1
+            except Exception:
+                pass
+        conf = p.get("confidence", 0) or 0
+        key = "94%+" if conf >= 94 else "88-93%" if conf >= 88 else "85-87%"
+        by_conf_range[key]["w" if p["result"] == "win" else "l"] += 1
+
+    # Streaks
+    streak_max_win = streak_max_loss = 0
+    cur_streak = 0
+    cur_type = None
+    for p in all_by_date:
+        r = p["result"]
+        cur_streak = cur_streak + 1 if r == cur_type else 1
+        cur_type = r
+        if r == "win":  streak_max_win  = max(streak_max_win,  cur_streak)
+        else:           streak_max_loss = max(streak_max_loss, cur_streak)
+    cur_streak_type, cur_streak_ct = None, 0
+    for p in reversed(all_by_date):
+        r = p["result"]
+        if cur_streak_type is None:
+            cur_streak_type, cur_streak_ct = r, 1
+        elif r == cur_streak_type:
+            cur_streak_ct += 1
+        else:
+            break
+
+    # ── Calendario mensual ──────────────────────────────────────────────
+    _today    = _dt_date.today()
+    _cal_y, _cal_m = _today.year, _today.month
+    _, _days_in_month = _mrange(_cal_y, _cal_m)
+    _first_dow = _dt_date(_cal_y, _cal_m, 1).weekday()
+    cal_data = {}
+    for p in preds:
+        if p.get("result") in ("win", "loss") and p.get("date"):
+            try:
+                d = datetime.fromisoformat(p["date"][:10]).date()
+                if d.year == _cal_y and d.month == _cal_m:
+                    ep = p.get("entry", 0) or 0
+                    xp = p.get("exit_price", 0) or 0
+                    pl_v = 0.0
+                    if ep and xp:
+                        raw = (xp - ep) / ep * 100
+                        pl_v = raw if p.get("signal") == "COMPRAR" else -raw
+                    dy = d.day
+                    if dy not in cal_data:
+                        cal_data[dy] = {"w": 0, "l": 0, "pl": 0.0}
+                    cal_data[dy]["w" if p["result"] == "win" else "l"] += 1
+                    cal_data[dy]["pl"] = round(cal_data[dy]["pl"] + pl_v, 1)
+            except Exception:
+                pass
+    # Build calendar HTML (Python)
+    _cal_html = '<div class="cal-grid">'
+    for h in ["L", "M", "X", "J", "V", "S", "D"]:
+        _cal_html += f'<div class="cal-hdr">{h}</div>'
+    for _ in range(_first_dow):
+        _cal_html += '<div class="cal-day"></div>'
+    for day in range(1, _days_in_month + 1):
+        data = cal_data.get(day, {})
+        today_cls = " today" if day == _today.day else ""
+        if data:
+            pl_v = data["pl"]
+            clr = "#00e07a" if pl_v >= 0 else "#ff3b5c"
+            bg  = "rgba(0,224,122,.09)" if pl_v >= 0 else "rgba(255,59,92,.09)"
+            brd = "rgba(0,224,122,.3)"  if pl_v >= 0 else "rgba(255,59,92,.3)"
+            pl_str = f"{'+' if pl_v >= 0 else ''}{round(pl_v,1)}%"
+            _cal_html += (f'<div class="cal-day has-data{today_cls}" style="border-color:{brd};background:{bg}">'
+                          f'<span class="cal-num" style="color:{clr}">{day}</span>'
+                          f'<span class="cal-pl" style="color:{clr}">{pl_str}</span>'
+                          f'<span class="cal-wl">{data["w"]}W·{data["l"]}L</span></div>')
+        else:
+            _cal_html += f'<div class="cal-day{today_cls}"><span class="cal-num">{day}</span></div>'
+    _cal_html += '</div>'
+    cal_month_name = f"{_mname[_cal_m]} {_cal_y}"
+
+    # ── Ticker stats (modal) ────────────────────────────────────────────
+    ticker_stats = {}
+    for p in preds:
+        t = p.get("ticker", "")
+        if not t:
+            continue
+        if t not in ticker_stats:
+            ticker_stats[t] = []
+        ep = p.get("entry", 0) or 0
+        xp = p.get("exit_price", 0) or 0
+        pl_v = None
+        if ep and xp and p.get("result") in ("win", "loss"):
+            raw = (xp - ep) / ep * 100
+            pl_v = round(raw if p.get("signal") == "COMPRAR" else -raw, 1)
+        ticker_stats[t].append({
+            "date":   (p.get("date") or "")[:10],
+            "signal": p.get("signal", ""),
+            "result": p.get("result", "pending"),
+            "entry":  round(ep, 2),
+            "exit":   round(xp, 2) if xp else None,
+            "pl":     pl_v,
+            "conf":   int(p.get("confidence", 0) or 0),
+            "why":    _infer_exit_reason(p) if p.get("result") in ("win", "loss") else "active",
+        })
+
+    # ── Time Machine data ───────────────────────────────────────────────
+    tm_trades = []
+    for p in preds:
+        if p.get("result") in ("win", "loss") and p.get("date"):
+            ep = p.get("entry", 0) or 0
+            xp = p.get("exit_price", 0) or 0
+            pl_v = None
+            if ep and xp:
+                raw = (xp - ep) / ep * 100
+                pl_v = round(raw if p.get("signal") == "COMPRAR" else -raw, 1)
+            tm_trades.append({"date": p.get("date", "")[:10], "result": p.get("result", ""), "pl": pl_v, "ticker": p.get("ticker", "")})
+    tm_trades.sort(key=lambda x: x["date"])
+    tm_max_days = 0
+    if tm_trades:
+        try:
+            oldest = datetime.fromisoformat(tm_trades[0]["date"]).date()
+            tm_max_days = (_today - oldest).days
+        except Exception:
+            pass
+
     # ── Gauge circular F&G ─────────────────────────────────────────────
     fg_angle_rad  = math.radians(180 - fg / 100 * 180)
     fg_dot_x      = round(60 + 45 * math.cos(fg_angle_rad), 1)
@@ -395,6 +532,17 @@ def build_payload():
         "bot_labels":       bot_labels,
         "bot_data":         bot_data,
         "spy_data":         spy_data,
+        "by_dow":           by_dow,
+        "by_conf_range":    by_conf_range,
+        "streak_max_win":   streak_max_win,
+        "streak_max_loss":  streak_max_loss,
+        "cur_streak_type":  cur_streak_type,
+        "cur_streak_ct":    cur_streak_ct,
+        "cal_html":         _cal_html,
+        "cal_month_name":   cal_month_name,
+        "ticker_stats":     ticker_stats,
+        "tm_trades":        tm_trades,
+        "tm_max_days":      tm_max_days,
     }
 
 
@@ -830,6 +978,46 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
   padding:20px;border-top:1px solid var(--b1);margin-top:8px;
 }
 
+/* ── MODAL TICKER ── */
+.modal-overlay{position:fixed;inset:0;z-index:9000;background:rgba(0,0,0,.72);backdrop-filter:blur(5px);display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity .2s}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal-box{background:var(--s1);border:1px solid var(--b2);border-radius:16px;width:min(680px,94vw);max-height:82vh;overflow-y:auto;padding:24px;position:relative;transform:translateY(14px);transition:transform .22s;box-shadow:0 24px 64px rgba(0,0,0,.7)}
+.modal-overlay.open .modal-box{transform:translateY(0)}
+.modal-close{position:absolute;top:16px;right:16px;background:rgba(255,255,255,.05);border:1px solid var(--b1);border-radius:8px;color:var(--t2);font-size:15px;width:32px;height:32px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s;line-height:1}
+.modal-close:hover{background:var(--rd);color:var(--red);border-color:rgba(255,59,92,.3)}
+
+/* ── CALENDARIO P/L ── */
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}
+.cal-hdr{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--t3);text-align:center;padding:4px 0;letter-spacing:.5px}
+.cal-day{min-height:54px;border-radius:8px;border:1px solid transparent;padding:5px 6px;display:flex;flex-direction:column;gap:2px;background:rgba(255,255,255,.02)}
+.cal-day.today{border-color:var(--blue)!important;background:rgba(61,142,248,.06)!important}
+.cal-day.has-data{border-width:1px}
+.cal-num{font-size:11px;font-weight:600;color:var(--t3)}
+.cal-day.today .cal-num{color:var(--blue)}
+.cal-pl{font-size:11px;font-weight:700;line-height:1.2}
+.cal-wl{font-size:9px;color:var(--t3)}
+
+/* ── TIME MACHINE ── */
+.tm-wrap{padding:10px 0 4px}
+.tm-slider{-webkit-appearance:none;appearance:none;width:100%;height:5px;border-radius:3px;background:var(--b1);outline:none;cursor:pointer;transition:background .2s}
+.tm-slider::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:var(--green);border:2px solid var(--bg);box-shadow:0 0 10px rgba(0,224,122,.45);cursor:pointer;transition:box-shadow .2s}
+.tm-slider::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:var(--green);border:2px solid var(--bg);cursor:pointer}
+.tm-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
+.tm-stat{background:var(--s2);border:1px solid var(--b1);border-radius:10px;padding:12px;text-align:center}
+.tm-val{font-size:22px;font-weight:800;letter-spacing:-.5px}
+.tm-lbl{font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--t3);margin-top:3px}
+
+/* ── HEATMAP DOW ── */
+.dow-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+.dow-cell{border-radius:10px;padding:14px 6px;text-align:center;border:1px solid var(--b1)}
+.dow-name{font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--t3);margin-bottom:6px}
+.dow-pct{font-size:20px;font-weight:800;line-height:1}
+.dow-ops{font-size:10px;color:var(--t3);margin-top:4px}
+
+/* ── TK LINK ── */
+.tk-link{cursor:pointer;transition:color .15s;border-bottom:1px dashed transparent}
+.tk-link:hover{color:var(--green)!important;border-bottom-color:var(--green)}
+
 /* ── SUMMARY STATS ROW ── */
 .sum-row{
   display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px;
@@ -1099,7 +1287,7 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
             {% for p in pending[:5] %}
             {% set st = p.get('signal_type','NORMAL') %}
             <tr>
-              <td><span class="tk">{{ p.ticker }}</span></td>
+              <td><span class="tk tk-link" onclick="openTickerModal('{{ p.ticker }}')">{{ p.ticker }}</span></td>
               <td>
                 {% if p.signal == 'COMPRAR' %}
                   <span class="badge b-buy">📈 Comprar</span>
@@ -1203,7 +1391,7 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
           {% set has_cur = p.current_price is not none %}
           <tr>
             <td>
-              <span class="tk">{{ p.ticker }}</span>
+              <span class="tk tk-link" onclick="openTickerModal('{{ p.ticker }}')">{{ p.ticker }}</span>
               {% if p.session %}<br><span style="font-size:9px;color:var(--t3)">{{ p.session }}</span>{% endif %}
             </td>
             <td>
@@ -1355,7 +1543,7 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
           {% set st = p.get('signal_type','NORMAL') %}
           <tr class="hist-row" onclick="toggleHist(this)">
             <td style="width:20px;padding-right:6px"><span class="exp-icon">▶</span></td>
-            <td><span class="tk">{{ p.ticker }}</span></td>
+            <td><span class="tk tk-link" onclick="openTickerModal('{{ p.ticker }}')">{{ p.ticker }}</span></td>
             <td>
               {% if p.signal == 'COMPRAR' %}<span class="badge b-buy">📈 Comprar</span>
               {% else %}<span class="badge b-sell">📉 Vender</span>{% endif %}
@@ -1450,6 +1638,27 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 
 <!-- ════════════════════════════════════════════════════ TAB: ANÁLISIS -->
 <div class="tab-panel" id="tab-analysis">
+
+  <!-- ── TIME MACHINE ── -->
+  <div class="card" style="margin-bottom:24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+      <span style="font-size:22px">⏪</span>
+      <div>
+        <div style="font-size:13px;font-weight:700;color:var(--t1)">Time Machine</div>
+        <div style="font-size:11px;color:var(--t3)">Arrastra para ver el rendimiento del bot en cualquier fecha pasada</div>
+      </div>
+      <span id="tm-date-lbl" style="margin-left:auto;font-size:12px;font-weight:600;color:var(--green);background:var(--g2);border:1px solid rgba(0,224,122,.2);border-radius:6px;padding:4px 12px;white-space:nowrap">Hoy</span>
+    </div>
+    <div class="tm-wrap">
+      <input type="range" class="tm-slider" id="tm-slider" min="0" max="{{ tm_max_days }}" value="0" oninput="updateTimeMachine(this.value)">
+    </div>
+    <div class="tm-stats">
+      <div class="tm-stat"><div class="tm-val col-blue" id="tm-total">{{ wins + losses }}</div><div class="tm-lbl">Operaciones</div></div>
+      <div class="tm-stat"><div class="tm-val col-green" id="tm-wins">{{ wins }}</div><div class="tm-lbl">Wins</div></div>
+      <div class="tm-stat"><div class="tm-val col-red" id="tm-losses">{{ losses }}</div><div class="tm-lbl">Losses</div></div>
+      <div class="tm-stat"><div class="tm-val col-blue" id="tm-acc">{{ accuracy }}%</div><div class="tm-lbl">Precisión</div></div>
+    </div>
+  </div>
 
   <!-- ── KPIs de rendimiento ── -->
   <div class="sum-row" style="margin-bottom:24px">
@@ -1589,6 +1798,71 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
   </div>
   {% endif %}
 
+  <!-- ── Detección de patrones ── -->
+  <div class="sh">🔍 Detección de patrones automática</div>
+  <div class="g2" style="margin-bottom:24px">
+
+    <!-- Heatmap día de semana -->
+    <div class="card">
+      <div class="card-title">📅 Rendimiento por día de semana</div>
+      <div class="dow-grid">
+        {% for i in range(7) %}
+        {% set dow = by_dow[i] %}
+        {% set tot_d = dow.w + dow.l %}
+        {% set pct_d = (dow.w / tot_d * 100)|int if tot_d > 0 else 0 %}
+        <div class="dow-cell" style="background:{% if tot_d==0 %}rgba(255,255,255,.02){% elif pct_d>=65 %}rgba(0,224,122,.1){% elif pct_d>=50 %}rgba(61,142,248,.08){% elif pct_d>=40 %}rgba(245,166,35,.08){% else %}rgba(255,59,92,.08){% endif %};border-color:{% if tot_d==0 %}var(--b1){% elif pct_d>=65 %}rgba(0,224,122,.25){% elif pct_d>=50 %}rgba(61,142,248,.2){% elif pct_d>=40 %}rgba(245,166,35,.2){% else %}rgba(255,59,92,.25){% endif %}">
+          <div class="dow-name">{{ dow.name }}</div>
+          <div class="dow-pct" style="color:{% if tot_d==0 %}var(--t3){% elif pct_d>=65 %}var(--green){% elif pct_d>=50 %}var(--blue){% elif pct_d>=40 %}var(--yellow){% else %}var(--red){% endif %}">{% if tot_d>0 %}{{ pct_d }}%{% else %}—{% endif %}</div>
+          <div class="dow-ops">{% if tot_d>0 %}{{ dow.w }}W/{{ dow.l }}L{% else %}sin datos{% endif %}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <!-- Confianza + Rachas -->
+    <div class="card">
+      <div class="card-title">🎯 Precisión por nivel de confianza</div>
+      {% for key, data in by_conf_range.items() %}
+      {% set tot_c = data.w + data.l %}
+      {% set pct_c = (data.w / tot_c * 100)|int if tot_c > 0 else 0 %}
+      <div style="margin-bottom:18px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:7px">
+          <span style="font-size:13px;font-weight:600;color:var(--t1)">{{ data.label }}</span>
+          <span style="font-size:18px;font-weight:800;color:{% if pct_c>=65 %}var(--green){% elif pct_c<45 and tot_c>0 %}var(--red){% else %}var(--yellow){% endif %}">{% if tot_c>0 %}{{ pct_c }}%{% else %}—{% endif %}</span>
+        </div>
+        {% if tot_c>0 %}
+        <div style="height:7px;border-radius:4px;background:var(--b1);overflow:hidden;display:flex">
+          <div style="width:{{ (data.w/tot_c*100)|int }}%;background:var(--green)"></div>
+          <div style="width:{{ (data.l/tot_c*100)|int }}%;background:var(--red)"></div>
+        </div>
+        <div style="font-size:11px;color:var(--t3);margin-top:4px">{{ data.w }}W / {{ data.l }}L · {{ tot_c }} ops</div>
+        {% else %}<div style="font-size:11px;color:var(--t3)">Sin datos aún</div>{% endif %}
+      </div>
+      {% endfor %}
+      <div style="border-top:1px solid var(--b1);padding-top:14px;margin-top:4px">
+        <div class="card-title" style="margin-bottom:10px">🔥 Rachas</div>
+        <div class="sr">
+          <span class="sr-label">Racha actual</span>
+          <span class="sr-val" style="color:{% if cur_streak_type=='win' %}var(--green){% elif cur_streak_type=='loss' %}var(--red){% else %}var(--t3){% endif %}">
+            {% if cur_streak_type %}{{ cur_streak_ct }} {{ '✓' if cur_streak_type=='win' else '✗' }} consecutivas{% else %}—{% endif %}
+          </span>
+        </div>
+        <div class="sr"><span class="sr-label">Mejor racha wins</span><span class="sr-val col-green">{{ streak_max_win }} ✓</span></div>
+        <div class="sr"><span class="sr-label">Peor racha losses</span><span class="sr-val col-red">{{ streak_max_loss }} ✗</span></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Calendario P/L mensual ── -->
+  <div class="sh">📅 Calendario P/L — {{ cal_month_name }}</div>
+  <div class="card" style="margin-bottom:24px">
+    {{ cal_html|safe }}
+    {% if not cal_data %}
+    <div class="empty" style="padding:32px"><span class="ei">📅</span><p>Sin operaciones resueltas este mes</p></div>
+    {% endif %}
+  </div>
+
   <!-- ── Gráfica donut + historial resumido ── -->
   <div class="g2">
     <div class="card">
@@ -1614,7 +1888,7 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
       {% if recent %}
       {% for p in recent[:5] %}
       <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(26,36,64,.4)">
-        <span style="font-weight:700;font-size:14px;min-width:52px">{{ p.ticker }}</span>
+        <span class="tk-link" style="font-weight:700;font-size:14px;min-width:52px" onclick="openTickerModal('{{ p.ticker }}')">{{ p.ticker }}</span>
         {% if p.result == 'win' %}<span class="badge b-win">✓ WIN</span>{% else %}<span class="badge b-loss">✗ LOSS</span>{% endif %}
         <div style="flex:1">
           <div style="font-size:11px;color:var(--t3)">${{ "%.2f"|format(p.entry|float) }} → {% if p.exit_price %}${{ "%.2f"|format(p.exit_price|float) }}{% else %}—{% endif %}</div>
@@ -1800,6 +2074,14 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 </div>
 
 </div><!-- /page -->
+
+<!-- ════ MODAL TICKER ════ -->
+<div class="modal-overlay" id="ticker-modal" onclick="if(event.target===this)closeTickerModal()">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeTickerModal()">✕</button>
+    <div id="modal-content"></div>
+  </div>
+</div>
 
 <script>
 // ── Tab navigation ──────────────────────────────────────────────────
@@ -2037,6 +2319,103 @@ setTimeout(() => {
   }
 }, 1800);
 {% endif %}
+
+// ── Time Machine ─────────────────────────────────────────────────────
+const TM_TRADES = {{ tm_trades|tojson }};
+function updateTimeMachine(daysBack) {
+  daysBack = parseInt(daysBack);
+  const lbl = document.getElementById('tm-date-lbl');
+  if (daysBack === 0) {
+    if (lbl) lbl.textContent = 'Hoy';
+    const wins = TM_TRADES.filter(t => t.result === 'win').length;
+    const losses = TM_TRADES.filter(t => t.result === 'loss').length;
+    _applyTM(wins, losses);
+    return;
+  }
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - daysBack);
+  const cutStr = cutoff.toISOString().split('T')[0];
+  if (lbl) lbl.textContent = cutStr;
+  const filtered = TM_TRADES.filter(t => t.date <= cutStr);
+  const wins = filtered.filter(t => t.result === 'win').length;
+  const losses = filtered.filter(t => t.result === 'loss').length;
+  _applyTM(wins, losses);
+}
+function _applyTM(wins, losses) {
+  const total = wins + losses;
+  const acc = total > 0 ? (Math.round(wins / total * 1000) / 10) : 0;
+  const _s = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+  _s('tm-total', total);
+  _s('tm-wins', wins);
+  _s('tm-losses', losses);
+  _s('tm-acc', acc + '%');
+}
+
+// ── Ticker Modal ─────────────────────────────────────────────────────
+const TICKER_STATS = {{ ticker_stats|tojson }};
+function openTickerModal(ticker) {
+  const trades = (TICKER_STATS[ticker] || []).slice().reverse();
+  const resolved = trades.filter(t => t.result === 'win' || t.result === 'loss');
+  const wins = resolved.filter(t => t.result === 'win').length;
+  const losses = resolved.filter(t => t.result === 'loss').length;
+  const total = wins + losses;
+  const acc = total > 0 ? Math.round(wins / total * 100) : 0;
+  const accClr = acc >= 60 ? 'var(--green)' : acc >= 45 ? 'var(--yellow)' : 'var(--red)';
+
+  let html = `<div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:20px;flex-wrap:wrap">
+    <div style="font-size:32px;font-weight:800;letter-spacing:-.5px;color:var(--t1)">${ticker}</div>
+    <div style="flex:1;min-width:160px">
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:6px">
+        <span style="font-size:13px;color:var(--green);font-weight:600">✓ ${wins} wins</span>
+        <span style="font-size:13px;color:var(--red);font-weight:600">✗ ${losses} losses</span>
+        <span style="font-size:13px;font-weight:700;color:${accClr}">${total > 0 ? acc + '% precisión' : 'Sin historial'}</span>
+      </div>
+      <div style="height:5px;border-radius:3px;background:var(--b1);overflow:hidden;display:flex;max-width:200px">
+        ${total > 0 ? `<div style="width:${Math.round(wins/total*100)}%;background:var(--green)"></div><div style="width:${Math.round(losses/total*100)}%;background:var(--red)"></div>` : ''}
+      </div>
+    </div>
+  </div>`;
+
+  if (trades.length === 0) {
+    html += `<div class="empty"><span class="ei">📋</span><p>Sin historial para ${ticker}</p></div>`;
+  } else {
+    html += `<div class="tw"><table>
+      <thead><tr><th>Fecha</th><th>Señal</th><th>Entrada</th><th>Salida</th><th>P/L</th><th>Conf.</th><th>Resultado</th></tr></thead>
+      <tbody>`;
+    for (const t of trades) {
+      const plStr   = t.pl !== null && t.pl !== undefined ? `${t.pl >= 0 ? '+' : ''}${t.pl}%` : '—';
+      const plColor = t.pl === null || t.pl === undefined ? 'var(--t3)' : t.pl >= 0 ? 'var(--green)' : 'var(--red)';
+      const resBadge = t.result === 'pending'
+        ? '<span class="badge b-sq" style="font-size:10px">Activa</span>'
+        : t.result === 'win'
+          ? '<span class="badge b-win" style="font-size:10px">✓ WIN</span>'
+          : '<span class="badge b-loss" style="font-size:10px">✗ LOSS</span>';
+      const sigBadge = t.signal === 'COMPRAR'
+        ? '<span class="badge b-buy" style="font-size:10px">📈 Buy</span>'
+        : '<span class="badge b-sell" style="font-size:10px">📉 Sell</span>';
+      const exitStr = t.exit ? `$${parseFloat(t.exit).toFixed(2)}` : '—';
+      html += `<tr>
+        <td style="font-size:11px;color:var(--t3)">${t.date}</td>
+        <td>${sigBadge}</td>
+        <td class="mono">$${parseFloat(t.entry).toFixed(2)}</td>
+        <td class="mono">${exitStr}</td>
+        <td style="font-weight:700;color:${plColor}">${plStr}</td>
+        <td style="font-size:12px;color:var(--t2)">${t.conf}%</td>
+        <td>${resBadge}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+
+  document.getElementById('modal-content').innerHTML = html;
+  document.getElementById('ticker-modal').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+function closeTickerModal() {
+  document.getElementById('ticker-modal').classList.remove('open');
+  document.body.style.overflow = '';
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTickerModal(); });
 
 // ── Historial expandible ─────────────────────────────────────────────
 function toggleHist(rowEl) {
