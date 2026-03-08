@@ -1,7 +1,7 @@
 """StockBot Pro — Panel de control web v2 (multi-página, premium design)"""
 
 from flask import Flask, render_template_string, session, redirect, url_for, request, jsonify
-import json, os, time, threading
+import json, os, time, threading, math
 from datetime import datetime, timedelta, date as _dt_date
 import pytz
 
@@ -20,6 +20,11 @@ _PRICE_TTL   = 180   # 3 min
 _earnings_cache = {}
 _earnings_lock  = threading.Lock()
 _EARNINGS_TTL   = 3600  # 1 h
+
+# Caché de sparklines: ticker → ([puntos normalizados], timestamp)
+_sparkline_cache = {}
+_sparkline_lock  = threading.Lock()
+_SPARKLINE_TTL   = 600  # 10 min
 
 app = Flask(__name__)
 app.secret_key = "stk_web_2026_xK9mP_secreto"
@@ -108,6 +113,46 @@ def _fetch_earnings_date(ticker):
     return result
 
 
+def _fetch_sparkline(ticker):
+    """Devuelve lista de puntos normalizados 0-100 para sparkline. Caché 10 min."""
+    now_ts = time.time()
+    with _sparkline_lock:
+        cached = _sparkline_cache.get(ticker)
+        if cached and now_ts - cached[1] < _SPARKLINE_TTL:
+            return cached[0]
+    result = []
+    if _HAS_YF:
+        try:
+            hist = yf.Ticker(ticker).history(period='5d', interval='1d')
+            if not hist.empty and len(hist) >= 2:
+                closes = hist['Close'].tolist()
+                mn, mx = min(closes), max(closes)
+                rng = mx - mn or 1
+                result = [round((p - mn) / rng * 100) for p in closes]
+        except Exception:
+            pass
+    with _sparkline_lock:
+        _sparkline_cache[ticker] = (result, now_ts)
+    return result
+
+
+def _sparkline_svg(points):
+    """Genera SVG inline de sparkline a partir de puntos normalizados."""
+    if not points or len(points) < 2:
+        return ''
+    w, h = 72, 24
+    n = len(points)
+    xs = [round(i / (n - 1) * w, 1) for i in range(n)]
+    ys = [round(h - points[i] / 100 * (h - 4) - 2, 1) for i in range(n)]
+    path = f'M {xs[0]} {ys[0]} ' + ' '.join(f'L {xs[i]} {ys[i]}' for i in range(1, n))
+    color = '#00e07a' if points[-1] >= points[0] else '#ff3b5c'
+    return (f'<svg viewBox="0 0 {w} {h}" style="width:{w}px;height:{h}px;display:block">'
+            f'<path d="{path}" stroke="{color}" stroke-width="1.5" fill="none" '
+            f'stroke-linecap="round" stroke-linejoin="round"/>'
+            f'<circle cx="{xs[-1]}" cy="{ys[-1]}" r="2.5" fill="{color}"/>'
+            f'</svg>')
+
+
 def _days_elapsed(date_str):
     if not date_str:
         return 0
@@ -172,6 +217,10 @@ def build_payload():
                 p["earnings_during"] = today <= edate <= end_of_signal
             except Exception:
                 pass
+
+        # Sparkline (5 días)
+        spark_pts = _fetch_sparkline(p.get("ticker", ""))
+        p["sparkline_svg"] = _sparkline_svg(spark_pts)
 
         # Precio actual + % cambio desde entrada
         cur_price, cur_chg = _fetch_price(p.get("ticker", ""))
@@ -275,6 +324,36 @@ def build_payload():
 
     rules = learnings.get("rules", [])
 
+    # ── Gauge circular F&G ─────────────────────────────────────────────
+    fg_angle_rad  = math.radians(180 - fg / 100 * 180)
+    fg_dot_x      = round(60 + 45 * math.cos(fg_angle_rad), 1)
+    fg_dot_y      = round(60 - 45 * math.sin(fg_angle_rad), 1)
+    fg_dash_offset = round(141.4 * (1 - fg / 100), 1)
+
+    # ── Bot vs SPY ─────────────────────────────────────────────────────
+    sorted_resolved = sorted(
+        [p for p in preds if p.get("result") in ("win", "loss") and p.get("date") and p.get("entry")],
+        key=lambda x: x["date"]
+    )[-20:]
+    bot_labels = ["Inicio"]
+    bot_data   = [0]
+    running    = 0.0
+    for p in sorted_resolved:
+        entry_p  = p.get("entry", 0) or 0
+        exit_p   = p.get("exit_price", 0) or 0
+        if entry_p and exit_p:
+            raw = (exit_p - entry_p) / entry_p * 100
+            pl  = raw if p.get("signal") == "COMPRAR" else -raw
+        else:
+            pl = 0.0
+        running += pl
+        bot_data.append(round(running, 1))
+        bot_labels.append(p.get("ticker", "")[:5])
+    n_trades = len(sorted_resolved)
+    spy_mom  = regime.get("spy_mom3m", 0) or 0
+    spy_step = spy_mom / n_trades if n_trades else 0
+    spy_data = [round(i * spy_step, 1) for i in range(len(bot_data))]
+
     return {
         "pending":        pending,
         "recent":         recent,
@@ -310,6 +389,12 @@ def build_payload():
         "sector_bias":      mctx.get("sector_bias", {}),
         "updated":          now.strftime("%H:%M:%S · %d/%m/%Y"),
         "next_open":        "Lunes 15:30h" if now.weekday() >= 5 else ("15:30h" if now.weekday() < 5 and (now.hour * 60 + now.minute) < 930 else None),
+        "fg_dot_x":         fg_dot_x,
+        "fg_dot_y":         fg_dot_y,
+        "fg_dash_offset":   fg_dash_offset,
+        "bot_labels":       bot_labels,
+        "bot_data":         bot_data,
+        "spy_data":         spy_data,
     }
 
 
@@ -427,6 +512,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.2/dist/confetti.browser.min.js"></script>
 <style>
 :root{
   --bg:#080c14; --s1:#0d1420; --s2:#111a2b; --s3:#1a2438;
@@ -535,25 +621,54 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
 /* ── TOOLTIP ── */
 .has-tooltip{position:relative}
 .has-tooltip .tooltip{
-  position:absolute;top:calc(100% + 10px);left:50%;
+  position:absolute;bottom:calc(100% + 12px);left:50%;top:auto;
   background:var(--s3);border:1px solid var(--b2);
   border-radius:10px;padding:12px 14px;
   font-size:12px;color:var(--t1);line-height:1.6;
-  white-space:nowrap;z-index:500;
+  white-space:nowrap;z-index:9999;
   opacity:0;pointer-events:none;
   transition:opacity .15s,transform .15s;
-  transform:translateX(-50%) translateY(-4px);
+  transform:translateX(-50%) translateY(4px);
   box-shadow:0 8px 24px rgba(0,0,0,.5);
   min-width:200px;
 }
 .has-tooltip:hover .tooltip{opacity:1;transform:translateX(-50%) translateY(0)}
 .tooltip::after{
-  content:'';position:absolute;bottom:100%;left:50%;transform:translateX(-50%);
-  border:6px solid transparent;border-bottom-color:var(--s3);
+  content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);
+  border:6px solid transparent;border-top-color:var(--s3);
 }
 .tt-row{display:flex;justify-content:space-between;gap:20px;padding:2px 0}
 .tt-range{color:var(--t2)}
 .tt-label{color:var(--t1);font-weight:600}
+
+/* ── TOAST ── */
+#toast-container{position:fixed;bottom:24px;right:24px;z-index:99999;display:flex;flex-direction:column;gap:10px;pointer-events:none}
+.toast{display:flex;align-items:center;gap:10px;background:var(--s2);border:1px solid var(--b2);border-radius:10px;padding:12px 16px;font-size:13px;color:var(--t1);box-shadow:0 8px 32px rgba(0,0,0,.6);animation:toast-in .3s ease;pointer-events:auto;max-width:320px}
+.toast.t-success{border-color:rgba(0,224,122,.35);background:rgba(0,224,122,.07)}
+.toast.t-info{border-color:rgba(61,142,248,.35);background:rgba(61,142,248,.07)}
+.toast.t-warn{border-color:rgba(245,166,35,.35);background:rgba(245,166,35,.07)}
+@keyframes toast-in{from{transform:translateX(110%);opacity:0}to{transform:translateX(0);opacity:1}}
+.toast-out{animation:toast-fade .3s ease forwards!important}
+@keyframes toast-fade{to{transform:translateX(110%);opacity:0}}
+
+/* ── HAMBURGER / MOBILE NAV ── */
+.hamburger{display:none;flex-direction:column;gap:5px;background:none;border:none;cursor:pointer;padding:6px;border-radius:8px}
+.hamburger span{width:20px;height:2px;background:var(--t2);border-radius:2px;transition:all .2s}
+@media(max-width:700px){
+  .hamburger{display:flex}
+  .nav-center{display:none;position:fixed;top:56px;left:0;right:0;z-index:198;background:rgba(8,12,20,.97);backdrop-filter:blur(16px);border-bottom:1px solid var(--b1);padding:8px 12px;flex-direction:column;gap:2px}
+  .nav-center.open{display:flex}
+  .nav-tab{width:100%;justify-content:flex-start;padding:10px 14px}
+  .live-pill{display:none}
+  .kpi-grid{grid-template-columns:repeat(2,1fr)!important}
+  .page{padding:12px 12px 32px}
+}
+
+/* ── SPARKLINE ── */
+.spark-cell{padding:8px 14px!important}
+
+/* ── BOT vs SPY ── */
+.bvs-box{position:relative;height:220px}
 
 /* ── FG BAR ── */
 .fg-bar{height:5px;border-radius:3px;background:var(--b1);margin:8px 0 4px;overflow:hidden;position:relative}
@@ -730,6 +845,8 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 </head>
 <body>
 
+<div id="toast-container"></div>
+
 <!-- NAVBAR -->
 <nav class="nav">
   <div class="nav-brand">
@@ -738,7 +855,7 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
     <span style="color:var(--t3);font-weight:400;font-size:12px">v5.2</span>
   </div>
 
-  <div class="nav-center">
+  <div class="nav-center" id="nav-center">
     <button class="nav-tab active" data-tab="dashboard" onclick="goTab('dashboard')">
       <span class="icon">⬛</span> Dashboard
     </button>
@@ -763,6 +880,9 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
       <span id="updated-ts">{{ updated }}</span>
     </div>
     <a href="/logout" class="btn-logout">Salir</a>
+    <button class="hamburger" id="hamburger" onclick="toggleMobileNav()" aria-label="Menu">
+      <span></span><span></span><span></span>
+    </button>
   </div>
 </nav>
 
@@ -806,9 +926,27 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
     <div class="kpi {% if fear_greed < 45 %}red{% elif fear_greed > 55 %}green{% else %}yellow{% endif %} has-tooltip">
       <div class="kpi-accent"></div>
       <div class="kpi-label">Fear &amp; Greed</div>
-      <div id="kpi-fg-val" class="kpi-val" style="color:{{ fg_color }}">{{ fear_greed }}<span style="font-size:14px;font-weight:400;opacity:.7">/100</span></div>
-      <div class="fg-bar"><div id="kpi-fg-fill" class="fg-fill" style="width:{{ fear_greed }}%;background:{{ fg_color }}"></div></div>
-      <div id="kpi-fg-sub" class="kpi-sub">{{ fg_label }}</div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <svg id="fg-gauge-svg" viewBox="0 0 120 70" style="width:100px;height:60px;overflow:visible;flex-shrink:0">
+          <defs>
+            <linearGradient id="fgGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" style="stop-color:#ff3b5c"/>
+              <stop offset="30%" style="stop-color:#f5a623"/>
+              <stop offset="60%" style="stop-color:#7bed9f"/>
+              <stop offset="100%" style="stop-color:#00e07a"/>
+            </linearGradient>
+          </defs>
+          <path d="M 15 60 A 45 45 0 0 1 105 60" stroke="#1a2438" stroke-width="9" fill="none" stroke-linecap="round"/>
+          <path d="M 15 60 A 45 45 0 0 1 105 60" stroke="url(#fgGrad)" stroke-width="9" fill="none" stroke-linecap="round" opacity="0.25"/>
+          <path id="fg-gauge-fill" d="M 15 60 A 45 45 0 0 1 105 60" stroke="{{ fg_color }}" stroke-width="9" fill="none" stroke-linecap="round" stroke-dasharray="141.4" stroke-dashoffset="{{ fg_dash_offset }}"/>
+          <circle id="fg-gauge-dot" cx="{{ fg_dot_x }}" cy="{{ fg_dot_y }}" r="5" fill="{{ fg_color }}" style="filter:drop-shadow(0 0 4px {{ fg_color }})"/>
+          <text x="60" y="56" text-anchor="middle" font-size="16" font-weight="800" fill="{{ fg_color }}" font-family="Inter,sans-serif" id="fg-gauge-txt">{{ fear_greed }}</text>
+        </svg>
+        <div>
+          <div id="kpi-fg-val" class="kpi-val" style="color:{{ fg_color }};font-size:22px">{{ fear_greed }}<span style="font-size:12px;font-weight:400;opacity:.7">/100</span></div>
+          <div id="kpi-fg-sub" class="kpi-sub">{{ fg_label }}</div>
+        </div>
+      </div>
       <div class="tooltip">
         <div style="font-weight:700;margin-bottom:8px;font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--t3)">Escala Fear &amp; Greed</div>
         <div class="tt-row"><span class="tt-range col-red">0 – 24</span><span class="tt-label">😱 Miedo Extremo</span></div>
@@ -934,6 +1072,16 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
     </div>
   </div>
 
+  <!-- BOT vs SPY CHART -->
+  {% if wins + losses > 0 %}
+  <div class="section">
+    <div class="sh">📈 Bot vs SPY — P/L acumulado (últimas {{ bot_data|length - 1 }} operaciones)</div>
+    <div class="card">
+      <div class="bvs-box"><canvas id="botVsSpy"></canvas></div>
+    </div>
+  </div>
+  {% endif %}
+
   <!-- SEÑALES ACTIVAS (preview en dashboard) -->
   <div class="section">
     <div class="sh">⏳ Señales activas ({{ pending_ct }})</div>
@@ -1036,6 +1184,7 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
             <th>Ticker</th>
             <th>Señal</th>
             <th>Tipo</th>
+            <th>5D</th>
             <th>Entrada</th>
             <th>Precio actual</th>
             <th>vs Entrada</th>
@@ -1066,6 +1215,9 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
               {% elif st == 'SHORT_SQUEEZE' %}<span class="badge b-sq">Squeeze</span>
               {% elif st == 'INSIDER_MASSIVE' %}<span class="badge b-ins">Insider</span>
               {% else %}<span style="font-size:11px;color:var(--t3)">Normal</span>{% endif %}
+            </td>
+            <td class="spark-cell">
+              {% if p.sparkline_svg %}{{ p.sparkline_svg|safe }}{% else %}<span style="color:var(--t3);font-size:11px">—</span>{% endif %}
             </td>
             <td>
               <span class="mono">${{ "%.2f"|format(p.entry|float) }}</span>
@@ -1659,6 +1811,9 @@ function goTab(name) {
   if (panel) panel.classList.add('active');
   if (btn)   btn.classList.add('active');
   window.location.hash = name;
+  // close mobile nav
+  const nc = document.getElementById('nav-center');
+  if (nc) nc.classList.remove('open');
 }
 
 // restore hash on load
@@ -1666,6 +1821,26 @@ function goTab(name) {
   const h = window.location.hash.replace('#', '');
   if (h && document.getElementById('tab-' + h)) goTab(h);
 })();
+
+// ── Mobile hamburger ────────────────────────────────────────────────
+function toggleMobileNav() {
+  const nc = document.getElementById('nav-center');
+  if (nc) nc.classList.toggle('open');
+}
+
+// ── Toast notifications ─────────────────────────────────────────────
+function showToast(msg, type='info', duration=4000) {
+  const ct = document.getElementById('toast-container');
+  if (!ct) return;
+  const el = document.createElement('div');
+  el.className = 'toast t-' + type;
+  el.innerHTML = msg;
+  ct.appendChild(el);
+  setTimeout(() => {
+    el.classList.add('toast-out');
+    setTimeout(() => el.remove(), 350);
+  }, duration);
+}
 
 // ── Donut chart ─────────────────────────────────────────────────────
 {% if wins + losses > 0 %}
@@ -1722,15 +1897,84 @@ if (ctx2) {
 }
 {% endif %}
 
+// ── Bot vs SPY chart ─────────────────────────────────────────────────
+{% if wins + losses > 0 and bot_data|length > 1 %}
+const ctxBvS = document.getElementById('botVsSpy');
+if (ctxBvS) {
+  new Chart(ctxBvS.getContext('2d'), {
+    type: 'line',
+    data: {
+      labels: {{ bot_labels|tojson }},
+      datasets: [
+        {
+          label: 'Bot acumulado %',
+          data: {{ bot_data|tojson }},
+          borderColor: '#00e07a',
+          backgroundColor: 'rgba(0,224,122,.07)',
+          fill: true,
+          tension: 0.4,
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          pointBackgroundColor: '#00e07a',
+          borderWidth: 2,
+        },
+        {
+          label: 'SPY ~equiv %',
+          data: {{ spy_data|tojson }},
+          borderColor: '#3d8ef8',
+          backgroundColor: 'transparent',
+          fill: false,
+          tension: 0.4,
+          borderDash: [5, 4],
+          pointRadius: 0,
+          borderWidth: 1.5,
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: true, labels: { color: '#8596b0', font: { size: 11 }, boxWidth: 16 } },
+        tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${c.parsed.y > 0 ? '+' : ''}${c.parsed.y}%` } }
+      },
+      scales: {
+        x: { ticks: { color: '#4a5a72', font: { size: 10 } }, grid: { color: 'rgba(30,45,68,.4)' } },
+        y: { ticks: { color: '#4a5a72', font: { size: 10 }, callback: v => (v >= 0 ? '+' : '') + v + '%' }, grid: { color: 'rgba(30,45,68,.4)' }, zero: true }
+      }
+    }
+  });
+}
+{% endif %}
+
 // ── Silent AJAX refresh ─────────────────────────────────────────────
 function _set(id, txt) { const e = document.getElementById(id); if (e) e.textContent = txt; }
 function _setH(id, html) { const e = document.getElementById(id); if (e) e.innerHTML = html; }
+
+let _prevPendingCt = {{ pending_ct }};
+let _prevWins      = {{ wins }};
 
 function updateData() {
   fetch('/api/data')
     .then(r => r.ok ? r.json() : null)
     .then(d => {
       if (!d) return;
+
+      // ── Toast & confetti logic ──
+      if (d.pending_ct > _prevPendingCt) {
+        showToast('📡 <b>Nueva señal activa</b>', 'info');
+      } else if (d.pending_ct < _prevPendingCt) {
+        if (d.wins > _prevWins) {
+          showToast('🎯 <b>Señal cerrada en WIN!</b>', 'success', 5000);
+          if (typeof confetti !== 'undefined') {
+            confetti({ particleCount: 120, spread: 70, origin: { y: 0.6 }, colors: ['#00e07a', '#3d8ef8', '#f5a623'] });
+          }
+        } else {
+          showToast('📊 Señal cerrada', 'info');
+        }
+      }
+      _prevPendingCt = d.pending_ct;
+      _prevWins      = d.wins;
 
       // Timestamps & counts
       _set('nav-pending-ct', d.pending_ct);
@@ -1747,11 +1991,18 @@ function updateData() {
       _setH('kpi-regime-sub', `SPY <b>${d.spy_mom3m >= 0 ? '+' : ''}${d.spy_mom3m.toFixed(1)}%</b> en 3 meses`);
 
       // ── Fear & Greed ──
-      const fv = document.getElementById('kpi-fg-val');
-      if (fv) { fv.innerHTML = `${d.fear_greed}<span style="font-size:14px;font-weight:400;opacity:.7">/100</span>`; fv.style.color = d.fg_color; }
-      const ff = document.getElementById('kpi-fg-fill');
-      if (ff) { ff.style.width = d.fear_greed + '%'; ff.style.background = d.fg_color; }
-      _set('kpi-fg-sub', d.fg_label);
+      if (d.fear_greed !== undefined) {
+        const fv = document.getElementById('kpi-fg-val');
+        if (fv) { fv.innerHTML = `${d.fear_greed}<span style="font-size:12px;font-weight:400;opacity:.7">/100</span>`; fv.style.color = d.fg_color; }
+        _set('kpi-fg-sub', d.fg_label);
+        // Update circular gauge
+        const fill = document.getElementById('fg-gauge-fill');
+        const dot  = document.getElementById('fg-gauge-dot');
+        const txt  = document.getElementById('fg-gauge-txt');
+        if (fill) { fill.setAttribute('stroke-dashoffset', (141.4*(1-d.fear_greed/100)).toFixed(1)); fill.setAttribute('stroke', d.fg_color); }
+        if (dot)  { const angle = (180 - d.fear_greed/100*180)*Math.PI/180; dot.setAttribute('cx', (60+45*Math.cos(angle)).toFixed(1)); dot.setAttribute('cy', (60-45*Math.sin(angle)).toFixed(1)); dot.setAttribute('fill', d.fg_color); }
+        if (txt)  { txt.textContent = d.fear_greed; txt.setAttribute('fill', d.fg_color); }
+      }
 
       // ── VIX ──
       const vixC = d.vix > 30 ? 'var(--red)' : d.vix > 20 ? 'var(--yellow)' : 'var(--green)';
@@ -1777,6 +2028,15 @@ function updateData() {
 
 // Refresh every 60s silently
 setInterval(updateData, 60000);
+
+// ── Confetti en wins recientes ───────────────────────────────────────
+{% if recent and recent[0].result == 'win' %}
+setTimeout(() => {
+  if (typeof confetti !== 'undefined') {
+    confetti({ particleCount: 80, spread: 60, origin: { y: 0.7 }, colors: ['#00e07a', '#3d8ef8', '#f5a623'] });
+  }
+}, 1800);
+{% endif %}
 
 // ── Historial expandible ─────────────────────────────────────────────
 function toggleHist(rowEl) {
