@@ -846,6 +846,31 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
 .tt-range{color:var(--t2)}
 .tt-label{color:var(--t1);font-weight:600}
 
+/* ── POSITION SIZING ── */
+.ps-card{background:linear-gradient(135deg,rgba(0,224,122,.04) 0%,rgba(100,149,255,.04) 100%);border:1px solid rgba(0,224,122,.2)!important}
+.ps-input-wrap{display:flex;align-items:center;gap:0;border:1px solid var(--b2);border-radius:8px;overflow:hidden;background:var(--s2)}
+.ps-currency{background:var(--s3);border:none;border-right:1px solid var(--b2);color:var(--t1);font-size:14px;font-weight:700;padding:8px 10px;cursor:pointer;outline:none;font-family:inherit}
+.ps-capital{background:transparent;border:none;color:var(--t1);font-size:16px;font-weight:700;padding:8px 12px;width:130px;outline:none;font-family:inherit}
+.ps-capital::placeholder{color:var(--t3);font-weight:400}
+.ps-risk-wrap{display:flex;align-items:center;gap:10px}
+.ps-risk-range{-webkit-appearance:none;width:100px;height:4px;border-radius:4px;background:var(--b2);outline:none;cursor:pointer}
+.ps-risk-range::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--green);cursor:pointer;box-shadow:0 0 6px rgba(0,224,122,.5)}
+.ps-risk-val{font-size:15px;font-weight:800;color:var(--green);min-width:32px}
+.ps-summary{display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+.ps-stat{display:flex;flex-direction:column;gap:2px}
+.ps-stat-val{font-size:15px;font-weight:800;color:var(--t1)}
+.ps-stat-lbl{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.4px}
+.ps-factors{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid var(--b1)}
+.ps-factor{display:flex;align-items:center;gap:5px;background:var(--s2);border:1px solid var(--b1);border-radius:6px;padding:4px 9px;font-size:11px}
+.ps-factor-name{color:var(--t2)}
+.ps-factor-val{font-weight:700}
+/* Position sizing column in table */
+.ps-cell{display:flex;flex-direction:column;gap:2px;min-width:110px}
+.ps-pct{font-size:13px;font-weight:800;color:var(--green)}
+.ps-eur{font-size:12px;color:var(--t1);font-weight:600}
+.ps-acc{font-size:10px;color:var(--t3)}
+.ps-empty{font-size:11px;color:var(--t3)}
+
 /* ── TOAST ── */
 #toast-container{position:fixed;bottom:24px;right:24px;z-index:99999;display:flex;flex-direction:column;gap:10px;pointer-events:none}
 .toast{display:flex;align-items:center;gap:10px;background:var(--s2);border:1px solid var(--b2);border-radius:10px;padding:12px 16px;font-size:13px;color:var(--t1);box-shadow:0 8px 32px rgba(0,0,0,.6);animation:toast-in .3s ease;pointer-events:auto;max-width:320px}
@@ -1478,6 +1503,47 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
   </div>
   {% endif %}
 
+  <!-- ── POSITION SIZING CARD ── -->
+  <div class="card ps-card" style="margin-bottom:16px;padding:16px 18px">
+    <div style="display:flex;align-items:flex-start;gap:20px;flex-wrap:wrap">
+
+      <!-- Capital input -->
+      <div style="flex:0 0 auto">
+        <div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.5px;text-transform:uppercase;margin-bottom:7px">💰 Tu capital disponible</div>
+        <div class="ps-input-wrap">
+          <select id="ps-currency" class="ps-currency" onchange="recalcPositions()">
+            <option value="USD">$</option>
+            <option value="EUR">€</option>
+          </select>
+          <input type="number" id="ps-capital" class="ps-capital" placeholder="10 000" min="100" step="500"
+            oninput="recalcPositions()" onchange="recalcPositions()">
+        </div>
+        <div style="font-size:10px;color:var(--t3);margin-top:5px">Se guarda automáticamente</div>
+      </div>
+
+      <!-- Riesgo base slider -->
+      <div style="flex:0 0 auto">
+        <div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.5px;text-transform:uppercase;margin-bottom:7px">⚙️ Riesgo por operación</div>
+        <div class="ps-risk-wrap">
+          <input type="range" id="ps-risk" class="ps-risk-range" min="0.5" max="5" step="0.5" value="2" oninput="recalcPositions()">
+          <span id="ps-risk-val" class="ps-risk-val">2%</span>
+        </div>
+        <div style="font-size:10px;color:var(--t3);margin-top:5px">Del capital arriesgado (≠ invertido)</div>
+      </div>
+
+      <!-- Resumen vivo -->
+      <div style="flex:1;min-width:220px">
+        <div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.5px;text-transform:uppercase;margin-bottom:7px">📊 Resumen de exposición</div>
+        <div class="ps-summary" id="ps-summary">
+          <span style="color:var(--t3);font-size:12px">Introduce tu capital para ver el sizing →</span>
+        </div>
+      </div>
+
+    </div>
+    <!-- Factores activos -->
+    <div class="ps-factors" id="ps-factors" style="display:none"></div>
+  </div>
+
   {% if pending %}
   <div class="card" style="margin-bottom:20px;padding:0">
     <div class="tw">
@@ -1499,6 +1565,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
             <th class="sortable" onclick="sortTable(this,12)">Earnings</th>
             <th class="sortable" onclick="sortTable(this,13)">Sector</th>
             <th class="sortable" onclick="sortTable(this,14)">Días</th>
+            <th title="Position sizing basado en tu capital">💰 Posición</th>
             <th>📝</th>
           </tr>
         </thead>
@@ -1508,7 +1575,12 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
           {% set has_cur = p.current_price is not none %}
           {% set pkey = 'sbp_pin_' ~ p.ticker ~ '_' ~ (p.date[:10] if p.date else '') %}
           {% set nkey = 'sbp_note_' ~ p.ticker ~ '_' ~ (p.date[:10] if p.date else '') %}
-          <tr data-pin-key="{{ pkey }}" data-note-key="{{ nkey }}">
+          <tr data-pin-key="{{ pkey }}" data-note-key="{{ nkey }}"
+            data-entry="{{ p.entry|float }}"
+            data-stop="{{ p.stop|float }}"
+            data-confidence="{{ p.confidence|int }}"
+            data-stype="{{ p.get('signal_type','NORMAL') }}"
+            data-price="{{ p.current_price if p.current_price else p.entry|float }}">
             <td style="padding:8px 4px;text-align:center">
               <button class="icon-btn" data-pin-btn onclick="togglePin('{{ pkey }}',this)" title="Fijar señal">⭐</button>
             </td>
@@ -1609,6 +1681,9 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
                 {{ p.days_remaining }}d
               </span>
               <br><span style="font-size:10px;color:var(--t3)">{{ p.date[:10] if p.date else '' }}</span>
+            </td>
+            <td class="ps-td" style="padding:8px 10px">
+              <div class="ps-cell ps-empty">—</div>
             </td>
             <td style="padding:8px 6px;text-align:center">
               <button class="icon-btn" data-note-btn data-note-key="{{ nkey }}"
@@ -2580,6 +2655,9 @@ function _setH(id, html) { const e = document.getElementById(id); if (e) e.inner
 
 let _prevPendingCt = {{ pending_ct }};
 let _prevWins      = {{ wins }};
+// Position sizing globals (updated by live refresh)
+let _liveRegime = '{{ regime }}';
+let _liveVix    = {{ vix }};
 
 function updateData() {
   fetch('/api/data')
@@ -2607,6 +2685,11 @@ function updateData() {
       _set('nav-pending-ct', d.pending_ct);
       _set('updated-ts', d.updated);
       _set('dash-updated', d.updated);
+
+      // Update position sizing globals
+      _liveRegime = d.regime;
+      _liveVix    = d.vix;
+      recalcPositions();
 
       // ── Régimen ──
       const regC = d.regime === 'BEAR' ? 'var(--red)' : d.regime === 'BULL' ? 'var(--green)' : 'var(--yellow)';
@@ -2888,6 +2971,133 @@ function toggleHist(rowEl) {
     inner.classList.add('open');
     inner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
+}
+
+// ── POSITION SIZING ─────────────────────────────────────────────────────
+(function initPositionSizing() {
+  const capEl  = document.getElementById('ps-capital');
+  const curEl  = document.getElementById('ps-currency');
+  const riskEl = document.getElementById('ps-risk');
+  if (!capEl) return;
+  // Restore from localStorage
+  const saved = localStorage.getItem('ps_capital');
+  const savedCur = localStorage.getItem('ps_currency') || 'USD';
+  const savedRisk = localStorage.getItem('ps_risk') || '2';
+  if (saved) capEl.value = saved;
+  if (curEl) curEl.value = savedCur;
+  if (riskEl) { riskEl.value = savedRisk; document.getElementById('ps-risk-val').textContent = savedRisk + '%'; }
+  if (saved) recalcPositions();
+})();
+
+function recalcPositions() {
+  const capEl   = document.getElementById('ps-capital');
+  const curEl   = document.getElementById('ps-currency');
+  const riskEl  = document.getElementById('ps-risk');
+  const riskLbl = document.getElementById('ps-risk-val');
+  if (!capEl) return;
+
+  const capital  = parseFloat(capEl.value) || 0;
+  const currency = curEl ? curEl.value : 'USD';
+  const sym      = currency === 'EUR' ? '€' : '$';
+  const baseRisk = parseFloat(riskEl ? riskEl.value : 2);
+  if (riskLbl) riskLbl.textContent = baseRisk + '%';
+
+  // Save to localStorage
+  if (capital > 0) localStorage.setItem('ps_capital', capital);
+  localStorage.setItem('ps_currency', currency);
+  localStorage.setItem('ps_risk', baseRisk);
+
+  // ── Factores de ajuste ──
+  const regimeFactor = _liveRegime === 'BEAR' ? 0.6 : _liveRegime === 'LATERAL' ? 0.8 : 1.0;
+  const vixFactor    = _liveVix > 30 ? 0.7 : _liveVix > 20 ? 0.85 : 1.0;
+
+  // ── Factores card visual ──
+  const factorsEl = document.getElementById('ps-factors');
+  if (factorsEl && capital > 0) {
+    factorsEl.style.display = 'flex';
+    const regColor = _liveRegime === 'BEAR' ? 'var(--red)' : _liveRegime === 'LATERAL' ? 'var(--yellow)' : 'var(--green)';
+    const vixColor = _liveVix > 30 ? 'var(--red)' : _liveVix > 20 ? 'var(--yellow)' : 'var(--green)';
+    factorsEl.innerHTML =
+      `<span style="font-size:10px;color:var(--t3);align-self:center;margin-right:4px">Factores activos:</span>` +
+      `<span class="ps-factor"><span class="ps-factor-name">Régimen</span><span class="ps-factor-val" style="color:${regColor}">${_liveRegime} ×${regimeFactor.toFixed(1)}</span></span>` +
+      `<span class="ps-factor"><span class="ps-factor-name">VIX ${_liveVix}</span><span class="ps-factor-val" style="color:${vixColor}">×${vixFactor.toFixed(2)}</span></span>` +
+      `<span class="ps-factor"><span class="ps-factor-name">Riesgo base</span><span class="ps-factor-val" style="color:var(--green)">${baseRisk}%</span></span>` +
+      `<span style="font-size:10px;color:var(--t3);align-self:center;margin-left:4px">· Ajuste final = riesgo base × régimen × VIX × confianza</span>`;
+  } else if (factorsEl) {
+    factorsEl.style.display = 'none';
+  }
+
+  // ── Calcular por cada fila ──
+  const rows = document.querySelectorAll('#signals-tbody tr');
+  let totalExposed = 0, totalRisk = 0, signalCount = 0;
+
+  rows.forEach(row => {
+    const entry      = parseFloat(row.dataset.entry)      || 0;
+    const stop       = parseFloat(row.dataset.stop)       || 0;
+    const confidence = parseFloat(row.dataset.confidence) || 0;
+    const stype      = row.dataset.stype || 'NORMAL';
+    const price      = parseFloat(row.dataset.price)      || entry;
+    const psCell     = row.querySelector('.ps-td .ps-cell');
+    if (!psCell) return;
+
+    if (capital <= 0 || entry <= 0 || stop <= 0) {
+      psCell.innerHTML = '<span class="ps-empty">—</span>';
+      return;
+    }
+
+    // Factores por señal
+    const confFactor = confidence >= 97 ? 1.2 : confidence >= 94 ? 1.0 : confidence >= 88 ? 0.8 : 0.6;
+    const typeFactor = stype === 'INSIDER_MASSIVE' ? 1.1 : stype === 'PRE_EARNINGS' ? 0.8 : stype === 'SHORT_SQUEEZE' ? 0.9 : 1.0;
+
+    // Riesgo ajustado %
+    const adjRiskPct = baseRisk * confFactor * regimeFactor * vixFactor * typeFactor;
+
+    // Dinero que arriesgas
+    const riskAmount = capital * adjRiskPct / 100;
+
+    // Stop distance por acción
+    const stopDist = Math.abs(entry - stop);
+    if (stopDist < 0.01) { psCell.innerHTML = '<span class="ps-empty">Stop inválido</span>'; return; }
+
+    // Nº de acciones = riesgo / distancia al stop
+    const shares = Math.floor(riskAmount / stopDist);
+    if (shares < 1) { psCell.innerHTML = `<span class="ps-empty">&lt;1 acc · sube capital</span>`; return; }
+
+    // Valor total de la posición
+    const posValue = shares * price;
+    const posPct   = (posValue / capital * 100).toFixed(1);
+
+    totalExposed += posValue;
+    totalRisk    += riskAmount;
+    signalCount++;
+
+    // Color según tamaño de posición
+    const pctNum = parseFloat(posPct);
+    const pctColor = pctNum >= 15 ? 'var(--green)' : pctNum >= 8 ? 'var(--blue)' : 'var(--t2)';
+
+    psCell.innerHTML =
+      `<span class="ps-pct" style="color:${pctColor}">${posPct}%</span>` +
+      `<span class="ps-eur">= ${sym}${posValue < 10000 ? posValue.toFixed(0) : (posValue/1000).toFixed(1)+'k'}</span>` +
+      `<span class="ps-acc">~${shares} acc · riesgo ${sym}${riskAmount.toFixed(0)}</span>`;
+  });
+
+  // ── Resumen global ──
+  const summaryEl = document.getElementById('ps-summary');
+  if (!summaryEl) return;
+  if (capital <= 0) {
+    summaryEl.innerHTML = '<span style="color:var(--t3);font-size:12px">Introduce tu capital para ver el sizing →</span>';
+    return;
+  }
+  const expPct  = (totalExposed / capital * 100).toFixed(1);
+  const riskPct = (totalRisk    / capital * 100).toFixed(1);
+  const expColor  = parseFloat(expPct)  > 80 ? 'var(--red)' : parseFloat(expPct)  > 50 ? 'var(--yellow)' : 'var(--green)';
+  const riskColor = parseFloat(riskPct) > 10 ? 'var(--red)' : parseFloat(riskPct) > 5  ? 'var(--yellow)' : 'var(--green)';
+
+  summaryEl.innerHTML =
+    `<div class="ps-stat"><span class="ps-stat-val">${sym}${capital.toLocaleString()}</span><span class="ps-stat-lbl">Capital total</span></div>` +
+    `<div class="ps-stat"><span class="ps-stat-val" style="color:${expColor}">${sym}${totalExposed < 10000 ? totalExposed.toFixed(0) : (totalExposed/1000).toFixed(1)+'k'} <span style="font-size:11px;opacity:.7">(${expPct}%)</span></span><span class="ps-stat-lbl">Capital expuesto</span></div>` +
+    `<div class="ps-stat"><span class="ps-stat-val" style="color:${riskColor}">${sym}${totalRisk.toFixed(0)} <span style="font-size:11px;opacity:.7">(${riskPct}%)</span></span><span class="ps-stat-lbl">Riesgo máx. total</span></div>` +
+    `<div class="ps-stat"><span class="ps-stat-val">${signalCount}</span><span class="ps-stat-lbl">Señales calculadas</span></div>`;
 }
 </script>
 </body>
