@@ -1541,8 +1541,6 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
       </div>
 
     </div>
-    <!-- Factores activos -->
-    <div class="ps-factors" id="ps-factors" style="display:none"></div>
   </div>
 
   {% if pending %}
@@ -3034,20 +3032,6 @@ function recalcPositions() {
   const vixFactor    = _liveVix > 30 ? 0.7 : _liveVix > 20 ? 0.85 : 1.0;
 
   // Factores card visual
-  const factorsEl = document.getElementById('ps-factors');
-  if (factorsEl && capital > 0) {
-    factorsEl.style.display = 'flex';
-    const regColor = _liveRegime === 'BEAR' ? 'var(--red)' : _liveRegime === 'LATERAL' ? 'var(--yellow)' : 'var(--green)';
-    const vixColor = _liveVix > 30 ? 'var(--red)' : _liveVix > 20 ? 'var(--yellow)' : 'var(--green)';
-    factorsEl.innerHTML =
-      `<span style="font-size:10px;color:var(--t3);align-self:center;margin-right:4px">Factores activos:</span>` +
-      `<span class="ps-factor"><span class="ps-factor-name">Régimen</span><span class="ps-factor-val" style="color:${regColor}">${_liveRegime} ×${regimeFactor.toFixed(1)}</span></span>` +
-      `<span class="ps-factor"><span class="ps-factor-name">VIX ${_liveVix}</span><span class="ps-factor-val" style="color:${vixColor}">×${vixFactor.toFixed(2)}</span></span>` +
-      `<span class="ps-factor"><span class="ps-factor-name">Asignación base</span><span class="ps-factor-val" style="color:var(--green)">${allocPct}%</span></span>`;
-  } else if (factorsEl) {
-    factorsEl.style.display = 'none';
-  }
-
   const rows = document.querySelectorAll('#signals-tbody tr');
   let totalExposed = 0, totalRisk = 0, signalCount = 0;
 
@@ -3083,7 +3067,7 @@ function recalcPositions() {
     const riskAmt   = shares * stopDist;
 
     if (shares < 1) {
-      psCell.innerHTML = '<span class="ps-empty">—</span>';
+      psCell.innerHTML = '';
       if (calcBtn) { calcBtn.style.display = 'block'; calcBtn.dataset.sym = sym; }
       return;
     }
@@ -3220,14 +3204,15 @@ function calcSizerModal(entry, stop, price, capital, sym, target, targetPct, day
   }
   if (useP <= 0) { resEl.innerHTML = '<span style="color:var(--red)">Sin precio disponible</span>'; return; }
 
-  const shares    = Math.floor(amt / useP);
-  const realAmt   = shares * useP;
-  const riskAmt   = shares * stopDist;
-  const capPct    = capital > 0 ? (realAmt / capital * 100).toFixed(1) : null;
-  const riskPct   = capital > 0 ? (riskAmt / capital * 100).toFixed(1) : null;
-  const riskColor = riskPct && parseFloat(riskPct) > 5 ? 'var(--red)' : 'var(--yellow)';
+  const sharesExact = amt / useP;                          // e.g. 1.504...
+  const sharesDisp  = sharesExact.toFixed(2).replace(/\.?0+$/, ''); // "1.5", "2", "1.3"
+  const realAmt     = amt;                                 // invertimos el importe exacto
+  const riskAmt     = sharesExact * stopDist;
+  const capPct      = capital > 0 ? (realAmt / capital * 100).toFixed(1) : null;
+  const riskPct     = capital > 0 ? (riskAmt / capital * 100).toFixed(1) : null;
+  const riskColor   = riskPct && parseFloat(riskPct) > 5 ? 'var(--red)' : 'var(--yellow)';
 
-  if (shares < 1) {
+  if (sharesExact < 1) {
     resEl.innerHTML = `<div style="text-align:center"><span style="color:var(--red);font-size:13px">⚠ Necesitas mínimo ${sym}${Math.ceil(useP)} para 1 acción</span></div>`;
     return;
   }
@@ -3235,7 +3220,7 @@ function calcSizerModal(entry, stop, price, capital, sym, target, targetPct, day
   // Ganancia potencial si se cumple la predicción
   const tgt = target || 0;
   const tPct = targetPct || (tgt > 0 && useP > 0 ? (tgt - useP) / useP * 100 : 0);
-  const profit = tgt > 0 ? (tgt - useP) * shares : (tPct > 0 ? (useP * tPct / 100) * shares : null);
+  const profit = tgt > 0 ? (tgt - useP) * sharesExact : (tPct > 0 ? (useP * tPct / 100) * sharesExact : null);
   const daysLeft = days || 0;
 
   const profitBlock = profit !== null ? `
@@ -3258,7 +3243,7 @@ function calcSizerModal(entry, stop, price, capital, sym, target, targetPct, day
     <div style="width:100%">
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
         <div style="text-align:center;background:var(--s3);border-radius:10px;padding:14px 10px">
-          <div style="font-size:30px;font-weight:800;color:var(--green)">${shares}</div>
+          <div style="font-size:30px;font-weight:800;color:var(--green)">${sharesDisp}</div>
           <div style="font-size:11px;color:var(--t3);margin-top:2px">acciones × ${sym}${useP.toFixed(2)}</div>
         </div>
         <div style="text-align:center;background:var(--s3);border-radius:10px;padding:14px 10px">
