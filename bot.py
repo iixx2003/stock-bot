@@ -104,6 +104,7 @@ REGIME_FILE           = "/app/data/regime.json"
 CATALYST_MEMORY_FILE  = "/app/data/catalyst_memory.json"
 ECON_CALENDAR_FILE    = "/app/data/econ_calendar.json"
 MARKET_CONTEXT_FILE   = "/app/data/market_context.json"  # web dashboard
+EARNINGS_WATCH_FILE   = "/app/data/earnings_watch.json"  # scanner semanal de earnings
 
 # ═══════════════════════════════════════════════════════════════════════
 # UNIVERSO — igual que v5, incluido aquí por completitud
@@ -315,6 +316,7 @@ GEO_SECTOR_MAP = {
 
 predictions    = []
 watch_signals  = {}
+earnings_watch = {}   # {ticker: {date, days_ahead, name, time}} — rellenado cada mañana
 learnings      = {
     "rules": [], "sector_memory": {}, "hour_memory": {},
     "error_memory": [], "regime_memory": {}, "last_updated": None,
@@ -360,7 +362,7 @@ CB_DURATION_HOURS      = 24
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_state():
-    global predictions, watch_signals, learnings, market_regime, catalyst_memory, econ_calendar
+    global predictions, watch_signals, learnings, market_regime, catalyst_memory, econ_calendar, earnings_watch
     os.makedirs("/app/data", exist_ok=True)
 
     for var_name, filepath, default in [
@@ -370,6 +372,7 @@ def load_state():
         ("market_regime",   REGIME_FILE,           market_regime),
         ("catalyst_memory", CATALYST_MEMORY_FILE,  {}),
         ("econ_calendar",   ECON_CALENDAR_FILE,    econ_calendar),
+        ("earnings_watch",  EARNINGS_WATCH_FILE,   {}),
     ]:
         try:
             if os.path.exists(filepath):
@@ -381,6 +384,7 @@ def load_state():
                 elif var_name == "market_regime":   market_regime   = data
                 elif var_name == "catalyst_memory": catalyst_memory = data
                 elif var_name == "econ_calendar":   econ_calendar   = data
+                elif var_name == "earnings_watch":  earnings_watch  = data
         except Exception as e:
             print(f"  ERROR cargando {filepath}: {e}")
 
@@ -397,6 +401,7 @@ def save_state():
         (market_regime,   REGIME_FILE),
         (catalyst_memory, CATALYST_MEMORY_FILE),
         (econ_calendar,   ECON_CALENDAR_FILE),
+        (earnings_watch,  EARNINGS_WATCH_FILE),
     ]:
         try:
             tmp_path = filepath + ".tmp"
@@ -878,6 +883,80 @@ def _fg_label(fg):
     return "EUFORIA"
 
 
+def fetch_earnings_calendar():
+    """
+    Obtiene earnings de los próximos 7 días laborables desde la API pública de Nasdaq.
+    Coste: ~5 peticiones HTTP ligeras por semana (una por día laboral), 0 tokens IA.
+    Devuelve dict {ticker: {date, days_ahead, name, time}} filtrado al universo propio.
+    """
+    from datetime import timedelta as _td
+    universe_set = set(UNIVERSE)
+    found = {}
+    today = datetime.now(SPAIN_TZ).date()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    for i in range(1, 8):
+        target_date = today + _td(days=i)
+        if target_date.weekday() >= 5:   # saltar fin de semana
+            continue
+        try:
+            url = f"https://api.nasdaq.com/api/calendar/earnings?date={target_date}"
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.status_code != 200:
+                continue
+            rows = (r.json().get("data") or {}).get("rows") or []
+            for row in rows:
+                sym = (row.get("symbol") or "").upper().strip()
+                if sym in universe_set and sym not in found:
+                    found[sym] = {
+                        "date":       str(target_date),
+                        "days_ahead": i,
+                        "name":       row.get("name", sym),
+                        "time":       row.get("time", "?"),   # "time-after-hours" / "time-pre-market"
+                    }
+            time.sleep(1)   # respetar rate-limit Nasdaq
+        except Exception as e:
+            print(f"  earnings_calendar día+{i}: {e}")
+    return found
+
+
+def update_earnings_watch():
+    """
+    Actualiza el watch semanal de earnings. Se ejecuta a las 09:00 cada día laboral.
+    Solo hace peticiones HTTP, nunca llama a la IA.
+    """
+    global earnings_watch
+    now = datetime.now(SPAIN_TZ)
+    if now.weekday() >= 5:
+        return
+    print("  📅 Escaneando earnings próximos 7 días...")
+    try:
+        new_watch = fetch_earnings_calendar()
+        earnings_watch = new_watch
+        save_state()
+
+        if earnings_watch:
+            items_str = ", ".join(
+                f"{t}({v['days_ahead']}d)" for t, v in
+                sorted(earnings_watch.items(), key=lambda x: x[1]["days_ahead"])[:12]
+            )
+            extra = f" (+{len(earnings_watch)-12} más)" if len(earnings_watch) > 12 else ""
+            print(f"  📅 {len(earnings_watch)} acciones del universo con earnings próximos: {items_str}{extra}")
+
+            # Notificar en Discord solo si hay resultados
+            lines = [f"📅 **EARNINGS SCANNER** — {len(earnings_watch)} acciones en tu universo esta semana"]
+            for tk, info in sorted(earnings_watch.items(), key=lambda x: x[1]["days_ahead"]):
+                t_tag = "🌅 pre-mkt" if "pre" in info.get("time","").lower() else "🌆 post-cierre" if "after" in info.get("time","").lower() else "🕐 horario"
+                lines.append(f"  • **{tk}** — {info['date']} ({info['days_ahead']}d) {t_tag}")
+            send_solicitud("\n".join(lines))
+        else:
+            print("  📅 Sin earnings en el universo los próximos 7 días")
+    except Exception as e:
+        print(f"  ERROR update_earnings_watch: {e}")
+
+
 def update_market_context():
     global market_context
     print("  Actualizando contexto macro...")
@@ -1228,10 +1307,10 @@ def check_pre_earnings_signal(fund, tech):
     beats   = fund.get("earnings_beats", 0)
     upside  = fund.get("analyst_upside", 0) or 0
 
-    if days is None or days < 1 or days > 7:
+    if days is None or days < 1 or days > 10:   # ampliado de 7 a 10 días
         return False, None, None
 
-    if beats < 3:
+    if beats < 2:   # bajado de 3 a 2 (más permisivo, la IA valida la calidad)
         return False, None, None
 
     # Técnico debe ser alcista
@@ -2909,7 +2988,34 @@ def watch_cycle():
         for t in rotation if t not in seen_set
     ]
 
-    to_analyze = candidates + rotation_items
+    # ── Earnings priority: tickers con earnings en 1-10 días del universo ──
+    # Se añaden al frente de la cola para analizarse aunque no pasen score técnico.
+    # El cooldown es de 6h (en vez del estándar 1h) para no saturar en semana de earnings.
+    earnings_priority = []
+    if earnings_watch:
+        seen_ep = {c["ticker"] for c in candidates} | {r["ticker"] for r in rotation_items}
+        for tk, info in sorted(earnings_watch.items(), key=lambda x: x[1].get("days_ahead", 99)):
+            days_left = info.get("days_ahead", 99)
+            if days_left < 1 or days_left > 10:
+                continue
+            if already_alerted_today(tk):
+                continue
+            last = watch_signals.get(tk, {}).get("last_analyzed", "2000-01-01T00:00:00+00:00")
+            hours_since = (datetime.now(SPAIN_TZ) - _to_aware(last)).total_seconds() / 3600
+            if hours_since < 6:
+                continue
+            if tk not in seen_ep:
+                earnings_priority.append({
+                    "ticker":        tk,
+                    "name":          info.get("name", tk),
+                    "sector":        "Unknown",
+                    "score":         SCORE_MINIMO,   # forzar análisis aunque no pase quick_scan
+                    "source":        f"earnings_{days_left}d",
+                    "earnings_days": days_left,
+                })
+                seen_ep.add(tk)
+
+    to_analyze = earnings_priority + candidates + rotation_items
     regime     = market_regime.get("regime", "?")
     eco_flag   = " ⚠️ALTO IMPACTO" if econ_calendar.get("is_high_impact") else ""
     pm_flag    = " 🌅PREMARKET" if is_premarket() else ""
@@ -2940,10 +3046,12 @@ def watch_cycle():
                 continue
 
         intentos_ciclo += 1
+        is_earnings_forced = item.get("source", "").startswith("earnings_")
         result = analyze_ticker(
             ticker,
             item.get("name", ticker),
             item.get("sector", "Unknown"),
+            force=is_earnings_forced,          # bypass score si viene del earnings scanner
             solo_excepcionales=solo_excepcionales,
         )
         if not result:
@@ -3238,12 +3346,14 @@ def main():
         f"🕐  {now.strftime('%H:%M  %d/%m/%Y')}"
     )
 
+    update_earnings_watch()   # escanear earnings al arrancar (sin esperar al 09:05)
     watch_cycle()
     listen_commands(init=True)
 
     schedule.every(5).minutes.do(watch_cycle)
     schedule.every(30).minutes.do(_update_macro_if_market_hours)
     schedule.every().day.at("09:00").do(update_market_context)
+    schedule.every().day.at("09:05").do(update_earnings_watch)   # justo después del contexto macro
     schedule.every().day.at("00:01").do(reset_daily_counters)
     schedule.every().day.at("22:00").do(daily_summary)
     schedule.every().sunday.at("10:00").do(weekly_report)
