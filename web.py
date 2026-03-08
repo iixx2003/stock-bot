@@ -441,6 +441,20 @@ def build_payload():
             "why":    _infer_exit_reason(p) if p.get("result") in ("win", "loss") else "active",
         })
 
+    # ── Detección de duplicados ─────────────────────────────────────────
+    from collections import Counter as _Counter
+    _tk_counts = _Counter(p.get("ticker", "") for p in pending)
+    for p in pending:
+        p["is_duplicate"] = _tk_counts.get(p.get("ticker", ""), 0) > 1
+
+    # ── Earnings próximos (señales activas) ─────────────────────────────
+    earnings_upcoming = sorted(
+        [{"ticker": p["ticker"], "date": p["earnings_date"],
+          "signal": p.get("signal", ""), "during": p.get("earnings_during", False)}
+         for p in pending if p.get("earnings_date")],
+        key=lambda x: x["date"]
+    )[:10]
+
     # ── Time Machine data ───────────────────────────────────────────────
     tm_trades = []
     for p in preds:
@@ -543,6 +557,7 @@ def build_payload():
         "ticker_stats":     ticker_stats,
         "tm_trades":        tm_trades,
         "tm_max_days":      tm_max_days,
+        "earnings_upcoming": earnings_upcoming,
     }
 
 
@@ -769,21 +784,21 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
 /* ── TOOLTIP ── */
 .has-tooltip{position:relative}
 .has-tooltip .tooltip{
-  position:absolute;bottom:calc(100% + 12px);left:50%;top:auto;
+  position:absolute;top:calc(100% + 10px);left:50%;bottom:auto;
   background:var(--s3);border:1px solid var(--b2);
   border-radius:10px;padding:12px 14px;
   font-size:12px;color:var(--t1);line-height:1.6;
   white-space:nowrap;z-index:9999;
   opacity:0;pointer-events:none;
   transition:opacity .15s,transform .15s;
-  transform:translateX(-50%) translateY(4px);
-  box-shadow:0 8px 24px rgba(0,0,0,.5);
+  transform:translateX(-50%) translateY(-4px);
+  box-shadow:0 8px 32px rgba(0,0,0,.7);
   min-width:200px;
 }
 .has-tooltip:hover .tooltip{opacity:1;transform:translateX(-50%) translateY(0)}
 .tooltip::after{
-  content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);
-  border:6px solid transparent;border-top-color:var(--s3);
+  content:'';position:absolute;bottom:100%;left:50%;transform:translateX(-50%);
+  border:6px solid transparent;border-bottom-color:var(--s3);
 }
 .tt-row{display:flex;justify-content:space-between;gap:20px;padding:2px 0}
 .tt-range{color:var(--t2)}
@@ -1017,6 +1032,31 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 /* ── TK LINK ── */
 .tk-link{cursor:pointer;transition:color .15s;border-bottom:1px dashed transparent}
 .tk-link:hover{color:var(--green)!important;border-bottom-color:var(--green)}
+
+/* ── SEARCH BAR ── */
+.search-wrap{position:relative;flex:1}
+.search-wrap input{width:100%;background:var(--s2);border:1px solid var(--b1);border-radius:8px;color:var(--t1);font-size:13px;padding:9px 12px 9px 36px;outline:none;font-family:inherit;transition:border-color .2s}
+.search-wrap input:focus{border-color:rgba(61,142,248,.45)}
+.search-wrap .si{position:absolute;left:11px;top:50%;transform:translateY(-50%);font-size:14px;pointer-events:none}
+
+/* ── SORTABLE HEADERS ── */
+th.sortable{cursor:pointer;user-select:none;transition:color .15s}
+th.sortable:hover{color:var(--t1)}
+th.sort-asc::after{content:' ▲';font-size:8px;color:var(--green)}
+th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
+
+/* ── PIN / NOTE BUTTONS ── */
+.icon-btn{background:none;border:none;cursor:pointer;font-size:13px;padding:2px 4px;border-radius:4px;transition:all .15s;line-height:1;color:var(--t3)}
+.icon-btn:hover{background:rgba(255,255,255,.07);color:var(--t1)}
+.icon-btn.pinned{color:var(--green)}
+.icon-btn.noted{color:var(--yellow)}
+.pin-row{background:rgba(0,224,122,.03)!important}
+.dup-badge{display:inline-flex;align-items:center;gap:3px;font-size:9px;font-weight:700;padding:1px 5px;border-radius:4px;background:rgba(245,166,35,.12);color:var(--yellow);border:1px solid rgba(245,166,35,.25);vertical-align:middle;margin-left:4px}
+
+/* ── NOTE MODAL ── */
+#note-modal .modal-box{max-width:420px}
+#note-textarea{width:100%;height:110px;background:var(--s2);border:1px solid var(--b1);border-radius:8px;color:var(--t1);font-size:13px;padding:12px;font-family:inherit;resize:vertical;outline:none;line-height:1.6;transition:border-color .2s}
+#note-textarea:focus{border-color:rgba(61,142,248,.4)}
 
 /* ── SUMMARY STATS ROW ── */
 .sum-row{
@@ -1356,12 +1396,37 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 <!-- ════════════════════════════════════════════════════ TAB: SEÑALES -->
 <div class="tab-panel" id="tab-signals">
 
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-    <div class="sh" style="margin-bottom:0;flex:1">📡 Señales activas — {{ pending_ct }} predicciones en curso</div>
-    <span style="font-size:11px;color:var(--t3);background:var(--s2);border:1px solid var(--b1);border-radius:6px;padding:4px 10px">
-      💡 Precio actual se actualiza cada 3 min
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+    <div class="sh" style="margin-bottom:0;flex:1;min-width:200px">📡 Señales activas — {{ pending_ct }} predicciones en curso</div>
+    <span style="font-size:11px;color:var(--t3);background:var(--s2);border:1px solid var(--b1);border-radius:6px;padding:4px 10px;white-space:nowrap">
+      💡 Precio actualiza cada 3 min
     </span>
   </div>
+
+  <!-- Buscador -->
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+    <div class="search-wrap">
+      <span class="si">🔍</span>
+      <input type="text" id="signals-search" placeholder="Buscar por ticker, sector, tipo..." oninput="filterSignals(this.value)">
+    </div>
+    <span id="signals-count" style="font-size:12px;color:var(--t3);white-space:nowrap;min-width:64px">{{ pending_ct }} señales</span>
+  </div>
+
+  <!-- Earnings próximos -->
+  {% if earnings_upcoming %}
+  <div class="card" style="margin-bottom:14px;padding:14px 16px">
+    <div class="card-title" style="margin-bottom:10px">📅 Próximos earnings en señales activas</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      {% for e in earnings_upcoming %}
+      <div style="display:flex;align-items:center;gap:8px;background:var(--s2);border:1px solid {% if e.during %}rgba(155,109,255,.35){% else %}var(--b1){% endif %};border-radius:8px;padding:7px 12px">
+        <span class="tk-link" onclick="openTickerModal('{{ e.ticker }}')" style="font-weight:700;font-size:13px">{{ e.ticker }}</span>
+        <span style="font-size:11px;color:var(--t3)">{{ e.date }}</span>
+        {% if e.during %}<span class="b-earn-sm">⚠️ en ventana</span>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
 
   {% if pending %}
   <div class="card" style="margin-bottom:20px;padding:0">
@@ -1369,29 +1434,37 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
       <table>
         <thead>
           <tr>
-            <th>Ticker</th>
-            <th>Señal</th>
-            <th>Tipo</th>
+            <th style="width:20px;padding:10px 6px"></th>
+            <th class="sortable" onclick="sortTable(this,1)">Ticker</th>
+            <th class="sortable" onclick="sortTable(this,2)">Señal</th>
+            <th class="sortable" onclick="sortTable(this,3)">Tipo</th>
             <th>5D</th>
-            <th>Entrada</th>
-            <th>Precio actual</th>
-            <th>vs Entrada</th>
-            <th>Objetivo</th>
-            <th>Stop</th>
-            <th>Confianza</th>
-            <th>Progreso al objetivo</th>
-            <th>Earnings</th>
-            <th>Sector</th>
-            <th>Días rest.</th>
+            <th class="sortable" onclick="sortTable(this,5)">Entrada</th>
+            <th class="sortable" onclick="sortTable(this,6)">Precio actual</th>
+            <th class="sortable" onclick="sortTable(this,7)">vs Entrada</th>
+            <th class="sortable" onclick="sortTable(this,8)">Objetivo</th>
+            <th class="sortable" onclick="sortTable(this,9)">Stop</th>
+            <th class="sortable" onclick="sortTable(this,10)">Confianza</th>
+            <th>Progreso</th>
+            <th class="sortable" onclick="sortTable(this,12)">Earnings</th>
+            <th class="sortable" onclick="sortTable(this,13)">Sector</th>
+            <th class="sortable" onclick="sortTable(this,14)">Días</th>
+            <th>📝</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody id="signals-tbody">
           {% for p in pending %}
           {% set st = p.get('signal_type','NORMAL') %}
           {% set has_cur = p.current_price is not none %}
-          <tr>
+          {% set pkey = 'sbp_pin_' ~ p.ticker ~ '_' ~ (p.date[:10] if p.date else '') %}
+          {% set nkey = 'sbp_note_' ~ p.ticker ~ '_' ~ (p.date[:10] if p.date else '') %}
+          <tr data-pin-key="{{ pkey }}" data-note-key="{{ nkey }}">
+            <td style="padding:8px 4px;text-align:center">
+              <button class="icon-btn" data-pin-btn onclick="togglePin('{{ pkey }}',this)" title="Fijar señal">⭐</button>
+            </td>
             <td>
               <span class="tk tk-link" onclick="openTickerModal('{{ p.ticker }}')">{{ p.ticker }}</span>
+              {% if p.is_duplicate %}<span class="dup-badge">⚠ DUP</span>{% endif %}
               {% if p.session %}<br><span style="font-size:9px;color:var(--t3)">{{ p.session }}</span>{% endif %}
             </td>
             <td>
@@ -1486,6 +1559,11 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
                 {{ p.days_remaining }}d
               </span>
               <br><span style="font-size:10px;color:var(--t3)">{{ p.date[:10] if p.date else '' }}</span>
+            </td>
+            <td style="padding:8px 6px;text-align:center">
+              <button class="icon-btn" data-note-btn data-note-key="{{ nkey }}"
+                onclick="openNoteModal('{{ p.ticker }}','{{ p.date[:10] if p.date else '' }}')"
+                title="Añadir nota">📝</button>
             </td>
           </tr>
           {% endfor %}
@@ -2083,6 +2161,21 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
   </div>
 </div>
 
+<!-- ════ MODAL NOTA ════ -->
+<div class="modal-overlay" id="note-modal" onclick="if(event.target===this)closeNoteModal()">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeNoteModal()">✕</button>
+    <div style="font-size:14px;font-weight:700;margin-bottom:4px">📝 Nota personal</div>
+    <div style="font-size:12px;color:var(--t3);margin-bottom:14px" id="note-modal-sub">Ticker</div>
+    <textarea id="note-textarea" placeholder="Escribe tu análisis, motivo de entrada, alertas personales..."></textarea>
+    <div style="display:flex;gap:10px;margin-top:12px;justify-content:flex-end">
+      <button onclick="deleteNote()" style="background:none;border:1px solid rgba(255,59,92,.3);border-radius:8px;color:var(--red);font-size:12px;padding:7px 14px;cursor:pointer;font-family:inherit">Borrar</button>
+      <button onclick="closeNoteModal()" style="background:none;border:1px solid var(--b1);border-radius:8px;color:var(--t2);font-size:12px;padding:7px 14px;cursor:pointer;font-family:inherit">Cancelar</button>
+      <button onclick="saveNote()" style="background:var(--blue);border:none;border-radius:8px;color:#fff;font-size:13px;font-weight:600;padding:7px 18px;cursor:pointer;font-family:inherit">Guardar ✓</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── Tab navigation ──────────────────────────────────────────────────
 function goTab(name) {
@@ -2415,7 +2508,116 @@ function closeTickerModal() {
   document.getElementById('ticker-modal').classList.remove('open');
   document.body.style.overflow = '';
 }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTickerModal(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeTickerModal(); closeNoteModal(); }
+});
+
+// ── Buscador señales ─────────────────────────────────────────────────
+function filterSignals(q) {
+  q = q.toLowerCase().trim();
+  const tbody = document.getElementById('signals-tbody');
+  if (!tbody) return;
+  let vis = 0;
+  tbody.querySelectorAll('tr').forEach(row => {
+    const match = !q || row.textContent.toLowerCase().includes(q);
+    row.style.display = match ? '' : 'none';
+    if (match) vis++;
+  });
+  const ct = document.getElementById('signals-count');
+  if (ct) ct.textContent = vis + ' señal' + (vis !== 1 ? 'es' : '');
+}
+
+// ── Ordenar columnas ─────────────────────────────────────────────────
+const _sortState = {};
+function sortTable(th, col) {
+  const tbody = document.getElementById('signals-tbody');
+  if (!tbody) return;
+  const dir = _sortState[col] === 'asc' ? 'desc' : 'asc';
+  _sortState[col] = dir;
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  rows.sort((a, b) => {
+    const av = a.cells[col] ? a.cells[col].textContent.trim() : '';
+    const bv = b.cells[col] ? b.cells[col].textContent.trim() : '';
+    const an = parseFloat(av.replace(/[^0-9.\-]/g, ''));
+    const bn = parseFloat(bv.replace(/[^0-9.\-]/g, ''));
+    if (!isNaN(an) && !isNaN(bn)) return dir === 'asc' ? an - bn : bn - an;
+    return dir === 'asc' ? av.localeCompare(bv, 'es') : bv.localeCompare(av, 'es');
+  });
+  rows.forEach(r => tbody.appendChild(r));
+  th.closest('thead').querySelectorAll('th').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+  th.classList.add('sort-' + dir);
+}
+
+// ── Pins (localStorage) ──────────────────────────────────────────────
+function togglePin(pkey, btn) {
+  const isPinned = !!localStorage.getItem(pkey);
+  if (isPinned) localStorage.removeItem(pkey);
+  else          localStorage.setItem(pkey, '1');
+  loadPins();
+}
+function loadPins() {
+  const tbody = document.getElementById('signals-tbody');
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  const pinned = [], unpinned = [];
+  rows.forEach(row => {
+    const pkey = row.getAttribute('data-pin-key');
+    const btn  = row.querySelector('[data-pin-btn]');
+    const on   = pkey && !!localStorage.getItem(pkey);
+    if (on) {
+      pinned.push(row);
+      row.classList.add('pin-row');
+      if (btn) { btn.textContent = '📌'; btn.classList.add('pinned'); }
+    } else {
+      unpinned.push(row);
+      row.classList.remove('pin-row');
+      if (btn) { btn.textContent = '⭐'; btn.classList.remove('pinned'); }
+    }
+  });
+  [...pinned, ...unpinned].forEach(r => tbody.appendChild(r));
+}
+
+// ── Notas (localStorage) ─────────────────────────────────────────────
+let _curNoteKey = '';
+function openNoteModal(ticker, date) {
+  _curNoteKey = 'sbp_note_' + ticker + '_' + date;
+  document.getElementById('note-modal-sub').textContent = ticker + (date ? ' · ' + date : '');
+  document.getElementById('note-textarea').value = localStorage.getItem(_curNoteKey) || '';
+  document.getElementById('note-modal').classList.add('open');
+  document.getElementById('note-textarea').focus();
+  document.body.style.overflow = 'hidden';
+}
+function closeNoteModal() {
+  document.getElementById('note-modal').classList.remove('open');
+  document.body.style.overflow = '';
+}
+function saveNote() {
+  const val = document.getElementById('note-textarea').value.trim();
+  if (val) localStorage.setItem(_curNoteKey, val);
+  else     localStorage.removeItem(_curNoteKey);
+  closeNoteModal();
+  loadNoteBadges();
+  showToast('📝 Nota guardada', 'success', 2500);
+}
+function deleteNote() {
+  localStorage.removeItem(_curNoteKey);
+  closeNoteModal();
+  loadNoteBadges();
+}
+function loadNoteBadges() {
+  document.querySelectorAll('[data-note-btn]').forEach(btn => {
+    const nkey = btn.getAttribute('data-note-key');
+    const note = nkey ? localStorage.getItem(nkey) : null;
+    if (note) { btn.textContent = '🗒️'; btn.classList.add('noted'); btn.title = note.substring(0, 80); }
+    else       { btn.textContent = '📝'; btn.classList.remove('noted'); btn.title = 'Añadir nota'; }
+  });
+}
+
+// Init Ronda 3 on load
+document.addEventListener('DOMContentLoaded', () => {
+  loadPins();
+  loadNoteBadges();
+});
 
 // ── Historial expandible ─────────────────────────────────────────────
 function toggleHist(rowEl) {
