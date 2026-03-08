@@ -505,6 +505,40 @@ def build_payload():
     spy_step = spy_mom / n_trades if n_trades else 0
     spy_data = [round(i * spy_step, 1) for i in range(len(bot_data))]
 
+    # ── Monthly performance (last 12 months) ────────────────────────────
+    _monthly_perf = {}
+    for p in preds:
+        if p.get("result") in ("win", "loss") and p.get("date"):
+            try:
+                _d = datetime.fromisoformat(p["date"][:10]).date()
+                _mk = f"{_d.year}-{_d.month:02d}"
+                ep = p.get("entry", 0) or 0
+                xp = p.get("exit_price", 0) or 0
+                pl_v = 0.0
+                if ep and xp:
+                    raw = (xp - ep) / ep * 100
+                    pl_v = round(raw if p.get("signal") == "COMPRAR" else -raw, 1)
+                if _mk not in _monthly_perf:
+                    _monthly_perf[_mk] = {"pl": 0.0, "w": 0, "l": 0, "label": _d.strftime("%b %y")}
+                _monthly_perf[_mk]["w" if p["result"] == "win" else "l"] += 1
+                _monthly_perf[_mk]["pl"] = round(_monthly_perf[_mk]["pl"] + pl_v, 1)
+            except Exception:
+                pass
+    monthly_perf = dict(sorted(_monthly_perf.items())[-12:])
+
+    # ── P/L per trade (last 30 resolved) ────────────────────────────────
+    pl_per_trade = []
+    for p in sorted(
+        [p for p in preds if p.get("result") in ("win", "loss") and p.get("date")],
+        key=lambda x: x.get("date", ""))[-30:]:
+        ep = p.get("entry", 0) or 0
+        xp = p.get("exit_price", 0) or 0
+        pl_v = 0.0
+        if ep and xp:
+            raw = (xp - ep) / ep * 100
+            pl_v = round(raw if p.get("signal") == "COMPRAR" else -raw, 1)
+        pl_per_trade.append({"ticker": p.get("ticker", "")[:6], "pl": pl_v, "result": p.get("result", "")})
+
     return {
         "pending":        pending,
         "recent":         recent,
@@ -559,6 +593,9 @@ def build_payload():
         "tm_trades":        tm_trades,
         "tm_max_days":      tm_max_days,
         "earnings_upcoming": earnings_upcoming,
+        "monthly_perf":     monthly_perf,
+        "pl_per_trade":     pl_per_trade,
+        "n_bot_trades":     n_trades,
     }
 
 
@@ -1101,6 +1138,9 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
     <button class="nav-tab" data-tab="macro" onclick="goTab('macro')">
       <span class="icon">🌍</span> Macro
     </button>
+    <button class="nav-tab" data-tab="charts" onclick="goTab('charts')">
+      <span class="icon">📊</span> Gráficos
+    </button>
   </div>
 
   <div class="nav-right">
@@ -1300,16 +1340,6 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
       <div class="sr"><span class="sr-label">Actualizado</span><span class="sr-val" style="font-size:11px;color:var(--t3)" id="dash-updated">{{ updated }}</span></div>
     </div>
   </div>
-
-  <!-- BOT vs SPY CHART -->
-  {% if wins + losses > 0 %}
-  <div class="section">
-    <div class="sh">📈 Bot vs SPY — P/L acumulado (últimas {{ bot_data|length - 1 }} operaciones)</div>
-    <div class="card">
-      <div class="bvs-box"><canvas id="botVsSpy"></canvas></div>
-    </div>
-  </div>
-  {% endif %}
 
   <!-- SEÑALES ACTIVAS (preview en dashboard) -->
   <div class="section">
@@ -1718,27 +1748,6 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
 <!-- ════════════════════════════════════════════════════ TAB: ANÁLISIS -->
 <div class="tab-panel" id="tab-analysis">
 
-  <!-- ── TIME MACHINE ── -->
-  <div class="card" style="margin-bottom:24px">
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
-      <span style="font-size:22px">⏪</span>
-      <div>
-        <div style="font-size:13px;font-weight:700;color:var(--t1)">Time Machine</div>
-        <div style="font-size:11px;color:var(--t3)">Arrastra para ver el rendimiento del bot en cualquier fecha pasada</div>
-      </div>
-      <span id="tm-date-lbl" style="margin-left:auto;font-size:12px;font-weight:600;color:var(--green);background:var(--g2);border:1px solid rgba(0,224,122,.2);border-radius:6px;padding:4px 12px;white-space:nowrap">Hoy</span>
-    </div>
-    <div class="tm-wrap">
-      <input type="range" class="tm-slider" id="tm-slider" min="0" max="{{ tm_max_days }}" value="0" oninput="updateTimeMachine(this.value)">
-    </div>
-    <div class="tm-stats">
-      <div class="tm-stat"><div class="tm-val col-blue" id="tm-total">{{ wins + losses }}</div><div class="tm-lbl">Operaciones</div></div>
-      <div class="tm-stat"><div class="tm-val col-green" id="tm-wins">{{ wins }}</div><div class="tm-lbl">Wins</div></div>
-      <div class="tm-stat"><div class="tm-val col-red" id="tm-losses">{{ losses }}</div><div class="tm-lbl">Losses</div></div>
-      <div class="tm-stat"><div class="tm-val col-blue" id="tm-acc">{{ accuracy }}%</div><div class="tm-lbl">Precisión</div></div>
-    </div>
-  </div>
-
   <!-- ── KPIs de rendimiento ── -->
   <div class="sum-row" style="margin-bottom:24px">
     <div class="sum-card" style="border-color:rgba(0,224,122,.2)">
@@ -1877,6 +1886,113 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
   </div>
   {% endif %}
 
+  <!-- ── Gráfica donut + historial resumido ── -->
+  <div class="g2">
+    <div class="card">
+      <div class="card-title">📊 Distribución de resultados</div>
+      {% if wins + losses > 0 %}
+      <div class="chart-box" style="height:180px"><canvas id="donutAnalysis"></canvas></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px">
+        <div style="background:rgba(0,224,122,.06);border:1px solid rgba(0,224,122,.15);border-radius:8px;padding:12px;text-align:center">
+          <div style="font-size:24px;font-weight:800;color:var(--green)">{{ wins }}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">WINS ✓</div>
+        </div>
+        <div style="background:rgba(255,59,92,.06);border:1px solid rgba(255,59,92,.15);border-radius:8px;padding:12px;text-align:center">
+          <div style="font-size:24px;font-weight:800;color:var(--red)">{{ losses }}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">LOSSES ✗</div>
+        </div>
+      </div>
+      {% else %}
+      <div class="empty"><span class="ei">📊</span><p>Sin datos resueltos</p></div>
+      {% endif %}
+    </div>
+    <div class="card">
+      <div class="card-title">📅 Últimas 5 operaciones resueltas</div>
+      {% if recent %}
+      {% for p in recent[:5] %}
+      <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(26,36,64,.4)">
+        <span class="tk-link" style="font-weight:700;font-size:14px;min-width:52px" onclick="openTickerModal('{{ p.ticker }}')">{{ p.ticker }}</span>
+        {% if p.result == 'win' %}<span class="badge b-win">✓ WIN</span>{% else %}<span class="badge b-loss">✗ LOSS</span>{% endif %}
+        <div style="flex:1">
+          <div style="font-size:11px;color:var(--t3)">${{ "%.2f"|format(p.entry|float) }} → {% if p.exit_price %}${{ "%.2f"|format(p.exit_price|float) }}{% else %}—{% endif %}</div>
+          <div style="font-size:10px;color:var(--t3)">{{ p.exit_reason_label }} · {{ p.date[:10] if p.date else '' }}</div>
+        </div>
+        {% if p.pl_pct is not none %}
+        <span style="font-weight:700;color:{% if p.pl_pct >= 0 %}var(--green){% else %}var(--red){% endif %}">{{ "%+.1f"|format(p.pl_pct) }}%</span>
+        {% endif %}
+      </div>
+      {% endfor %}
+      {% else %}
+      <div class="empty"><span class="ei">📋</span><p>Sin historial aún</p></div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+<!-- /analysis -->
+
+
+<!-- ════════════════════════════════════════════════════ TAB: CHARTS -->
+<div class="tab-panel" id="tab-charts">
+
+  <!-- ── Bot vs SPY ── -->
+  {% set bvs_n = n_bot_trades %}
+  {% if bvs_n >= 3 %}
+  <div class="section">
+    <div class="sh">📈 Bot vs SPY — P/L acumulado (últimas {{ bvs_n }} {{ 'operación' if bvs_n == 1 else 'operaciones' }})</div>
+    <div class="card">
+      <div style="font-size:12px;color:var(--t3);margin-bottom:12px">Comparativa del P/L acumulado del bot frente a SPY en el mismo período. La línea verde es el rendimiento real del bot; la azul punteada es el benchmark de SPY.</div>
+      <div class="bvs-box"><canvas id="botVsSpy"></canvas></div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- ── P/L mensual ── -->
+  {% if monthly_perf %}
+  <div class="section">
+    <div class="sh">📆 P/L acumulado por mes</div>
+    <div class="card">
+      <div style="font-size:12px;color:var(--t3);margin-bottom:12px">Suma de P/L % de todas las operaciones cerradas por mes.</div>
+      <div class="bvs-box" style="height:200px"><canvas id="monthlyPerfChart"></canvas></div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- ── P/L por operación ── -->
+  {% if pl_per_trade %}
+  <div class="section">
+    <div class="sh">🎯 P/L por operación (últimas {{ pl_per_trade|length }})</div>
+    <div class="card">
+      <div style="font-size:12px;color:var(--t3);margin-bottom:12px">P/L % de cada operación resuelta. Verde = WIN, rojo = LOSS.</div>
+      <div class="bvs-box" style="height:200px"><canvas id="plPerTradeChart"></canvas></div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- ── Time Machine ── -->
+  <div class="section">
+    <div class="sh">⏪ Time Machine</div>
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+        <span style="font-size:22px">⏪</span>
+        <div>
+          <div style="font-size:13px;font-weight:700;color:var(--t1)">Viaja al pasado</div>
+          <div style="font-size:11px;color:var(--t3)">Arrastra para ver el rendimiento del bot en cualquier fecha pasada</div>
+        </div>
+        <span id="tm-date-lbl" style="margin-left:auto;font-size:12px;font-weight:600;color:var(--green);background:var(--g2);border:1px solid rgba(0,224,122,.2);border-radius:6px;padding:4px 12px;white-space:nowrap">Hoy</span>
+      </div>
+      <div class="tm-wrap">
+        <input type="range" class="tm-slider" id="tm-slider" min="0" max="{{ tm_max_days }}" value="0" oninput="updateTimeMachine(this.value)">
+      </div>
+      <div class="tm-stats">
+        <div class="tm-stat"><div class="tm-val col-blue" id="tm-total">{{ wins + losses }}</div><div class="tm-lbl">Operaciones</div></div>
+        <div class="tm-stat"><div class="tm-val col-green" id="tm-wins">{{ wins }}</div><div class="tm-lbl">Wins</div></div>
+        <div class="tm-stat"><div class="tm-val col-red" id="tm-losses">{{ losses }}</div><div class="tm-lbl">Losses</div></div>
+        <div class="tm-stat"><div class="tm-val col-blue" id="tm-acc">{{ accuracy }}%</div><div class="tm-lbl">Precisión</div></div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Detección de patrones ── -->
   <div class="sh">🔍 Detección de patrones automática</div>
   <div class="g2" style="margin-bottom:24px">
@@ -1942,50 +2058,32 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
     {% endif %}
   </div>
 
-  <!-- ── Gráfica donut + historial resumido ── -->
-  <div class="g2">
-    <div class="card">
-      <div class="card-title">📊 Distribución de resultados</div>
-      {% if wins + losses > 0 %}
-      <div class="chart-box" style="height:180px"><canvas id="donutAnalysis"></canvas></div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px">
-        <div style="background:rgba(0,224,122,.06);border:1px solid rgba(0,224,122,.15);border-radius:8px;padding:12px;text-align:center">
-          <div style="font-size:24px;font-weight:800;color:var(--green)">{{ wins }}</div>
-          <div style="font-size:11px;color:var(--t3);margin-top:2px">WINS ✓</div>
+  <!-- ── Calendario de earnings ── -->
+  <div class="sh">📅 Calendario de earnings — señales activas</div>
+  <div class="card" style="margin-bottom:24px">
+    {% if earnings_upcoming %}
+    <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Próximas fechas de presentación de resultados de tus señales activas. ⚠️ indica que el earnings cae dentro de la ventana activa de la señal.</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px">
+      {% for e in earnings_upcoming %}
+      <div style="display:flex;flex-direction:column;gap:4px;background:var(--s2);border:1px solid {% if e.during %}rgba(155,109,255,.35){% else %}var(--b1){% endif %};border-radius:10px;padding:12px 14px">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span class="tk-link" onclick="openTickerModal('{{ e.ticker }}')" style="font-weight:700;font-size:15px">{{ e.ticker }}</span>
+          {% if e.during %}<span style="font-size:10px;background:rgba(155,109,255,.15);color:#9b6dff;border:1px solid rgba(155,109,255,.3);border-radius:5px;padding:2px 7px">⚠️ Activo</span>{% endif %}
         </div>
-        <div style="background:rgba(255,59,92,.06);border:1px solid rgba(255,59,92,.15);border-radius:8px;padding:12px;text-align:center">
-          <div style="font-size:24px;font-weight:800;color:var(--red)">{{ losses }}</div>
-          <div style="font-size:11px;color:var(--t3);margin-top:2px">LOSSES ✗</div>
+        <div style="font-size:12px;color:var(--t2)">{{ e.date }}</div>
+        <div style="font-size:11px;color:var(--t3)">
+          {% if e.signal == 'COMPRAR' %}📈 Comprar{% else %}📉 Vender{% endif %}
         </div>
-      </div>
-      {% else %}
-      <div class="empty"><span class="ei">📊</span><p>Sin datos resueltos</p></div>
-      {% endif %}
-    </div>
-    <div class="card">
-      <div class="card-title">📅 Últimas 5 operaciones resueltas</div>
-      {% if recent %}
-      {% for p in recent[:5] %}
-      <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(26,36,64,.4)">
-        <span class="tk-link" style="font-weight:700;font-size:14px;min-width:52px" onclick="openTickerModal('{{ p.ticker }}')">{{ p.ticker }}</span>
-        {% if p.result == 'win' %}<span class="badge b-win">✓ WIN</span>{% else %}<span class="badge b-loss">✗ LOSS</span>{% endif %}
-        <div style="flex:1">
-          <div style="font-size:11px;color:var(--t3)">${{ "%.2f"|format(p.entry|float) }} → {% if p.exit_price %}${{ "%.2f"|format(p.exit_price|float) }}{% else %}—{% endif %}</div>
-          <div style="font-size:10px;color:var(--t3)">{{ p.exit_reason_label }} · {{ p.date[:10] if p.date else '' }}</div>
-        </div>
-        {% if p.pl_pct is not none %}
-        <span style="font-weight:700;color:{% if p.pl_pct >= 0 %}var(--green){% else %}var(--red){% endif %}">{{ "%+.1f"|format(p.pl_pct) }}%</span>
-        {% endif %}
       </div>
       {% endfor %}
-      {% else %}
-      <div class="empty"><span class="ei">📋</span><p>Sin historial aún</p></div>
-      {% endif %}
     </div>
+    {% else %}
+    <div class="empty" style="padding:32px"><span class="ei">📅</span><p>Sin earnings próximos en señales activas</p></div>
+    {% endif %}
   </div>
 
 </div>
-<!-- /analysis -->
+<!-- /charts -->
 
 
 <!-- ════════════════════════════════════════════════════ TAB: MACRO -->
@@ -2273,8 +2371,8 @@ if (ctx2) {
 }
 {% endif %}
 
-// ── Bot vs SPY chart ─────────────────────────────────────────────────
-{% if wins + losses > 0 and bot_data|length > 1 %}
+// ── Bot vs SPY chart (Gráficos tab) ─────────────────────────────────
+{% if n_bot_trades >= 3 and bot_data|length > 1 %}
 const ctxBvS = document.getElementById('botVsSpy');
 if (ctxBvS) {
   new Chart(ctxBvS.getContext('2d'), {
@@ -2317,6 +2415,76 @@ if (ctxBvS) {
       scales: {
         x: { ticks: { color: '#4a5a72', font: { size: 10 } }, grid: { color: 'rgba(30,45,68,.4)' } },
         y: { ticks: { color: '#4a5a72', font: { size: 10 }, callback: v => (v >= 0 ? '+' : '') + v + '%' }, grid: { color: 'rgba(30,45,68,.4)' }, zero: true }
+      }
+    }
+  });
+}
+{% endif %}
+
+// ── Monthly P/L bar chart ────────────────────────────────────────────
+{% if monthly_perf %}
+const ctxMP = document.getElementById('monthlyPerfChart');
+if (ctxMP) {
+  const mpLabels = {{ monthly_perf.values()|map(attribute='label')|list|tojson }};
+  const mpData   = {{ monthly_perf.values()|map(attribute='pl')|list|tojson }};
+  new Chart(ctxMP.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: mpLabels,
+      datasets: [{
+        label: 'P/L mensual %',
+        data: mpData,
+        backgroundColor: mpData.map(v => v >= 0 ? 'rgba(0,224,122,.6)' : 'rgba(255,59,92,.6)'),
+        borderColor:     mpData.map(v => v >= 0 ? '#00e07a' : '#ff3b5c'),
+        borderWidth: 1.5,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: c => ` ${c.parsed.y >= 0 ? '+' : ''}${c.parsed.y}%` } }
+      },
+      scales: {
+        x: { ticks: { color: '#4a5a72', font: { size: 10 } }, grid: { color: 'rgba(30,45,68,.4)' } },
+        y: { ticks: { color: '#4a5a72', font: { size: 10 }, callback: v => (v >= 0 ? '+' : '') + v + '%' }, grid: { color: 'rgba(30,45,68,.4)' } }
+      }
+    }
+  });
+}
+{% endif %}
+
+// ── P/L per trade bar chart ──────────────────────────────────────────
+{% if pl_per_trade %}
+const ctxPT = document.getElementById('plPerTradeChart');
+if (ctxPT) {
+  const ptLabels = {{ pl_per_trade|map(attribute='ticker')|list|tojson }};
+  const ptData   = {{ pl_per_trade|map(attribute='pl')|list|tojson }};
+  new Chart(ctxPT.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: ptLabels,
+      datasets: [{
+        label: 'P/L %',
+        data: ptData,
+        backgroundColor: ptData.map(v => v >= 0 ? 'rgba(0,224,122,.6)' : 'rgba(255,59,92,.6)'),
+        borderColor:     ptData.map(v => v >= 0 ? '#00e07a' : '#ff3b5c'),
+        borderWidth: 1.5,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: c => ` ${c.parsed.y >= 0 ? '+' : ''}${c.parsed.y}%` } }
+      },
+      scales: {
+        x: { ticks: { color: '#4a5a72', font: { size: 10 }, maxRotation: 45 }, grid: { color: 'rgba(30,45,68,.4)' } },
+        y: { ticks: { color: '#4a5a72', font: { size: 10 }, callback: v => (v >= 0 ? '+' : '') + v + '%' }, grid: { color: 'rgba(30,45,68,.4)' } }
       }
     }
   });
