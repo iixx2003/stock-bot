@@ -2,7 +2,7 @@
 
 from flask import Flask, render_template_string, session, redirect, url_for, request, jsonify
 import json, os, time, threading
-from datetime import datetime
+from datetime import datetime, timedelta, date as _dt_date
 import pytz
 
 try:
@@ -15,6 +15,11 @@ except ImportError:
 _price_cache = {}
 _price_lock  = threading.Lock()
 _PRICE_TTL   = 180   # 3 min
+
+# Caché de earnings: ticker → (date_str_or_None, timestamp)
+_earnings_cache = {}
+_earnings_lock  = threading.Lock()
+_EARNINGS_TTL   = 3600  # 1 h
 
 app = Flask(__name__)
 app.secret_key = "stk_web_2026_xK9mP_secreto"
@@ -72,6 +77,37 @@ def _fetch_price(ticker):
         return None, None
 
 
+def _fetch_earnings_date(ticker):
+    """Próxima fecha de earnings (YYYY-MM-DD) o None. Caché 1 h."""
+    now_ts = time.time()
+    with _earnings_lock:
+        cached = _earnings_cache.get(ticker)
+        if cached is not None and now_ts - cached[1] < _EARNINGS_TTL:
+            return cached[0]
+    result = None
+    if _HAS_YF:
+        try:
+            today = _dt_date.today()
+            t = yf.Ticker(ticker)
+            # earnings_dates es un DataFrame con índice DatetimeTZ
+            ef = t.earnings_dates
+            if ef is not None and not ef.empty:
+                future = [idx for idx in ef.index if idx.date() >= today]
+                if future:
+                    result = str(sorted(future)[0])[:10]
+            if result is None:
+                cal = t.calendar
+                if isinstance(cal, dict):
+                    ed = cal.get("Earnings Date")
+                    if ed:
+                        result = str(ed[0] if isinstance(ed, (list, tuple)) else ed)[:10]
+        except Exception:
+            pass
+    with _earnings_lock:
+        _earnings_cache[ticker] = (result, now_ts)
+    return result
+
+
 def _days_elapsed(date_str):
     if not date_str:
         return 0
@@ -122,6 +158,20 @@ def build_payload():
         p["days_elapsed"]   = days
         p["days_remaining"] = max(0, 30 - days)
         p["target_pct"]     = round((target - entry) / entry * 100, 1) if entry > 0 and target > 0 else None
+
+        # Earnings durante el período de la señal
+        ed_str = _fetch_earnings_date(p.get("ticker", ""))
+        p["earnings_date"] = None
+        p["earnings_during"] = False
+        if ed_str:
+            try:
+                edate = _dt_date.fromisoformat(ed_str)
+                today = _dt_date.today()
+                end_of_signal = today + timedelta(days=p["days_remaining"])
+                p["earnings_date"] = ed_str
+                p["earnings_during"] = today <= edate <= end_of_signal
+            except Exception:
+                pass
 
         # Precio actual + % cambio desde entrada
         cur_price, cur_chg = _fetch_price(p.get("ticker", ""))
@@ -462,7 +512,7 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
 @media(max-width:700px){.kpi-grid{grid-template-columns:repeat(2,1fr)}}
 .kpi{
   background:var(--s1);border:1px solid var(--b1);border-radius:var(--r);
-  padding:18px 18px 16px;position:relative;overflow:hidden;
+  padding:18px 18px 16px;position:relative;
   transition:border-color .2s,transform .15s;cursor:default;
 }
 .kpi:hover{transform:translateY(-1px)}
@@ -640,6 +690,25 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 .mkt-closed {background:rgba(255,255,255,.05);color:var(--t3)}
 .mkt-weekend{background:rgba(255,255,255,.04);color:var(--t3)}
 
+/* ── HISTORIAL EXPANDIBLE ── */
+.hist-row{cursor:pointer}
+.hist-row:hover td{background:rgba(255,255,255,.025)!important}
+.hist-row.open td{background:rgba(61,142,248,.04)!important}
+.hist-row .exp-icon{font-size:10px;color:var(--t3);display:inline-block;transition:transform .2s;margin-left:4px}
+.hist-row.open .exp-icon{transform:rotate(90deg)}
+.hist-detail-row td{padding:0!important;border-bottom:1px solid var(--b1)!important}
+.hist-detail-inner{
+  display:none;padding:14px 20px;
+  background:rgba(10,16,28,.6);
+  font-size:12px;color:var(--t2);line-height:1.75;
+  border-top:1px solid rgba(61,142,248,.15);
+}
+.hist-detail-inner.open{display:block}
+.hist-detail-inner b{color:var(--t1)}
+.b-earn-sm{display:inline-flex;align-items:center;gap:3px;font-size:10px;font-weight:700;
+  padding:2px 6px;border-radius:4px;background:var(--pd);color:var(--purple);
+  border:1px solid rgba(155,109,255,.25);vertical-align:middle;white-space:nowrap}
+
 /* ── FOOTER ── */
 .footer{
   text-align:center;color:var(--t3);font-size:11px;
@@ -710,14 +779,14 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
   <div class="kpi-grid">
 
     <!-- Régimen -->
-    <div class="kpi {% if regime=='BEAR' %}red{% elif regime=='BULL' %}green{% else %}yellow{% endif %} has-tooltip">
+    <div class="kpi {% if regime=='BEAR' %}red{% elif regime=='BULL' %}green{% else %}yellow{% endif %} has-tooltip" id="kpi-regime-card">
       <div class="kpi-accent"></div>
       <div class="kpi-label">Régimen de mercado</div>
-      <div class="kpi-val col-{% if regime=='BEAR' %}red{% elif regime=='BULL' %}green{% else %}yellow{% endif %}">
+      <div id="kpi-regime-val" class="kpi-val col-{% if regime=='BEAR' %}red{% elif regime=='BULL' %}green{% else %}yellow{% endif %}">
         {{ regime }}
         <span class="badge b-{% if regime=='BEAR' %}bear{% elif regime=='BULL' %}bull{% else %}lat{% endif %}" style="font-size:11px;vertical-align:middle;margin-left:4px">{{ regime_str }}%</span>
       </div>
-      <div class="kpi-sub">SPY <b>{{ "%+.1f"|format(spy_mom3m) }}%</b> en 3 meses</div>
+      <div id="kpi-regime-sub" class="kpi-sub">SPY <b>{{ "%+.1f"|format(spy_mom3m) }}%</b> en 3 meses</div>
       <div class="tooltip" style="min-width:240px">
         <div style="font-weight:700;margin-bottom:8px;font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--t3)">Regímenes de mercado</div>
         <div class="tt-row" style="margin-bottom:6px"><span class="tt-label col-green">🐂 BULL</span></div>
@@ -737,9 +806,9 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
     <div class="kpi {% if fear_greed < 45 %}red{% elif fear_greed > 55 %}green{% else %}yellow{% endif %} has-tooltip">
       <div class="kpi-accent"></div>
       <div class="kpi-label">Fear &amp; Greed</div>
-      <div class="kpi-val" style="color:{{ fg_color }}">{{ fear_greed }}<span style="font-size:14px;font-weight:400;opacity:.7">/100</span></div>
-      <div class="fg-bar"><div class="fg-fill" style="width:{{ fear_greed }}%;background:{{ fg_color }}"></div></div>
-      <div class="kpi-sub">{{ fg_label }}</div>
+      <div id="kpi-fg-val" class="kpi-val" style="color:{{ fg_color }}">{{ fear_greed }}<span style="font-size:14px;font-weight:400;opacity:.7">/100</span></div>
+      <div class="fg-bar"><div id="kpi-fg-fill" class="fg-fill" style="width:{{ fear_greed }}%;background:{{ fg_color }}"></div></div>
+      <div id="kpi-fg-sub" class="kpi-sub">{{ fg_label }}</div>
       <div class="tooltip">
         <div style="font-weight:700;margin-bottom:8px;font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--t3)">Escala Fear &amp; Greed</div>
         <div class="tt-row"><span class="tt-range col-red">0 – 24</span><span class="tt-label">😱 Miedo Extremo</span></div>
@@ -757,8 +826,8 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
     <div class="kpi {% if vix > 30 %}red{% elif vix > 20 %}yellow{% else %}green{% endif %} has-tooltip">
       <div class="kpi-accent"></div>
       <div class="kpi-label">VIX — Volatilidad</div>
-      <div class="kpi-val col-{% if vix > 30 %}red{% elif vix > 20 %}yellow{% else %}green{% endif %}">{{ vix }}</div>
-      <div class="kpi-sub">
+      <div id="kpi-vix-val" class="kpi-val col-{% if vix > 30 %}red{% elif vix > 20 %}yellow{% else %}green{% endif %}">{{ vix }}</div>
+      <div id="kpi-vix-sub" class="kpi-sub">
         {% if vix > 35 %}🔴 Pánico de mercado
         {% elif vix > 25 %}🟠 Alta volatilidad
         {% elif vix > 18 %}🟡 Volatilidad elevada
@@ -782,12 +851,12 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
     <div class="kpi {% if market_status in ('weekend','closed','premarket') %}{% elif sp500 < 0 %}red{% else %}green{% endif %}">
       <div class="kpi-accent"></div>
       <div class="kpi-label">S&amp;P 500</div>
-      <div class="kpi-val
+      <div id="kpi-sp500-val" class="kpi-val
         {% if market_status in ('weekend','closed') %}col-{% else %}{% if sp500 < 0 %}col-red{% else %}col-green{% endif %}{% endif %}"
         style="{% if market_status in ('weekend','closed','premarket') %}color:var(--t3);font-size:20px{% endif %}">
         {{ sp500_display }}
       </div>
-      <div class="kpi-sub">
+      <div id="kpi-sp500-sub" class="kpi-sub">
         {% if market_status == 'open' %}
           <span class="mkt-badge mkt-open">● Abierto</span>
         {% elif market_status == 'premarket' %}
@@ -804,8 +873,8 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
     <div class="kpi blue">
       <div class="kpi-accent" style="background:linear-gradient(90deg,var(--blue),transparent)"></div>
       <div class="kpi-label">Precisión global</div>
-      <div class="kpi-val col-blue">{{ accuracy }}%</div>
-      <div class="kpi-sub">
+      <div id="kpi-acc-val" class="kpi-val col-blue">{{ accuracy }}%</div>
+      <div id="kpi-acc-sub" class="kpi-sub">
         <span style="color:var(--green)">{{ wins }}✓</span> ·
         <span style="color:var(--red)">{{ losses }}✗</span> ·
         <span style="color:var(--yellow)">{{ pending_ct }} pend.</span>
@@ -974,6 +1043,7 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
             <th>Stop</th>
             <th>Confianza</th>
             <th>Progreso al objetivo</th>
+            <th>Earnings</th>
             <th>Sector</th>
             <th>Días rest.</th>
           </tr>
@@ -1058,6 +1128,15 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
                 {% else %}—{% endif %}
               </div>
             </td>
+            <td>
+              {% if p.earnings_during %}
+                <span class="b-earn-sm">📅 {{ p.earnings_date }}</span>
+              {% elif p.earnings_date %}
+                <span style="font-size:10px;color:var(--t3)">{{ p.earnings_date }}</span>
+              {% else %}
+                <span style="color:var(--t3)">—</span>
+              {% endif %}
+            </td>
             <td style="font-size:12px">
               {% if p.sector and p.sector != 'Unknown' %}<span style="color:var(--t1)">{{ p.sector }}</span>
               {% else %}<span style="color:var(--t3)">—</span>{% endif %}
@@ -1096,18 +1175,34 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
   </div>
 
   {% if recent %}
+  <div style="font-size:11px;color:var(--t3);margin-bottom:10px">Haz clic en cualquier fila para ver el análisis completo de la operación.</div>
   <div class="card">
     <div class="tw">
       <table>
         <thead>
           <tr>
+            <th></th>
             <th>Ticker</th><th>Señal</th><th>Resultado</th><th>Motivo</th>
-            <th>Entrada → Salida</th><th>P/L</th><th>Tipo</th><th>Sector</th><th>Días</th><th>Fecha</th>
+            <th class="has-tooltip" style="cursor:help">
+              Entrada → Salida
+              <span style="color:var(--t3);font-size:9px;margin-left:3px">ℹ</span>
+              <div class="tooltip" style="min-width:280px;text-align:left">
+                <div style="font-weight:700;margin-bottom:6px;font-size:11px;letter-spacing:.4px;text-transform:uppercase;color:var(--t3)">¿Qué significan estos precios?</div>
+                <div class="tt-row" style="margin-bottom:4px"><span class="badge b-buy" style="font-size:10px">📈 COMPRAR</span></div>
+                <div style="font-size:11px;color:var(--t2);margin-bottom:10px;line-height:1.5">Entrada = precio al que compras. Salida = precio al que vendiste (objetivo o stop). Si el precio sube, ganas.</div>
+                <div class="tt-row" style="margin-bottom:4px"><span class="badge b-sell" style="font-size:10px">📉 VENDER</span></div>
+                <div style="font-size:11px;color:var(--t2);line-height:1.5">Entrada = precio al que vendes en corto (short). Salida = precio al que recompras. Si el precio baja, ganas. Si sube, pierdes.</div>
+              </div>
+            </th>
+            <th>P/L</th><th>Tipo</th><th>Sector</th><th>Días</th><th>Fecha</th>
           </tr>
         </thead>
         <tbody>
           {% for p in recent %}
-          <tr>
+          {% set er = p.exit_reason_label %}
+          {% set st = p.get('signal_type','NORMAL') %}
+          <tr class="hist-row" onclick="toggleHist(this)">
+            <td style="width:20px;padding-right:6px"><span class="exp-icon">▶</span></td>
             <td><span class="tk">{{ p.ticker }}</span></td>
             <td>
               {% if p.signal == 'COMPRAR' %}<span class="badge b-buy">📈 Comprar</span>
@@ -1118,7 +1213,6 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
               {% else %}<span class="badge b-loss">✗ LOSS</span>{% endif %}
             </td>
             <td>
-              {% set er = p.exit_reason_label %}
               {% if er == 'TARGET' %}<span class="badge b-target">🎯 Target</span>
               {% elif er == 'STOP' %}<span class="badge b-stop">🛑 Stop</span>
               {% else %}<span class="badge b-exp">⏱ Expirada</span>{% endif %}
@@ -1140,7 +1234,6 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
               {% else %}—{% endif %}
             </td>
             <td>
-              {% set st = p.get('signal_type','NORMAL') %}
               {% if st == 'PRE_EARNINGS' %}<span class="badge b-earn">Pre-Earn</span>
               {% elif st == 'SHORT_SQUEEZE' %}<span class="badge b-sq">Squeeze</span>
               {% elif st == 'INSIDER_MASSIVE' %}<span class="badge b-ins">Insider</span>
@@ -1149,6 +1242,46 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
             <td style="font-size:12px;color:var(--t2)">{{ p.sector or '—' }}</td>
             <td style="font-size:12px;color:var(--t3)">{{ p.days_to_result or '—' }}d</td>
             <td style="font-size:11px;color:var(--t3)">{% if p.date %}{{ p.date[:10] }}{% endif %}</td>
+          </tr>
+          <tr class="hist-detail-row">
+            <td colspan="11">
+              <div class="hist-detail-inner">
+                {% if p.signal == 'COMPRAR' %}
+                  <b>Señal COMPRAR (posición larga).</b>
+                  El bot predijo que <b>{{ p.ticker }}</b> subiría desde <b>${{ "%.2f"|format(p.entry|float) }}</b>.
+                  {% if p.target %}Objetivo: <b style="color:var(--green)">${{ "%.2f"|format(p.target|float) }}</b>{% if p.target_pct %} (+{{ p.target_pct }}%){% endif %}.{% endif %}
+                  {% if p.stop %}Stop loss: <b style="color:var(--red)">${{ "%.2f"|format(p.stop|float) }}</b> (protección si baja).{% endif %}
+                  <br>
+                  {% if er == 'TARGET' %}
+                    ✅ <b style="color:var(--green)">El precio alcanzó el objetivo.</b> Se cerró la posición con beneficio en ${{ "%.2f"|format(p.exit_price|float) if p.exit_price else '—' }}.
+                  {% elif er == 'STOP' %}
+                    🛑 <b style="color:var(--red)">El precio bajó hasta el stop loss (${{ "%.2f"|format(p.exit_price|float) if p.exit_price else '—' }}) en lugar de subir.</b>
+                    La posición se cerró automáticamente para limitar pérdidas. P/L: <b style="color:var(--red)">{{ "%+.1f"|format(p.pl_pct) if p.pl_pct else '—' }}%</b>.
+                  {% else %}
+                    ⏱ <b style="color:var(--yellow)">La señal expiró</b> a los {{ p.days_to_result or 30 }} días sin alcanzar objetivo ni stop. Se cerró al precio de mercado.
+                  {% endif %}
+                {% else %}
+                  <b>Señal VENDER (posición corta / short).</b>
+                  El bot predijo que <b>{{ p.ticker }}</b> bajaría desde <b>${{ "%.2f"|format(p.entry|float) }}</b>.
+                  En un short, vendes primero y recompras después: <b>ganas si el precio baja, pierdes si sube.</b>
+                  {% if p.stop %}Stop loss: <b style="color:var(--red)">${{ "%.2f"|format(p.stop|float) }}</b> (se activa si el precio sube hasta aquí).{% endif %}
+                  <br>
+                  {% if er == 'TARGET' %}
+                    ✅ <b style="color:var(--green)">El precio bajó al objetivo.</b> Se recompró con beneficio en ${{ "%.2f"|format(p.exit_price|float) if p.exit_price else '—' }}.
+                  {% elif er == 'STOP' %}
+                    🛑 <b style="color:var(--red)">El precio subió hasta ${{ "%.2f"|format(p.exit_price|float) if p.exit_price else '—' }} (stop loss) en lugar de bajar.</b>
+                    Al subir el precio se recompró más caro de lo que se vendió → pérdida de <b style="color:var(--red)">{{ "%+.1f"|format(p.pl_pct) if p.pl_pct else '—' }}%</b>.
+                  {% else %}
+                    ⏱ <b style="color:var(--yellow)">La señal expiró</b> a los {{ p.days_to_result or 30 }} días sin alcanzar objetivo ni stop.
+                  {% endif %}
+                {% endif %}
+                <span style="color:var(--t3);margin-left:6px">
+                  · Confianza inicial: <b>{{ p.confidence|int if p.confidence else '—' }}%</b>
+                  · Emitida: <b>{{ p.date[:10] if p.date else '—' }}</b>
+                  · Régimen: <b>{{ p.get('regime','?') }}</b>
+                </span>
+              </div>
+            </td>
           </tr>
           {% endfor %}
         </tbody>
@@ -1590,26 +1723,79 @@ if (ctx2) {
 {% endif %}
 
 // ── Silent AJAX refresh ─────────────────────────────────────────────
-// Updates only text nodes, no full page reload — zero flicker
+function _set(id, txt) { const e = document.getElementById(id); if (e) e.textContent = txt; }
+function _setH(id, html) { const e = document.getElementById(id); if (e) e.innerHTML = html; }
+
 function updateData() {
   fetch('/api/data')
     .then(r => r.ok ? r.json() : null)
     .then(d => {
       if (!d) return;
-      // Update pending count badge
-      const ct = document.getElementById('nav-pending-ct');
-      if (ct) ct.textContent = d.pending_ct;
-      // Update timestamp
-      const ts = document.getElementById('updated-ts');
-      if (ts) ts.textContent = d.updated;
-      const du = document.getElementById('dash-updated');
-      if (du) du.textContent = d.updated;
+
+      // Timestamps & counts
+      _set('nav-pending-ct', d.pending_ct);
+      _set('updated-ts', d.updated);
+      _set('dash-updated', d.updated);
+
+      // ── Régimen ──
+      const regC = d.regime === 'BEAR' ? 'var(--red)' : d.regime === 'BULL' ? 'var(--green)' : 'var(--yellow)';
+      const regB = d.regime === 'BEAR' ? 'bear' : d.regime === 'BULL' ? 'bull' : 'lat';
+      _setH('kpi-regime-val',
+        `${d.regime} <span class="badge b-${regB}" style="font-size:11px;vertical-align:middle;margin-left:4px">${d.regime_str}%</span>`);
+      const rv = document.getElementById('kpi-regime-val');
+      if (rv) rv.style.color = regC;
+      _setH('kpi-regime-sub', `SPY <b>${d.spy_mom3m >= 0 ? '+' : ''}${d.spy_mom3m.toFixed(1)}%</b> en 3 meses`);
+
+      // ── Fear & Greed ──
+      const fv = document.getElementById('kpi-fg-val');
+      if (fv) { fv.innerHTML = `${d.fear_greed}<span style="font-size:14px;font-weight:400;opacity:.7">/100</span>`; fv.style.color = d.fg_color; }
+      const ff = document.getElementById('kpi-fg-fill');
+      if (ff) { ff.style.width = d.fear_greed + '%'; ff.style.background = d.fg_color; }
+      _set('kpi-fg-sub', d.fg_label);
+
+      // ── VIX ──
+      const vixC = d.vix > 30 ? 'var(--red)' : d.vix > 20 ? 'var(--yellow)' : 'var(--green)';
+      const vixV = document.getElementById('kpi-vix-val');
+      if (vixV) { vixV.textContent = d.vix; vixV.style.color = vixC; }
+      _set('kpi-vix-sub', d.vix > 35 ? '🔴 Pánico de mercado' : d.vix > 25 ? '🟠 Alta volatilidad' : d.vix > 18 ? '🟡 Volatilidad elevada' : '🟢 Calma — baja vol');
+
+      // ── SP500 ──
+      _set('kpi-sp500-val', d.sp500_display);
+      const spSub = document.getElementById('kpi-sp500-sub');
+      if (spSub) {
+        const badges = { open:'<span class="mkt-badge mkt-open">● Abierto</span>', premarket:'<span class="mkt-badge mkt-pre">◑ Pre-apertura</span>', weekend:'<span class="mkt-badge mkt-weekend">Fin de semana</span>', closed:'<span class="mkt-badge mkt-closed">Mercado cerrado</span>' };
+        spSub.innerHTML = badges[d.market_status] || badges.closed;
+      }
+
+      // ── Accuracy ──
+      _set('kpi-acc-val', d.accuracy + '%');
+      _setH('kpi-acc-sub',
+        `<span style="color:var(--green)">${d.wins}✓</span> · <span style="color:var(--red)">${d.losses}✗</span> · <span style="color:var(--yellow)">${d.pending_ct} pend.</span>`);
     })
     .catch(() => {});
 }
 
 // Refresh every 60s silently
 setInterval(updateData, 60000);
+
+// ── Historial expandible ─────────────────────────────────────────────
+function toggleHist(rowEl) {
+  const detailRow = rowEl.nextElementSibling;
+  const inner = detailRow ? detailRow.querySelector('.hist-detail-inner') : null;
+  if (!inner) return;
+  const isOpen = rowEl.classList.contains('open');
+  // Cerrar todos los abiertos
+  document.querySelectorAll('.hist-row.open').forEach(r => {
+    r.classList.remove('open');
+    const dr = r.nextElementSibling;
+    if (dr) { const inn = dr.querySelector('.hist-detail-inner'); if (inn) inn.classList.remove('open'); }
+  });
+  if (!isOpen) {
+    rowEl.classList.add('open');
+    inner.classList.add('open');
+    inner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+}
 </script>
 </body>
 </html>"""
