@@ -831,12 +831,16 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
   transition:opacity .15s,transform .15s;
   transform:translateX(-50%) translateY(-4px);
   box-shadow:0 8px 32px rgba(0,0,0,.7);
-  min-width:200px;
+  min-width:200px;max-width:280px;
 }
 .has-tooltip:hover .tooltip{opacity:1;transform:translateX(-50%) translateY(0)}
 .tooltip::after{
   content:'';position:absolute;bottom:100%;left:50%;transform:translateX(-50%);
   border:6px solid transparent;border-bottom-color:var(--s3);
+}
+/* Disable tooltips on touch/mobile — they get stuck and block content */
+@media(hover:none),(max-width:700px){
+  .has-tooltip .tooltip{display:none!important}
 }
 .tt-row{display:flex;justify-content:space-between;gap:20px;padding:2px 0}
 .tt-range{color:var(--t2)}
@@ -859,10 +863,25 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
   .hamburger{display:flex}
   .nav-center{display:none;position:fixed;top:56px;left:0;right:0;z-index:198;background:rgba(8,12,20,.97);backdrop-filter:blur(16px);border-bottom:1px solid var(--b1);padding:8px 12px;flex-direction:column;gap:2px}
   .nav-center.open{display:flex}
-  .nav-tab{width:100%;justify-content:flex-start;padding:10px 14px}
+  .nav-tab{width:100%;justify-content:flex-start;padding:10px 14px;font-size:14px}
   .live-pill{display:none}
   .kpi-grid{grid-template-columns:repeat(2,1fr)!important}
-  .page{padding:12px 12px 32px}
+  .page{padding:10px 10px 40px}
+  .section{margin-bottom:16px}
+  .card{padding:14px}
+  .sh{font-size:10px;margin-bottom:10px}
+  .sum-row{grid-template-columns:repeat(2,1fr)!important;gap:10px}
+  .sum-val{font-size:22px}
+  .g2,.g3,.g13{grid-template-columns:1fr!important}
+  .bvs-box{height:180px}
+  .tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{font-size:12px}
+  td,th{padding:8px 10px}
+  .modal-box{width:calc(100vw - 24px);max-height:85vh;overflow-y:auto}
+  .tm-stats{grid-template-columns:repeat(2,1fr)}
+  .dow-grid{grid-template-columns:repeat(4,1fr)}
+  #toast-container{bottom:12px;right:12px;left:12px}
+  .toast{max-width:100%}
 }
 
 /* ── SPARKLINE ── */
@@ -1132,14 +1151,14 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
     <button class="nav-tab" data-tab="history" onclick="goTab('history')">
       <span class="icon">📋</span> Historial
     </button>
+    <button class="nav-tab" data-tab="charts" onclick="goTab('charts')">
+      <span class="icon">📊</span> Gráficos
+    </button>
     <button class="nav-tab" data-tab="analysis" onclick="goTab('analysis')">
       <span class="icon">🧠</span> Análisis
     </button>
     <button class="nav-tab" data-tab="macro" onclick="goTab('macro')">
       <span class="icon">🌍</span> Macro
-    </button>
-    <button class="nav-tab" data-tab="charts" onclick="goTab('charts')">
-      <span class="icon">📊</span> Gráficos
     </button>
   </div>
 
@@ -1953,7 +1972,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
     <div class="sh">📆 P/L acumulado por mes</div>
     <div class="card">
       <div style="font-size:12px;color:var(--t3);margin-bottom:12px">Suma de P/L % de todas las operaciones cerradas por mes.</div>
-      <div class="bvs-box" style="height:200px"><canvas id="monthlyPerfChart"></canvas></div>
+      <div class="bvs-box" style="height:240px"><canvas id="monthlyPerfChart"></canvas></div>
     </div>
   </div>
   {% endif %}
@@ -1961,10 +1980,10 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
   <!-- ── P/L por operación ── -->
   {% if pl_per_trade %}
   <div class="section">
-    <div class="sh">🎯 P/L por operación (últimas {{ pl_per_trade|length }})</div>
+    <div class="sh">🎯 Curva de equity — P/L acumulado por operación (últimas {{ pl_per_trade|length }} {{ 'operación' if pl_per_trade|length == 1 else 'operaciones' }})</div>
     <div class="card">
       <div style="font-size:12px;color:var(--t3);margin-bottom:12px">P/L % de cada operación resuelta. Verde = WIN, rojo = LOSS.</div>
-      <div class="bvs-box" style="height:200px"><canvas id="plPerTradeChart"></canvas></div>
+      <div class="bvs-box" style="height:260px"><canvas id="plPerTradeChart"></canvas></div>
     </div>
   </div>
   {% endif %}
@@ -2421,23 +2440,35 @@ if (ctxBvS) {
 }
 {% endif %}
 
-// ── Monthly P/L bar chart ────────────────────────────────────────────
+// ── Monthly P/L line chart ───────────────────────────────────────────
 {% if monthly_perf %}
 const ctxMP = document.getElementById('monthlyPerfChart');
 if (ctxMP) {
   const mpLabels = {{ monthly_perf.values()|map(attribute='label')|list|tojson }};
   const mpData   = {{ monthly_perf.values()|map(attribute='pl')|list|tojson }};
-  new Chart(ctxMP.getContext('2d'), {
-    type: 'bar',
+  const mpCtx = ctxMP.getContext('2d');
+  const mpGrad = mpCtx.createLinearGradient(0, 0, 0, 200);
+  mpGrad.addColorStop(0,   'rgba(0,224,122,.25)');
+  mpGrad.addColorStop(0.6, 'rgba(0,224,122,.05)');
+  mpGrad.addColorStop(1,   'rgba(0,224,122,0)');
+  new Chart(mpCtx, {
+    type: 'line',
     data: {
       labels: mpLabels,
       datasets: [{
         label: 'P/L mensual %',
         data: mpData,
-        backgroundColor: mpData.map(v => v >= 0 ? 'rgba(0,224,122,.6)' : 'rgba(255,59,92,.6)'),
-        borderColor:     mpData.map(v => v >= 0 ? '#00e07a' : '#ff3b5c'),
-        borderWidth: 1.5,
-        borderRadius: 4,
+        borderColor: '#00e07a',
+        backgroundColor: mpGrad,
+        fill: true,
+        tension: 0.4,
+        pointRadius: 5,
+        pointHoverRadius: 7,
+        pointBackgroundColor: mpData.map(v => v >= 0 ? '#00e07a' : '#ff3b5c'),
+        pointBorderColor: '#080c14',
+        pointBorderWidth: 2,
+        borderWidth: 2.5,
+        segment: { borderColor: ctx => ctx.p0.parsed.y >= 0 ? '#00e07a' : '#ff3b5c' }
       }]
     },
     options: {
@@ -2445,46 +2476,98 @@ if (ctxMP) {
       maintainAspectRatio: false,
       plugins: {
         legend: { display: false },
-        tooltip: { callbacks: { label: c => ` ${c.parsed.y >= 0 ? '+' : ''}${c.parsed.y}%` } }
+        tooltip: {
+          backgroundColor: 'rgba(13,20,32,.95)',
+          borderColor: 'rgba(37,51,73,.6)',
+          borderWidth: 1,
+          callbacks: {
+            label: c => ` P/L: ${c.parsed.y >= 0 ? '+' : ''}${c.parsed.y}%`
+          }
+        }
       },
       scales: {
-        x: { ticks: { color: '#4a5a72', font: { size: 10 } }, grid: { color: 'rgba(30,45,68,.4)' } },
-        y: { ticks: { color: '#4a5a72', font: { size: 10 }, callback: v => (v >= 0 ? '+' : '') + v + '%' }, grid: { color: 'rgba(30,45,68,.4)' } }
+        x: { ticks: { color: '#4a5a72', font: { size: 11 } }, grid: { color: 'rgba(30,45,68,.4)' }, border: { color: 'rgba(30,45,68,.4)' } },
+        y: {
+          ticks: { color: '#4a5a72', font: { size: 11 }, callback: v => (v >= 0 ? '+' : '') + v + '%' },
+          grid: { color: 'rgba(30,45,68,.4)' },
+          border: { color: 'rgba(30,45,68,.4)' }
+        }
       }
     }
   });
 }
 {% endif %}
 
-// ── P/L per trade bar chart ──────────────────────────────────────────
+// ── P/L per trade line chart ─────────────────────────────────────────
 {% if pl_per_trade %}
 const ctxPT = document.getElementById('plPerTradeChart');
 if (ctxPT) {
   const ptLabels = {{ pl_per_trade|map(attribute='ticker')|list|tojson }};
   const ptData   = {{ pl_per_trade|map(attribute='pl')|list|tojson }};
-  new Chart(ctxPT.getContext('2d'), {
-    type: 'bar',
+  // Cumulative P/L for a nice equity-curve look
+  const ptCumul = [];
+  let ptRun = 0;
+  ptData.forEach(v => { ptRun += v; ptCumul.push(Math.round(ptRun * 10) / 10); });
+  const ptCtx = ctxPT.getContext('2d');
+  const ptFinalPositive = ptCumul.length ? ptCumul[ptCumul.length-1] >= 0 : true;
+  const ptColor = ptFinalPositive ? '#00e07a' : '#ff3b5c';
+  const ptGrad = ptCtx.createLinearGradient(0, 0, 0, 200);
+  ptGrad.addColorStop(0,   ptFinalPositive ? 'rgba(0,224,122,.22)' : 'rgba(255,59,92,.22)');
+  ptGrad.addColorStop(1,   'rgba(0,0,0,0)');
+  new Chart(ptCtx, {
+    type: 'line',
     data: {
       labels: ptLabels,
-      datasets: [{
-        label: 'P/L %',
-        data: ptData,
-        backgroundColor: ptData.map(v => v >= 0 ? 'rgba(0,224,122,.6)' : 'rgba(255,59,92,.6)'),
-        borderColor:     ptData.map(v => v >= 0 ? '#00e07a' : '#ff3b5c'),
-        borderWidth: 1.5,
-        borderRadius: 4,
-      }]
+      datasets: [
+        {
+          label: 'P/L acumulado %',
+          data: ptCumul,
+          borderColor: ptColor,
+          backgroundColor: ptGrad,
+          fill: true,
+          tension: 0.35,
+          pointRadius: 4,
+          pointHoverRadius: 7,
+          pointBackgroundColor: ptData.map(v => v >= 0 ? '#00e07a' : '#ff3b5c'),
+          pointBorderColor: '#080c14',
+          pointBorderWidth: 2,
+          borderWidth: 2.5,
+        },
+        {
+          label: 'P/L individual %',
+          data: ptData,
+          borderColor: 'rgba(61,142,248,.5)',
+          backgroundColor: 'transparent',
+          fill: false,
+          tension: 0,
+          pointRadius: 3,
+          pointBackgroundColor: ptData.map(v => v >= 0 ? 'rgba(0,224,122,.7)' : 'rgba(255,59,92,.7)'),
+          borderWidth: 1,
+          borderDash: [3,3],
+        }
+      ]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       plugins: {
-        legend: { display: false },
-        tooltip: { callbacks: { label: c => ` ${c.parsed.y >= 0 ? '+' : ''}${c.parsed.y}%` } }
+        legend: { display: true, labels: { color: '#8596b0', font: { size: 11 }, boxWidth: 14, padding: 16 } },
+        tooltip: {
+          backgroundColor: 'rgba(13,20,32,.95)',
+          borderColor: 'rgba(37,51,73,.6)',
+          borderWidth: 1,
+          callbacks: {
+            label: c => ` ${c.dataset.label}: ${c.parsed.y >= 0 ? '+' : ''}${c.parsed.y}%`
+          }
+        }
       },
       scales: {
-        x: { ticks: { color: '#4a5a72', font: { size: 10 }, maxRotation: 45 }, grid: { color: 'rgba(30,45,68,.4)' } },
-        y: { ticks: { color: '#4a5a72', font: { size: 10 }, callback: v => (v >= 0 ? '+' : '') + v + '%' }, grid: { color: 'rgba(30,45,68,.4)' } }
+        x: { ticks: { color: '#4a5a72', font: { size: 10 }, maxRotation: 40 }, grid: { color: 'rgba(30,45,68,.4)' }, border: { color: 'rgba(30,45,68,.4)' } },
+        y: {
+          ticks: { color: '#4a5a72', font: { size: 11 }, callback: v => (v >= 0 ? '+' : '') + v + '%' },
+          grid: { color: 'rgba(30,45,68,.4)' },
+          border: { color: 'rgba(30,45,68,.4)' }
+        }
       }
     }
   });
