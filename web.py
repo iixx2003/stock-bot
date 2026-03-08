@@ -582,7 +582,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </thead>
           <tbody>
             {% for p in pending %}
-            {% set days = ((now_ts - p.date|string|replace('T',' ')|replace('Z','')) if p.date else 0) %}
             <tr>
               <td><span class="ticker">{{ p.ticker }}</span></td>
               <td>
@@ -779,7 +778,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card">
       <div class="card-title">Top sectores</div>
       {% if by_sector %}
-        {% for s, v in by_sector|dictsort(by='value', reverse=True) %}
+        {% for s, v in by_sector.items()|sort(attribute='1.w', reverse=True) %}
         {% if loop.index <= 8 %}
         <div class="type-block">
           <div style="display:flex;justify-content:space-between;margin-bottom:4px">
