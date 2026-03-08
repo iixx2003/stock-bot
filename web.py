@@ -4,6 +4,7 @@ from flask import Flask, render_template_string, session, redirect, url_for, req
 import json, os, time, threading, math
 from datetime import datetime, timedelta, date as _dt_date
 from calendar import monthrange as _mrange, month_name as _mname
+from collections import Counter as _Counter
 import pytz
 
 try:
@@ -442,7 +443,6 @@ def build_payload():
         })
 
     # ── Detección de duplicados ─────────────────────────────────────────
-    from collections import Counter as _Counter
     _tk_counts = _Counter(p.get("ticker", "") for p in pending)
     for p in pending:
         p["is_duplicate"] = _tk_counts.get(p.get("ticker", ""), 0) > 1
@@ -554,6 +554,7 @@ def build_payload():
         "cur_streak_ct":    cur_streak_ct,
         "cal_html":         _cal_html,
         "cal_month_name":   cal_month_name,
+        "cal_data":         cal_data,
         "ticker_stats":     ticker_stats,
         "tm_trades":        tm_trades,
         "tm_max_days":      tm_max_days,
