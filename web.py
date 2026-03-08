@@ -1,9 +1,20 @@
 """StockBot Pro — Panel de control web v2 (multi-página, premium design)"""
 
 from flask import Flask, render_template_string, session, redirect, url_for, request, jsonify
-import json, os, time
+import json, os, time, threading
 from datetime import datetime
 import pytz
+
+try:
+    import yfinance as yf
+    _HAS_YF = True
+except ImportError:
+    _HAS_YF = False
+
+# Caché de precios: ticker → (price, change_pct, timestamp)
+_price_cache = {}
+_price_lock  = threading.Lock()
+_PRICE_TTL   = 180   # 3 min
 
 app = Flask(__name__)
 app.secret_key = "stk_web_2026_xK9mP_secreto"
@@ -38,6 +49,27 @@ def is_premarket_now():
         return False
     t = now.hour * 60 + now.minute
     return 540 <= t < 930     # 09:00–15:30 ES
+
+
+def _fetch_price(ticker):
+    """Devuelve (price, change_pct) con caché de 3 min. Nunca lanza excepción."""
+    now_ts = time.time()
+    with _price_lock:
+        cached = _price_cache.get(ticker)
+        if cached and now_ts - cached[2] < _PRICE_TTL:
+            return cached[0], cached[1]
+    if not _HAS_YF:
+        return None, None
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        price  = round(float(fi.last_price), 2)   if fi.last_price  else None
+        prev   = float(fi.previous_close)          if fi.previous_close else None
+        chg    = round((price - prev) / prev * 100, 2) if price and prev else None
+        with _price_lock:
+            _price_cache[ticker] = (price, chg, now_ts)
+        return price, chg
+    except Exception:
+        return None, None
 
 
 def _days_elapsed(date_str):
@@ -81,14 +113,33 @@ def build_payload():
     resolved = wins + losses
     accuracy = round(wins / resolved * 100, 1) if resolved > 0 else 0
 
-    # Enrich pending
+    # Enrich pending (incluye precio actual en tiempo real)
     for p in pending:
         entry  = p.get("entry", 0) or 0
         target = p.get("target", 0) or 0
+        stop   = p.get("stop",   0) or 0
         days   = _days_elapsed(p.get("date"))
         p["days_elapsed"]   = days
         p["days_remaining"] = max(0, 30 - days)
         p["target_pct"]     = round((target - entry) / entry * 100, 1) if entry > 0 and target > 0 else None
+
+        # Precio actual + % cambio desde entrada
+        cur_price, cur_chg = _fetch_price(p.get("ticker", ""))
+        p["current_price"] = cur_price
+        p["current_chg"]   = cur_chg    # % diario
+        if cur_price and entry > 0:
+            raw_vs_entry = (cur_price - entry) / entry * 100
+            p["vs_entry_pct"] = round(raw_vs_entry if p.get("signal") == "COMPRAR" else -raw_vs_entry, 2)
+            # Progreso real hacia target
+            if target > entry and p.get("signal") == "COMPRAR":
+                p["real_progress"] = max(0, min(100, round((cur_price - entry) / (target - entry) * 100)))
+            elif target < entry and p.get("signal") == "VENDER":
+                p["real_progress"] = max(0, min(100, round((entry - cur_price) / (entry - target) * 100)))
+            else:
+                p["real_progress"] = None
+        else:
+            p["vs_entry_pct"]  = None
+            p["real_progress"] = None
 
     recent = sorted(
         [p for p in preds if p.get("result") in ("win", "loss")],
@@ -202,10 +253,13 @@ def build_payload():
         "hour_memory":    learnings.get("hour_memory", {}),
         "regime_memory":  learnings.get("regime_memory", {}),
         "sector_memory":  learnings.get("sector_memory", {}),
-        "macro_news":     mctx.get("macro_news", []),
-        "avg_win":        avg_win,
-        "avg_loss":       avg_loss,
-        "updated":        now.strftime("%H:%M:%S · %d/%m/%Y"),
+        "macro_news":       mctx.get("macro_news", []),
+        "avg_win":          avg_win,
+        "avg_loss":         avg_loss,
+        "geo_context":      mctx.get("geopolitical_context", []),
+        "sector_bias":      mctx.get("sector_bias", {}),
+        "updated":          now.strftime("%H:%M:%S · %d/%m/%Y"),
+        "next_open":        "Lunes 15:30h" if now.weekday() >= 5 else ("15:30h" if now.weekday() < 5 and (now.hour * 60 + now.minute) < 930 else None),
     }
 
 
@@ -656,7 +710,7 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
   <div class="kpi-grid">
 
     <!-- Régimen -->
-    <div class="kpi {% if regime=='BEAR' %}red{% elif regime=='BULL' %}green{% else %}yellow{% endif %}">
+    <div class="kpi {% if regime=='BEAR' %}red{% elif regime=='BULL' %}green{% else %}yellow{% endif %} has-tooltip">
       <div class="kpi-accent"></div>
       <div class="kpi-label">Régimen de mercado</div>
       <div class="kpi-val col-{% if regime=='BEAR' %}red{% elif regime=='BULL' %}green{% else %}yellow{% endif %}">
@@ -664,6 +718,19 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
         <span class="badge b-{% if regime=='BEAR' %}bear{% elif regime=='BULL' %}bull{% else %}lat{% endif %}" style="font-size:11px;vertical-align:middle;margin-left:4px">{{ regime_str }}%</span>
       </div>
       <div class="kpi-sub">SPY <b>{{ "%+.1f"|format(spy_mom3m) }}%</b> en 3 meses</div>
+      <div class="tooltip" style="min-width:240px">
+        <div style="font-weight:700;margin-bottom:8px;font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--t3)">Regímenes de mercado</div>
+        <div class="tt-row" style="margin-bottom:6px"><span class="tt-label col-green">🐂 BULL</span></div>
+        <div style="font-size:11px;color:var(--t2);margin-bottom:10px;line-height:1.5">SPY por encima de SMA200, momentum positivo. El bot opera con umbrales normales y busca largos.</div>
+        <div class="tt-row" style="margin-bottom:6px"><span class="tt-label col-red">🐻 BEAR</span></div>
+        <div style="font-size:11px;color:var(--t2);margin-bottom:10px;line-height:1.5">SPY bajo SMA200, tendencia bajista. El bot sube umbrales de confianza y reduce objetivos a +8%.</div>
+        <div class="tt-row" style="margin-bottom:6px"><span class="tt-label col-yellow">↔ LATERAL</span></div>
+        <div style="font-size:11px;color:var(--t2);margin-bottom:10px;line-height:1.5">Sin tendencia clara. Rango entre soportes y resistencias. Objetivos +12%, más cautela.</div>
+        <div style="padding-top:8px;border-top:1px solid var(--b1);font-size:11px;color:var(--t3)">
+          El % indica la <b style="color:var(--t1)">fuerza del régimen</b> (0–100).<br>
+          Actualmente: <b style="color:{% if regime=='BEAR' %}var(--red){% elif regime=='BULL' %}var(--green){% else %}var(--yellow){% endif %}">{{ regime }} {{ regime_str }}%</b> · SPY {{ "%+.1f"|format(spy_mom3m) }}% en 3m
+        </div>
+      </div>
     </div>
 
     <!-- Fear & Greed -->
@@ -884,25 +951,42 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 <!-- ════════════════════════════════════════════════════ TAB: SEÑALES -->
 <div class="tab-panel" id="tab-signals">
 
-  <div class="sh">📡 Señales activas — {{ pending_ct }} predicciones en curso</div>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+    <div class="sh" style="margin-bottom:0;flex:1">📡 Señales activas — {{ pending_ct }} predicciones en curso</div>
+    <span style="font-size:11px;color:var(--t3);background:var(--s2);border:1px solid var(--b1);border-radius:6px;padding:4px 10px">
+      💡 Precio actual se actualiza cada 3 min
+    </span>
+  </div>
 
   {% if pending %}
-  <div class="card" style="margin-bottom:20px">
+  <div class="card" style="margin-bottom:20px;padding:0">
     <div class="tw">
       <table>
         <thead>
           <tr>
-            <th>Ticker</th><th>Señal</th><th>Tipo</th>
-            <th>Entrada</th><th>Objetivo</th><th>Stop</th>
-            <th>Confianza</th><th>Progreso temporal</th>
-            <th>Sector</th><th>Días restantes</th><th>Fecha</th>
+            <th>Ticker</th>
+            <th>Señal</th>
+            <th>Tipo</th>
+            <th>Entrada</th>
+            <th>Precio actual</th>
+            <th>vs Entrada</th>
+            <th>Objetivo</th>
+            <th>Stop</th>
+            <th>Confianza</th>
+            <th>Progreso al objetivo</th>
+            <th>Sector</th>
+            <th>Días rest.</th>
           </tr>
         </thead>
         <tbody>
           {% for p in pending %}
           {% set st = p.get('signal_type','NORMAL') %}
+          {% set has_cur = p.current_price is not none %}
           <tr>
-            <td><span class="tk">{{ p.ticker }}</span></td>
+            <td>
+              <span class="tk">{{ p.ticker }}</span>
+              {% if p.session %}<br><span style="font-size:9px;color:var(--t3)">{{ p.session }}</span>{% endif %}
+            </td>
             <td>
               {% if p.signal == 'COMPRAR' %}<span class="badge b-buy">📈 Comprar</span>
               {% else %}<span class="badge b-sell">📉 Vender</span>{% endif %}
@@ -913,16 +997,35 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
               {% elif st == 'INSIDER_MASSIVE' %}<span class="badge b-ins">Insider</span>
               {% else %}<span style="font-size:11px;color:var(--t3)">Normal</span>{% endif %}
             </td>
-            <td class="mono">${{ "%.2f"|format(p.entry|float) }}</td>
-            <td class="mono g">
-              ${{ "%.2f"|format(p.target|float) }}
-              {% if p.target_pct %}<br><span style="font-size:10px;color:var(--green);opacity:.7">+{{ p.target_pct }}%</span>{% endif %}
+            <td>
+              <span class="mono">${{ "%.2f"|format(p.entry|float) }}</span>
             </td>
-            <td class="mono r">
-              ${{ "%.2f"|format(p.stop|float) }}
-              {% if p.entry and p.stop %}
-              <br><span style="font-size:10px;color:var(--red);opacity:.7">{{ "%.1f"|format((p.stop|float - p.entry|float) / p.entry|float * 100) }}%</span>
+            <td>
+              {% if has_cur %}
+                <span class="mono" style="font-weight:700;color:var(--t1)">${{ "%.2f"|format(p.current_price) }}</span>
+                {% if p.current_chg is not none %}
+                <br><span style="font-size:10px;color:{% if p.current_chg >= 0 %}var(--green){% else %}var(--red){% endif %}">
+                  {{ "%+.2f"|format(p.current_chg) }}% hoy
+                </span>
+                {% endif %}
+              {% else %}
+                <span style="color:var(--t3);font-size:12px">— fuera mkt</span>
               {% endif %}
+            </td>
+            <td>
+              {% if p.vs_entry_pct is not none %}
+                <span style="font-weight:700;font-size:13px;color:{% if p.vs_entry_pct >= 0 %}var(--green){% else %}var(--red){% endif %}">
+                  {{ "%+.2f"|format(p.vs_entry_pct) }}%
+                </span>
+              {% else %}<span style="color:var(--t3)">—</span>{% endif %}
+            </td>
+            <td>
+              <span class="mono g">${{ "%.2f"|format(p.target|float) }}</span>
+              {% if p.target_pct %}<br><span style="font-size:10px;color:var(--green);opacity:.8">+{{ p.target_pct }}%</span>{% endif %}
+            </td>
+            <td>
+              <span class="mono r">${{ "%.2f"|format(p.stop|float) }}</span>
+              {% if p.entry and p.stop %}<br><span style="font-size:10px;color:var(--red);opacity:.7">{{ "%.1f"|format((p.stop|float - p.entry|float) / p.entry|float * 100) }}%</span>{% endif %}
             </td>
             <td>
               <div class="conf-wrap">
@@ -933,32 +1036,37 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
               </div>
             </td>
             <td>
-              {% if p.target_pct %}
-              <div class="prog-wrap">
-                <div class="prog-bar">
-                  <div class="prog-fill {% if p.days_remaining <= 7 %}danger{% endif %}" style="width:{{ [[(p.days_elapsed / 30 * 100)|int, 0]|max, 100]|min }}%"></div>
-                </div>
-                <div class="prog-meta">
-                  <span style="color:var(--t3)">{{ p.days_elapsed }}d transcurridos</span>
-                  <span style="color:{% if p.days_remaining <= 7 %}var(--red){% else %}var(--t3){% endif %}">{{ p.days_remaining }}d restantes</span>
-                </div>
+              <div class="prog-wrap" style="min-width:150px">
+                {% if p.real_progress is not none %}
+                  <!-- Barra basada en precio real -->
+                  <div class="prog-bar">
+                    <div class="prog-fill" style="width:{{ p.real_progress }}%;background:{% if p.real_progress >= 75 %}var(--green){% elif p.real_progress >= 40 %}var(--blue){% else %}var(--t3){% endif %}"></div>
+                  </div>
+                  <div class="prog-meta">
+                    <span style="color:var(--t2)">{{ p.real_progress }}% al objetivo</span>
+                    <span style="color:var(--t3)">{{ p.days_remaining }}d rest.</span>
+                  </div>
+                {% elif p.target_pct %}
+                  <!-- Fallback: barra temporal -->
+                  <div class="prog-bar">
+                    <div class="prog-fill {% if p.days_remaining <= 7 %}danger{% endif %}" style="width:{{ [[(p.days_elapsed / 30 * 100)|int, 0]|max, 100]|min }}%"></div>
+                  </div>
+                  <div class="prog-meta">
+                    <span style="color:var(--t3)">+{{ p.target_pct }}% obj · {{ p.days_elapsed }}d</span>
+                    <span style="color:{% if p.days_remaining <= 7 %}var(--red){% else %}var(--t3){% endif %}">{{ p.days_remaining }}d rest.</span>
+                  </div>
+                {% else %}—{% endif %}
               </div>
-              {% else %}—{% endif %}
             </td>
             <td style="font-size:12px">
-              {% if p.sector and p.sector != 'Unknown' %}
-                <span style="color:var(--t1)">{{ p.sector }}</span>
-              {% else %}
-                <span style="color:var(--t3)">—</span>
-              {% endif %}
+              {% if p.sector and p.sector != 'Unknown' %}<span style="color:var(--t1)">{{ p.sector }}</span>
+              {% else %}<span style="color:var(--t3)">—</span>{% endif %}
             </td>
             <td>
               <span class="dpill {% if p.days_remaining <= 5 %}urgent{% elif p.days_remaining >= 20 %}ok{% endif %}">
                 {{ p.days_remaining }}d
               </span>
-            </td>
-            <td style="font-size:11px;color:var(--t3)">
-              {% if p.date %}{{ p.date[:10] }}{% else %}—{% endif %}
+              <br><span style="font-size:10px;color:var(--t3)">{{ p.date[:10] if p.date else '' }}</span>
             </td>
           </tr>
           {% endfor %}
@@ -1058,107 +1166,185 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 <!-- ════════════════════════════════════════════════════ TAB: ANÁLISIS -->
 <div class="tab-panel" id="tab-analysis">
 
-  <div class="sh">🧠 Análisis de rendimiento</div>
+  <!-- ── KPIs de rendimiento ── -->
+  <div class="sum-row" style="margin-bottom:24px">
+    <div class="sum-card" style="border-color:rgba(0,224,122,.2)">
+      <div class="sum-val col-green">{{ accuracy }}%</div>
+      <div class="sum-label">Tasa de acierto</div>
+    </div>
+    <div class="sum-card" style="border-color:rgba(61,142,248,.2)">
+      <div class="sum-val col-blue">{{ wins + losses }}</div>
+      <div class="sum-label">Operaciones resueltas</div>
+    </div>
+    <div class="sum-card" style="border-color:rgba(0,224,122,.2)">
+      <div class="sum-val col-green">{% if avg_win %}+{{ avg_win }}%{% else %}—{% endif %}</div>
+      <div class="sum-label">P/L medio en wins</div>
+    </div>
+    <div class="sum-card" style="border-color:rgba(255,59,92,.2)">
+      <div class="sum-val col-red">{% if avg_loss %}{{ avg_loss }}%{% else %}—{% endif %}</div>
+      <div class="sum-label">P/L medio en losses</div>
+    </div>
+  </div>
 
-  <div class="g3">
+  <!-- ── Fila principal: tipo + sector + régimen ── -->
+  <div class="g3" style="margin-bottom:24px">
 
-    <!-- Por tipo de señal -->
+    <!-- Tipo de señal — con chart de barras -->
     <div class="card">
-      <div class="card-title">Precisión por tipo de señal</div>
+      <div class="card-title">⚡ Precisión por tipo de señal</div>
       {% if by_type %}
         {% for t, s in by_type.items() %}
         {% set total_t = s.w + s.l %}
         {% set pct_t = (s.w / total_t * 100)|int if total_t > 0 else 0 %}
-        <div class="stat-block">
-          <div class="stat-head">
-            {% if t == 'PRE_EARNINGS' %}<span class="badge b-earn">Pre-Earnings</span>
-            {% elif t == 'SHORT_SQUEEZE' %}<span class="badge b-sq">Squeeze</span>
-            {% elif t == 'INSIDER_MASSIVE' %}<span class="badge b-ins">Insider</span>
-            {% else %}<span class="badge b-norm">Normal</span>{% endif %}
-            <span class="stat-ops">{{ total_t }} ops</span>
-          </div>
-          <div class="stat-bar-wrap">
-            <div class="stat-bar">
-              <div class="stat-bar-w" style="width:{{ (s.w / total_t * 100)|int if total_t > 0 else 0 }}%"></div>
-              <div class="stat-bar-l" style="width:{{ (s.l / total_t * 100)|int if total_t > 0 else 0 }}%"></div>
+        <div style="margin-bottom:14px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            {% if t == 'PRE_EARNINGS' %}<span class="badge b-earn">📅 Pre-Earnings</span>
+            {% elif t == 'SHORT_SQUEEZE' %}<span class="badge b-sq">🔥 Squeeze</span>
+            {% elif t == 'INSIDER_MASSIVE' %}<span class="badge b-ins">🕵️ Insider</span>
+            {% else %}<span class="badge b-norm">📊 Normal</span>{% endif %}
+            <div style="text-align:right">
+              <span style="font-size:18px;font-weight:800;color:{% if pct_t >= 60 %}var(--green){% elif pct_t < 45 %}var(--red){% else %}var(--yellow){% endif %}">{{ pct_t }}%</span>
+              <span style="font-size:10px;color:var(--t3);display:block">{{ s.w }}W / {{ s.l }}L</span>
             </div>
-            <span class="stat-pct" style="color:{% if pct_t >= 60 %}var(--green){% elif pct_t < 45 %}var(--red){% else %}var(--yellow){% endif %}">{{ pct_t }}%</span>
+          </div>
+          <div style="height:8px;border-radius:4px;background:var(--b1);overflow:hidden;display:flex">
+            <div style="width:{{ (s.w / total_t * 100)|int if total_t > 0 else 0 }}%;background:var(--green);transition:width .5s"></div>
+            <div style="width:{{ (s.l / total_t * 100)|int if total_t > 0 else 0 }}%;background:var(--red)"></div>
           </div>
         </div>
         {% endfor %}
       {% else %}
-      <div class="empty" style="padding:24px"><span class="ei" style="font-size:28px">📊</span><p>Sin datos resueltos</p></div>
+        <div class="empty" style="padding:32px"><span class="ei">📊</span><p>Sin datos resueltos aún</p></div>
       {% endif %}
     </div>
 
-    <!-- Por sector -->
+    <!-- Sector — top 8 con heat visual -->
     <div class="card">
-      <div class="card-title">Rendimiento por sector</div>
+      <div class="card-title">🏭 Rendimiento por sector</div>
       {% if by_sector %}
         {% for s, v in by_sector.items()|sort(attribute='1.w', reverse=True) %}
-        {% if loop.index <= 10 %}
+        {% if loop.index <= 8 and s != 'Unknown' %}
         {% set total_s = v.w + v.l %}
         {% set pct_s = (v.w / total_s * 100)|int if total_s > 0 else 0 %}
-        <div class="stat-block">
-          <div class="stat-head">
-            <span class="stat-name">{{ s if s != 'Unknown' else '— Desconocido' }}</span>
-            <span class="stat-ops">{{ total_s }} ops</span>
-          </div>
-          <div class="stat-bar-wrap">
-            <div class="stat-bar">
-              <div class="stat-bar-w" style="width:{{ pct_s }}%"></div>
-              <div class="stat-bar-l" style="width:{{ 100 - pct_s }}%"></div>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+              <span style="font-size:12px;color:var(--t1);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ s }}</span>
+              <span style="font-size:11px;color:var(--t3);flex-shrink:0;margin-left:8px">{{ total_s }} ops</span>
             </div>
-            <span class="stat-pct" style="color:{% if pct_s >= 60 %}var(--green){% elif pct_s < 45 %}var(--red){% else %}var(--yellow){% endif %}">{{ pct_s }}%</span>
+            <div style="height:6px;border-radius:3px;background:var(--b1);overflow:hidden;display:flex">
+              <div style="width:{{ pct_s }}%;background:{% if pct_s >= 65 %}var(--green){% elif pct_s >= 50 %}#3d8ef8{% elif pct_s >= 40 %}var(--yellow){% else %}var(--red){% endif %};transition:width .5s"></div>
+            </div>
           </div>
+          <span style="font-size:13px;font-weight:700;min-width:36px;text-align:right;color:{% if pct_s >= 65 %}var(--green){% elif pct_s >= 50 %}var(--blue){% elif pct_s >= 40 %}var(--yellow){% else %}var(--red){% endif %}">{{ pct_s }}%</span>
         </div>
         {% endif %}
         {% endfor %}
       {% else %}
-      <div class="empty" style="padding:24px"><span class="ei" style="font-size:28px">🏭</span><p>Sin datos de sector</p></div>
+        <div class="empty" style="padding:32px"><span class="ei">🏭</span><p>Sin datos de sector</p></div>
       {% endif %}
     </div>
 
-    <!-- Reglas aprendidas -->
+    <!-- Régimen de mercado — rendimiento histórico -->
     <div class="card">
-      <div class="card-title">🧠 Reglas aprendidas ({{ rules_ct }})</div>
-      {% if rules %}
-        {% for r in rules %}
-        {% set wr = r.win_rate|float %}
-        <div class="rule-item">
-          <div class="rule-dot" style="background:{% if wr >= 70 %}var(--green){% elif wr >= 55 %}var(--blue){% elif wr <= 35 %}var(--red){% else %}var(--yellow){% endif %}"></div>
-          <div class="rule-text">
-            {{ r.description }}
-            <span class="rule-wr" style="color:{% if wr >= 70 %}var(--green){% elif wr >= 55 %}var(--blue){% elif wr <= 35 %}var(--red){% else %}var(--yellow){% endif %}">{{ wr }}%</span>
-            <span style="font-size:10px;color:var(--t3)">· {{ r.sample_size }} casos</span>
+      <div class="card-title">🌡️ Rendimiento por régimen</div>
+      {% if regime_memory %}
+        {% for reg, data in regime_memory.items() %}
+        {% set wr = data.win_rate|float %}
+        <div style="margin-bottom:20px;padding:16px;border-radius:10px;background:var(--s2);border:1px solid var(--b1)">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
+            <span class="badge b-{% if reg=='BEAR' %}bear{% elif reg=='BULL' %}bull{% else %}lat{% endif %}" style="font-size:12px">
+              {% if reg=='BULL' %}🐂{% elif reg=='BEAR' %}🐻{% else %}↔{% endif %} {{ reg }}
+            </span>
+            <span style="font-size:11px;color:var(--t3)">{{ data.total }} ops</span>
+          </div>
+          <div style="font-size:36px;font-weight:800;color:{% if wr >= 60 %}var(--green){% elif wr < 45 %}var(--red){% else %}var(--yellow){% endif %}">{{ wr }}%</div>
+          <div style="font-size:11px;color:var(--t3);margin:4px 0 8px">tasa de acierto histórica</div>
+          <div style="height:5px;border-radius:3px;background:var(--b1);overflow:hidden">
+            <div style="width:{{ wr|int }}%;height:100%;border-radius:3px;background:{% if wr >= 60 %}var(--green){% elif wr < 45 %}var(--red){% else %}var(--yellow){% endif %}"></div>
           </div>
         </div>
         {% endfor %}
       {% else %}
-      <div class="empty" style="padding:24px"><span class="ei" style="font-size:28px">🧠</span><p>Necesita más datos para aprender</p></div>
+        <div class="empty" style="padding:24px"><span class="ei">📈</span><p>Necesita más operaciones</p></div>
       {% endif %}
     </div>
 
   </div>
 
-  <!-- Régimen memory -->
-  {% if regime_memory %}
-  <div class="section">
-    <div class="sh">📊 Rendimiento por régimen de mercado</div>
-    <div class="g3">
-      {% for reg, data in regime_memory.items() %}
-      <div class="card-sm">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-          <span class="badge b-{% if reg=='BEAR' %}bear{% elif reg=='BULL' %}bull{% else %}lat{% endif %}">{{ reg }}</span>
-          <span style="font-size:11px;color:var(--t3)">{{ data.total }} ops</span>
+  <!-- ── Reglas aprendidas ── -->
+  <div class="sh">🧠 Motor de aprendizaje autónomo — {{ rules_ct }} reglas activas</div>
+  {% if rules %}
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px;margin-bottom:24px">
+    {% for r in rules %}
+    {% set wr = r.win_rate|float %}
+    {% set is_positive = wr >= 55 %}
+    <div style="display:flex;gap:12px;padding:14px 16px;border-radius:10px;background:var(--s1);border:1px solid {% if wr >= 70 %}rgba(0,224,122,.2){% elif wr >= 55 %}rgba(61,142,248,.2){% elif wr <= 35 %}rgba(255,59,92,.2){% else %}var(--b1){% endif %}">
+      <div style="flex-shrink:0;margin-top:2px">
+        <div style="width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;background:{% if wr >= 70 %}rgba(0,224,122,.1){% elif wr >= 55 %}rgba(61,142,248,.1){% elif wr <= 35 %}rgba(255,59,92,.1){% else %}rgba(255,255,255,.05){% endif %}">
+          {% if wr >= 70 %}✅{% elif wr >= 55 %}📈{% elif wr <= 35 %}⚠️{% else %}📊{% endif %}
         </div>
-        <div style="font-size:28px;font-weight:800;color:{% if data.win_rate >= 60 %}var(--green){% elif data.win_rate < 45 %}var(--red){% else %}var(--yellow){% endif %}">{{ data.win_rate }}%</div>
-        <div style="font-size:11px;color:var(--t3);margin-top:4px">tasa de acierto</div>
       </div>
-      {% endfor %}
+      <div style="flex:1;min-width:0">
+        <div style="font-size:12px;color:var(--t2);line-height:1.5;margin-bottom:6px">{{ r.description }}</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:16px;font-weight:800;color:{% if wr >= 70 %}var(--green){% elif wr >= 55 %}var(--blue){% elif wr <= 35 %}var(--red){% else %}var(--yellow){% endif %}">{{ wr }}%</span>
+          <div style="flex:1;height:4px;border-radius:2px;background:var(--b1);overflow:hidden">
+            <div style="width:{{ wr|int }}%;height:100%;border-radius:2px;background:{% if wr >= 70 %}var(--green){% elif wr >= 55 %}var(--blue){% elif wr <= 35 %}var(--red){% else %}var(--yellow){% endif %}"></div>
+          </div>
+          <span style="font-size:10px;color:var(--t3)">{{ r.sample_size }} casos</span>
+        </div>
+      </div>
     </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card" style="margin-bottom:24px">
+    <div class="empty"><span class="ei">🧠</span><p>El bot necesita más operaciones resueltas para generar reglas de aprendizaje</p></div>
   </div>
   {% endif %}
+
+  <!-- ── Gráfica donut + historial resumido ── -->
+  <div class="g2">
+    <div class="card">
+      <div class="card-title">📊 Distribución de resultados</div>
+      {% if wins + losses > 0 %}
+      <div class="chart-box" style="height:180px"><canvas id="donutAnalysis"></canvas></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px">
+        <div style="background:rgba(0,224,122,.06);border:1px solid rgba(0,224,122,.15);border-radius:8px;padding:12px;text-align:center">
+          <div style="font-size:24px;font-weight:800;color:var(--green)">{{ wins }}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">WINS ✓</div>
+        </div>
+        <div style="background:rgba(255,59,92,.06);border:1px solid rgba(255,59,92,.15);border-radius:8px;padding:12px;text-align:center">
+          <div style="font-size:24px;font-weight:800;color:var(--red)">{{ losses }}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">LOSSES ✗</div>
+        </div>
+      </div>
+      {% else %}
+      <div class="empty"><span class="ei">📊</span><p>Sin datos resueltos</p></div>
+      {% endif %}
+    </div>
+    <div class="card">
+      <div class="card-title">📅 Últimas 5 operaciones resueltas</div>
+      {% if recent %}
+      {% for p in recent[:5] %}
+      <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(26,36,64,.4)">
+        <span style="font-weight:700;font-size:14px;min-width:52px">{{ p.ticker }}</span>
+        {% if p.result == 'win' %}<span class="badge b-win">✓ WIN</span>{% else %}<span class="badge b-loss">✗ LOSS</span>{% endif %}
+        <div style="flex:1">
+          <div style="font-size:11px;color:var(--t3)">${{ "%.2f"|format(p.entry|float) }} → {% if p.exit_price %}${{ "%.2f"|format(p.exit_price|float) }}{% else %}—{% endif %}</div>
+          <div style="font-size:10px;color:var(--t3)">{{ p.exit_reason_label }} · {{ p.date[:10] if p.date else '' }}</div>
+        </div>
+        {% if p.pl_pct is not none %}
+        <span style="font-weight:700;color:{% if p.pl_pct >= 0 %}var(--green){% else %}var(--red){% endif %}">{{ "%+.1f"|format(p.pl_pct) }}%</span>
+        {% endif %}
+      </div>
+      {% endfor %}
+      {% else %}
+      <div class="empty"><span class="ei">📋</span><p>Sin historial aún</p></div>
+      {% endif %}
+    </div>
+  </div>
 
 </div>
 <!-- /analysis -->
@@ -1167,55 +1353,154 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 <!-- ════════════════════════════════════════════════════ TAB: MACRO -->
 <div class="tab-panel" id="tab-macro">
 
-  <div class="sh">🌍 Contexto macro y eventos de mercado</div>
+  <div class="sh">🌍 Contexto macro — mercados, eventos y noticias</div>
 
+  <!-- ── Fila indicadores ── -->
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px">
+
+    <!-- Régimen -->
+    <div style="background:var(--s1);border:1px solid var(--b1);border-radius:12px;padding:18px;text-align:center;border-top:2px solid {% if regime=='BULL' %}var(--green){% elif regime=='BEAR' %}var(--red){% else %}var(--yellow){% endif %}">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);margin-bottom:8px">Régimen</div>
+      <div style="font-size:32px;font-weight:800;color:{% if regime=='BULL' %}var(--green){% elif regime=='BEAR' %}var(--red){% else %}var(--yellow){% endif %}">{{ regime }}</div>
+      <div style="font-size:12px;color:var(--t3);margin-top:4px">Fuerza {{ regime_str }}%</div>
+      <div style="margin-top:10px">
+        <span class="mkt-badge {% if market_status=='open' %}mkt-open{% elif market_status=='premarket' %}mkt-pre{% else %}mkt-closed{% endif %}">
+          {% if market_status=='open' %}● Abierto{% elif market_status=='premarket' %}◑ Pre-mkt{% elif market_status=='weekend' %}Fin semana{% else %}Cerrado{% endif %}
+        </span>
+      </div>
+      {% if next_open %}<div style="font-size:11px;color:var(--t3);margin-top:6px">Abre: {{ next_open }}</div>{% endif %}
+    </div>
+
+    <!-- F&G gauge visual -->
+    <div style="background:var(--s1);border:1px solid var(--b1);border-radius:12px;padding:18px;text-align:center;border-top:2px solid {{ fg_color }}">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);margin-bottom:8px">Fear &amp; Greed</div>
+      <div style="font-size:36px;font-weight:800;color:{{ fg_color }}">{{ fear_greed }}</div>
+      <div style="font-size:12px;color:var(--t2);margin:4px 0 8px">{{ fg_label }}</div>
+      <div style="height:6px;border-radius:3px;background:linear-gradient(90deg,#ff3b5c,#ff6b35,#f5a623,#7bed9f,#00e07a);margin-bottom:4px;position:relative">
+        <div style="position:absolute;top:-4px;left:{{ fear_greed }}%;transform:translateX(-50%);width:14px;height:14px;border-radius:50%;background:white;border:2px solid {{ fg_color }};box-shadow:0 0 8px {{ fg_color }}"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--t3)"><span>Miedo ext.</span><span>Neutral</span><span>Codicia ext.</span></div>
+    </div>
+
+    <!-- VIX -->
+    <div style="background:var(--s1);border:1px solid var(--b1);border-radius:12px;padding:18px;text-align:center;border-top:2px solid {% if vix > 30 %}var(--red){% elif vix > 20 %}var(--yellow){% else %}var(--green){% endif %}">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);margin-bottom:8px">VIX — Volatilidad</div>
+      <div style="font-size:36px;font-weight:800;color:{% if vix > 30 %}var(--red){% elif vix > 20 %}var(--yellow){% else %}var(--green){% endif %}">{{ vix }}</div>
+      <div style="font-size:12px;color:var(--t2);margin-top:4px">
+        {% if vix > 35 %}🔴 Pánico extremo{% elif vix > 25 %}🟠 Alta volatilidad{% elif vix > 18 %}🟡 Estrés moderado{% else %}🟢 Mercado calmado{% endif %}
+      </div>
+      <div style="margin-top:10px;padding:6px 10px;border-radius:6px;background:{% if vix > 30 %}rgba(255,59,92,.08){% elif vix > 20 %}rgba(245,166,35,.08){% else %}rgba(0,224,122,.08){% endif %};font-size:11px;color:var(--t3)">
+        {% if vix > 30 %}Bot en modo ultra-conservador{% elif vix > 20 %}Umbrales elevados{% else %}Operación normal{% endif %}
+      </div>
+    </div>
+
+    <!-- S&P 500 -->
+    <div style="background:var(--s1);border:1px solid var(--b1);border-radius:12px;padding:18px;text-align:center;border-top:2px solid {% if market_status in ('weekend','closed','premarket') %}var(--b1){% elif sp500 < 0 %}var(--red){% else %}var(--green){% endif %}">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);margin-bottom:8px">S&amp;P 500 (SPY)</div>
+      <div style="font-size:32px;font-weight:800;color:{% if market_status in ('weekend','closed','premarket') %}var(--t3){% elif sp500 < 0 %}var(--red){% else %}var(--green){% endif %}">{{ sp500_display }}</div>
+      <div style="font-size:12px;color:var(--t2);margin-top:4px">{{ sp500_sub }}</div>
+      <div style="margin-top:10px;font-size:12px;color:var(--t3)">
+        SPY momentum 3m: <b style="color:{% if spy_mom3m >= 0 %}var(--green){% else %}var(--red){% endif %}">{{ "%+.1f"|format(spy_mom3m) }}%</b>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Fila eventos + bias sectorial + noticias ── -->
   <div class="g3">
 
-    <!-- Régimen detallado -->
+    <!-- Eventos económicos (calendario visual) -->
     <div class="card">
-      <div class="card-title">Estado del mercado</div>
-      <div style="text-align:center;padding:12px 0 20px">
-        <div style="font-size:48px;font-weight:800;letter-spacing:-2px;color:{% if regime=='BEAR' %}var(--red){% elif regime=='BULL' %}var(--green){% else %}var(--yellow){% endif %}">{{ regime }}</div>
-        <div style="font-size:13px;color:var(--t2);margin-top:6px">Fuerza: {{ regime_str }}%</div>
-        <div style="margin-top:16px">
-          <span class="mkt-badge {% if market_status=='open' %}mkt-open{% elif market_status=='premarket' %}mkt-pre{% else %}mkt-closed{% endif %}" style="font-size:12px;padding:5px 14px">
-            {% if market_status=='open' %}● Mercado abierto
-            {% elif market_status=='premarket' %}◑ Pre-apertura
-            {% elif market_status=='weekend' %}Fin de semana
-            {% else %}Mercado cerrado{% endif %}
+      <div class="card-title">📅 Calendario económico</div>
+
+      {% if high_impact and eco_events %}
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;padding:10px 12px;border-radius:8px;background:rgba(255,59,92,.06);border:1px solid rgba(255,59,92,.2)">
+          <span style="font-size:16px">⚠️</span>
+          <div>
+            <div style="font-size:11px;font-weight:700;color:var(--red);letter-spacing:.4px">ALTO IMPACTO HOY</div>
+            <div style="font-size:11px;color:var(--t3);margin-top:2px">El bot opera con umbrales más altos</div>
+          </div>
+        </div>
+        {% for ev in eco_events %}
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;background:var(--s2);border:1px solid var(--b1);margin-bottom:8px">
+          <span style="font-size:18px">📌</span>
+          <span style="font-size:13px;color:var(--t1)">{{ ev }}</span>
+        </div>
+        {% endfor %}
+      {% else %}
+        <div style="padding:16px 12px;border-radius:8px;background:rgba(0,224,122,.04);border:1px solid rgba(0,224,122,.1);display:flex;align-items:center;gap:10px;margin-bottom:16px">
+          <span style="font-size:18px">✅</span>
+          <div style="font-size:12px;color:var(--t2)">Sin eventos de alto impacto hoy.<br>El bot opera en modo normal.</div>
+        </div>
+      {% endif %}
+
+      <!-- Efectos en el bot -->
+      <div style="border-top:1px solid var(--b1);padding-top:14px;margin-top:8px">
+        <div style="font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);margin-bottom:10px">Cómo afecta al bot</div>
+        <div class="sr"><span class="sr-label">Umbral confianza normal</span><span class="sr-val" style="font-size:12px">85–87%</span></div>
+        <div class="sr"><span class="sr-label">Umbral fuerte</span><span class="sr-val" style="font-size:12px">88–93%</span></div>
+        <div class="sr"><span class="sr-label">Umbral excepcional</span><span class="sr-val" style="font-size:12px">94%+</span></div>
+        <div class="sr"><span class="sr-label">Pre-apertura (15:00–15:30)</span><span class="sr-val" style="font-size:12px;color:var(--yellow)">Mín. FUERTE</span></div>
+        {% if high_impact %}<div class="sr"><span class="sr-label">Alto impacto hoy</span><span class="sr-val" style="font-size:12px;color:var(--red)">+5% umbral extra</span></div>{% endif %}
+      </div>
+    </div>
+
+    <!-- Bias sectorial geopolítico -->
+    <div class="card">
+      <div class="card-title">🗺️ Contexto geopolítico y sectorial</div>
+
+      {% if geo_context %}
+        <div style="margin-bottom:14px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);margin-bottom:8px">Factores detectados</div>
+          {% for g in geo_context %}
+          <span style="display:inline-block;background:rgba(61,142,248,.1);border:1px solid rgba(61,142,248,.2);color:var(--blue);border-radius:6px;padding:3px 10px;font-size:12px;font-weight:600;margin:0 4px 6px 0">{{ g }}</span>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      {% if sector_bias %}
+        <div style="font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);margin-bottom:10px">Bias sectorial detectado</div>
+        {% for etf, direction in sector_bias.items() %}
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-radius:8px;background:var(--s2);border:1px solid var(--b1);margin-bottom:6px">
+          <span style="font-size:13px;font-weight:600">{{ etf }}</span>
+          <span style="font-size:12px;font-weight:700;color:{% if direction=='up' %}var(--green){% else %}var(--red){% endif %}">
+            {% if direction=='up' %}▲ Favorecido{% else %}▼ Presión{% endif %}
           </span>
         </div>
+        {% endfor %}
+      {% else %}
+        <div style="padding:14px 0;font-size:12px;color:var(--t3);text-align:center">Sin bias sectorial detectado</div>
+      {% endif %}
+
+      <!-- VIX context -->
+      <div style="border-top:1px solid var(--b1);padding-top:14px;margin-top:10px">
+        <div style="font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);margin-bottom:10px">Niveles de referencia VIX</div>
+        {% for label, low, high, color in [('Calma', 0, 15, '#00e07a'), ('Normal', 15, 20, '#7bed9f'), ('Estrés', 20, 30, '#f5a623'), ('Miedo', 30, 40, '#ff6b35'), ('Pánico', 40, 100, '#ff3b5c')] %}
+        <div style="display:flex;align-items:center;gap:8px;padding:4px 0">
+          <div style="width:8px;height:8px;border-radius:50%;background:{{ color }};flex-shrink:0"></div>
+          <span style="font-size:12px;color:var(--t2);flex:1">{{ label }}</span>
+          <span style="font-size:11px;color:var(--t3)">{{ low }}–{{ high if high < 100 else '∞' }}</span>
+          {% if vix >= low and vix < high %}<span style="font-size:10px;font-weight:700;color:{{ color }};background:rgba(255,255,255,.05);border-radius:4px;padding:1px 6px">← actual</span>{% endif %}
+        </div>
+        {% endfor %}
       </div>
-      <div class="sr"><span class="sr-label">SPY momentum 3m</span><span class="sr-val col-{% if spy_mom3m >= 0 %}green{% else %}red{% endif %}">{{ "%+.1f"|format(spy_mom3m) }}%</span></div>
-      <div class="sr"><span class="sr-label">VIX</span><span class="sr-val col-{% if vix > 25 %}red{% elif vix > 18 %}yellow{% else %}green{% endif %}">{{ vix }}</span></div>
-      <div class="sr"><span class="sr-label">Fear &amp; Greed</span><span class="sr-val" style="color:{{ fg_color }}">{{ fear_greed }}/100 · {{ fg_label }}</span></div>
     </div>
 
-    <!-- Eventos económicos -->
+    <!-- Noticias macro feed -->
     <div class="card">
-      <div class="card-title">📅 Eventos económicos</div>
-      {% if high_impact and eco_events %}
-        <div style="font-size:11px;color:var(--red);font-weight:700;margin-bottom:10px;letter-spacing:.4px">⚠️ ALTO IMPACTO HOY</div>
-        {% for ev in eco_events %}
-        <div style="background:var(--rd);border:1px solid rgba(255,59,92,.2);border-radius:8px;padding:10px 12px;font-size:13px;color:#ff8090;margin-bottom:8px">{{ ev }}</div>
+      <div class="card-title">📰 Feed de noticias macro</div>
+      {% if macro_news %}
+        {% for n in macro_news[:10] %}
+        <div style="padding:10px 0;border-bottom:1px solid rgba(26,36,64,.4);display:flex;align-items:flex-start;gap:8px">
+          <span style="color:var(--t3);font-size:14px;flex-shrink:0;margin-top:1px">•</span>
+          <span style="font-size:12px;color:var(--t2);line-height:1.55;flex:1">{{ n }}</span>
+        </div>
         {% endfor %}
-        <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--b1);font-size:12px;color:var(--t3)">
-          El bot aumenta umbrales de confianza en días de alto impacto.
+        <div style="padding-top:12px;font-size:11px;color:var(--t3);text-align:center">
+          Fuente: RSS macro · Actualizado con el contexto del bot
         </div>
       {% else %}
-        <div class="empty" style="padding:28px"><span class="ei" style="font-size:24px">📅</span><p>Sin eventos de alto impacto hoy</p></div>
-      {% endif %}
-    </div>
-
-    <!-- Noticias macro -->
-    <div class="card">
-      <div class="card-title">📡 Noticias macro</div>
-      {% if macro_news %}
-        {% for n in macro_news[:8] %}
-        <div class="news-item">{{ n }}</div>
-        {% endfor %}
-      {% else %}
-        <div class="empty" style="padding:28px"><span class="ei" style="font-size:24px">📰</span><p>Sin noticias disponibles</p></div>
+        <div class="empty" style="padding:40px"><span class="ei">📰</span><p>Sin noticias macro disponibles</p></div>
       {% endif %}
     </div>
 
@@ -1277,6 +1562,31 @@ new Chart(ctx, {
     animation: { animateScale: true }
   }
 });
+{% endif %}
+
+// ── Donut en Análisis ────────────────────────────────────────────────
+{% if wins + losses > 0 %}
+const ctx2 = document.getElementById('donutAnalysis');
+if (ctx2) {
+  new Chart(ctx2.getContext('2d'), {
+    type: 'doughnut',
+    data: {
+      labels: ['Wins', 'Losses'],
+      datasets: [{
+        data: [{{ wins }}, {{ losses }}],
+        backgroundColor: ['rgba(0,224,122,.75)', 'rgba(255,59,92,.75)'],
+        borderColor: ['#00e07a', '#ff3b5c'],
+        borderWidth: 2,
+        hoverOffset: 8,
+      }]
+    },
+    options: {
+      cutout: '74%',
+      plugins: { legend: { display: false } },
+      animation: { animateScale: true }
+    }
+  });
+}
 {% endif %}
 
 // ── Silent AJAX refresh ─────────────────────────────────────────────
