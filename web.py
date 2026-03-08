@@ -1555,7 +1555,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
             <th class="sortable" onclick="sortTable(this,3)">Tipo</th>
             <th>5D</th>
             <th class="sortable" onclick="sortTable(this,5)">Entrada</th>
-            <th class="sortable" onclick="sortTable(this,6)">Precio actual</th>
+            <th class="sortable" onclick="sortTable(this,6)">Precio actual <span id="live-dot" title="Actualizando precios..." style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--t3);margin-left:4px;vertical-align:middle"></span></th>
             <th class="sortable" onclick="sortTable(this,7)">vs Entrada</th>
             <th class="sortable" onclick="sortTable(this,8)">Objetivo</th>
             <th class="sortable" onclick="sortTable(this,9)">Stop</th>
@@ -1575,6 +1575,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
           {% set pkey = 'sbp_pin_' ~ p.ticker ~ '_' ~ (p.date[:10] if p.date else '') %}
           {% set nkey = 'sbp_note_' ~ p.ticker ~ '_' ~ (p.date[:10] if p.date else '') %}
           <tr data-pin-key="{{ pkey }}" data-note-key="{{ nkey }}"
+            data-ticker="{{ p.ticker }}"
             data-entry="{{ p.entry|float }}"
             data-stop="{{ p.stop|float }}"
             data-confidence="{{ p.confidence|int }}"
@@ -1604,24 +1605,25 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
             <td>
               <span class="mono">${{ "%.2f"|format(p.entry|float) }}</span>
             </td>
-            <td>
+            <td class="live-price-td" data-entry="{{ p.entry|float }}">
               {% if has_cur %}
-                <span class="mono" style="font-weight:700;color:var(--t1)">${{ "%.2f"|format(p.current_price) }}</span>
+                <span class="live-price mono" style="font-weight:700;color:var(--t1)">${{ "%.2f"|format(p.current_price) }}</span>
                 {% if p.current_chg is not none %}
-                <br><span style="font-size:10px;color:{% if p.current_chg >= 0 %}var(--green){% else %}var(--red){% endif %}">
+                <br><span class="live-chg" style="font-size:10px;color:{% if p.current_chg >= 0 %}var(--green){% else %}var(--red){% endif %}">
                   {{ "%+.2f"|format(p.current_chg) }}% hoy
                 </span>
-                {% endif %}
+                {% else %}<br><span class="live-chg" style="font-size:10px"></span>{% endif %}
               {% else %}
-                <span style="color:var(--t3);font-size:12px">— fuera mkt</span>
+                <span class="live-price" style="color:var(--t3);font-size:12px">—</span>
+                <br><span class="live-chg" style="font-size:10px"></span>
               {% endif %}
             </td>
-            <td>
+            <td class="live-vs-td">
               {% if p.vs_entry_pct is not none %}
-                <span style="font-weight:700;font-size:13px;color:{% if p.vs_entry_pct >= 0 %}var(--green){% else %}var(--red){% endif %}">
+                <span class="live-vs" style="font-weight:700;font-size:13px;color:{% if p.vs_entry_pct >= 0 %}var(--green){% else %}var(--red){% endif %}">
                   {{ "%+.2f"|format(p.vs_entry_pct) }}%
                 </span>
-              {% else %}<span style="color:var(--t3)">—</span>{% endif %}
+              {% else %}<span class="live-vs" style="color:var(--t3)">—</span>{% endif %}
             </td>
             <td>
               <span class="mono g">${{ "%.2f"|format(p.target|float) }}</span>
@@ -3259,6 +3261,93 @@ function calcSizerModal(entry, stop, price, capital, sym, target, targetPct, day
     </div>`;
 }
 
+// ── LIVE PRICES ──────────────────────────────────────────────────────────
+let _livePrices = {};
+
+function _fmt2(n) { return n != null ? n.toFixed(2) : null; }
+
+function refreshLivePrices() {
+  const dot = document.getElementById('live-dot');
+  if (dot) { dot.style.background = 'var(--yellow)'; dot.title = 'Actualizando…'; }
+
+  fetch('/api/prices')
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      if (!d || !d.prices) return;
+      _livePrices = d.prices;
+
+      // Actualizar cada fila
+      document.querySelectorAll('#signals-tbody tr').forEach(row => {
+        const tk    = row.dataset.ticker;
+        const info  = d.prices[tk];
+        if (!tk || !info || info.price == null) return;
+
+        const newPrice = info.price;
+        const newChg   = info.chg;
+        const entry    = parseFloat(row.querySelector('.live-price-td')?.dataset.entry) || 0;
+
+        // Actualizar data-price en el <tr> para que el modal use el precio nuevo
+        row.dataset.price = newPrice;
+        // Actualizar también el botón de la calculadora
+        const btn = row.querySelector('.ps-calc-btn');
+        if (btn) btn.dataset.price = newPrice;
+
+        // Celda precio actual
+        const priceEl = row.querySelector('.live-price');
+        if (priceEl) {
+          const old = parseFloat(priceEl.textContent.replace('$','')) || 0;
+          priceEl.textContent = '$' + _fmt2(newPrice);
+          priceEl.style.fontWeight = '700';
+          priceEl.style.color = 'var(--t1)';
+          // Flash animación si cambió
+          if (old > 0 && Math.abs(newPrice - old) > 0.005) {
+            const flash = newPrice > old ? 'var(--green)' : 'var(--red)';
+            priceEl.style.color = flash;
+            setTimeout(() => { if (priceEl) priceEl.style.color = 'var(--t1)'; }, 1200);
+          }
+        }
+
+        // Celda cambio diario
+        const chgEl = row.querySelector('.live-chg');
+        if (chgEl && newChg != null) {
+          chgEl.textContent = (newChg >= 0 ? '+' : '') + _fmt2(newChg) + '% hoy';
+          chgEl.style.color = newChg >= 0 ? 'var(--green)' : 'var(--red)';
+        }
+
+        // Celda vs entrada
+        const vsEl = row.querySelector('.live-vs');
+        if (vsEl && entry > 0) {
+          const signal = row.dataset.stype;
+          const raw    = (newPrice - entry) / entry * 100;
+          const vsPct  = signal === 'SELL' ? -raw : raw;
+          vsEl.textContent = (vsPct >= 0 ? '+' : '') + vsPct.toFixed(2) + '%';
+          vsEl.style.color = vsPct >= 0 ? 'var(--green)' : 'var(--red)';
+          vsEl.style.fontWeight = '700';
+          vsEl.style.fontSize = '13px';
+        }
+      });
+
+      // Recalcular position sizing con precios actualizados
+      if (document.getElementById('ps-capital')?.value) recalcPositions();
+
+      // Punto verde = live
+      const now = new Date();
+      const hm  = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+      if (dot) {
+        dot.style.background = 'var(--green)';
+        dot.style.boxShadow  = '0 0 6px var(--green)';
+        dot.title = 'En vivo · última actualización ' + hm;
+      }
+    })
+    .catch(() => {
+      if (dot) { dot.style.background = 'var(--red)'; dot.title = 'Error actualizando precios'; }
+    });
+}
+
+// Arrancar en vivo: primera llamada inmediata, luego cada 30s
+refreshLivePrices();
+setInterval(refreshLivePrices, 30000);
+
 function closeSizerModal() {
   const m = document.getElementById('sizer-modal');
   if (m) m.style.display = 'none';
@@ -3297,6 +3386,20 @@ def api_data():
     if not session.get("auth"):
         return jsonify({"error": "unauthorized"}), 401
     return jsonify(build_payload())
+
+
+@app.route("/api/prices")
+def api_prices():
+    """Precios en vivo para todos los tickers pendientes. Ligero y rápido."""
+    if not session.get("auth"):
+        return jsonify({"error": "unauthorized"}), 401
+    preds   = _rjson("predictions.json", [])
+    tickers = list({p["ticker"] for p in preds if p.get("result") == "pending" and p.get("ticker")})
+    out = {}
+    for tk in tickers:
+        price, chg = _fetch_price(tk)
+        out[tk] = {"price": price, "chg": chg}
+    return jsonify({"prices": out, "ts": int(time.time())})
 
 
 @app.route("/logout")
