@@ -16,7 +16,105 @@ except ImportError:
 # Caché de precios: ticker → (price, change_pct, timestamp)
 _price_cache = {}
 _price_lock  = threading.Lock()
-_PRICE_TTL   = 15    # 15 seg (live)
+_PRICE_TTL   = 3     # 3 seg (Finnhub WS actualiza en tiempo real)
+
+# Caché de cierre anterior: ticker → (prev_close, timestamp) — TTL 24 h
+_prev_close_cache = {}
+_prev_close_lock  = threading.Lock()
+_PREV_CLOSE_TTL   = 86400
+
+# ─── Finnhub WebSocket (precios en tiempo real) ────────────────────────────────
+FINNHUB_KEY    = os.environ.get("FINNHUB_KEY", "GN255O5B9CERVXLC")
+_fh_ws         = None   # instancia WebSocketApp activa
+_fh_subscribed = set()  # tickers suscritos actualmente
+_fh_lock       = threading.Lock()
+
+
+def _fh_on_message(ws, message):
+    """Recibe trades de Finnhub y actualiza _price_cache al instante."""
+    try:
+        data = json.loads(message)
+        if data.get("type") != "trade":
+            return
+        now_ts = time.time()
+        for trade in data.get("data", []):
+            ticker = trade["s"]
+            price  = round(float(trade["p"]), 2)
+            with _prev_close_lock:
+                pc_entry = _prev_close_cache.get(ticker)
+            prev_close = pc_entry[0] if pc_entry else None
+            chg = round((price - prev_close) / prev_close * 100, 2) if prev_close else None
+            with _price_lock:
+                old = _price_cache.get(ticker)
+                # Conservar chg anterior si aún no tenemos prev_close
+                if chg is None and old:
+                    chg = old[1]
+                _price_cache[ticker] = (price, chg, now_ts)
+    except Exception:
+        pass
+
+
+def _fh_on_open(ws):
+    with _fh_lock:
+        for tk in list(_fh_subscribed):
+            try:
+                ws.send(json.dumps({"type": "subscribe", "symbol": tk}))
+            except Exception:
+                pass
+
+
+def _fh_start():
+    """Hilo daemon: mantiene conexión WebSocket con Finnhub y reconecta si cae."""
+    global _fh_ws
+    try:
+        import websocket as _ws_lib
+    except ImportError:
+        return  # websocket-client no instalado, funciona sin él (yfinance fallback)
+    while True:
+        try:
+            ws = _ws_lib.WebSocketApp(
+                f"wss://ws.finnhub.io?token={FINNHUB_KEY}",
+                on_open=_fh_on_open,
+                on_message=_fh_on_message,
+                on_error=lambda ws, e: None,
+                on_close=lambda ws, *a: None,
+            )
+            with _fh_lock:
+                _fh_ws = ws
+            ws.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception:
+            pass
+        with _fh_lock:
+            _fh_ws = None
+        time.sleep(5)
+
+
+def _fh_sync_tickers(tickers):
+    """Suscribe tickers nuevos y desuscribe los que ya no hacen falta."""
+    new_set = set(tickers)
+    with _fh_lock:
+        ws     = _fh_ws
+        to_add = new_set - _fh_subscribed
+        to_rem = _fh_subscribed - new_set
+        connected = ws and getattr(getattr(ws, "sock", None), "connected", False)
+        if connected:
+            for tk in to_add:
+                try:
+                    ws.send(json.dumps({"type": "subscribe",   "symbol": tk}))
+                except Exception:
+                    pass
+            for tk in to_rem:
+                try:
+                    ws.send(json.dumps({"type": "unsubscribe", "symbol": tk}))
+                except Exception:
+                    pass
+        _fh_subscribed.update(to_add)
+        _fh_subscribed -= to_rem
+
+
+# Arrancar hilo Finnhub WS al importar el módulo
+threading.Thread(target=_fh_start, daemon=True).start()
+# ──────────────────────────────────────────────────────────────────────────────
 
 # Caché de earnings: ticker → (date_str_or_None, timestamp)
 _earnings_cache = {}
@@ -64,7 +162,7 @@ def is_premarket_now():
 
 
 def _fetch_price(ticker):
-    """Devuelve (price, change_pct) con caché de 15 seg. Nunca lanza excepción."""
+    """Devuelve (price, change_pct). Usa caché (actualizada por Finnhub WS o yfinance)."""
     now_ts = time.time()
     with _price_lock:
         cached = _price_cache.get(ticker)
@@ -77,6 +175,12 @@ def _fetch_price(ticker):
         price  = round(float(fi.last_price), 2)   if fi.last_price  else None
         prev   = float(fi.previous_close)          if fi.previous_close else None
         chg    = round((price - prev) / prev * 100, 2) if price and prev else None
+        # Guardar prev_close para que Finnhub WS calcule el % de cambio diario
+        if prev:
+            with _prev_close_lock:
+                pc = _prev_close_cache.get(ticker)
+                if not pc or now_ts - pc[1] > _PREV_CLOSE_TTL:
+                    _prev_close_cache[ticker] = (prev, now_ts)
         with _price_lock:
             _price_cache[ticker] = (price, chg, now_ts)
         return price, chg
@@ -3312,9 +3416,9 @@ function refreshLivePrices() {
     });
 }
 
-// Arrancar en vivo: primera llamada inmediata, luego cada 30s
+// Arrancar en vivo: primera llamada inmediata, luego cada 5s
 refreshLivePrices();
-setInterval(refreshLivePrices, 15000);
+setInterval(refreshLivePrices, 5000);
 
 function closeSizerModal() {
   const m = document.getElementById('sizer-modal');
@@ -3363,6 +3467,8 @@ def api_prices():
         return jsonify({"error": "unauthorized"}), 401
     preds   = _rjson("predictions.json", [])
     tickers = list({p["ticker"] for p in preds if p.get("result") == "pending" and p.get("ticker")})
+    # Sincronizar suscripciones Finnhub con los tickers activos
+    _fh_sync_tickers(tickers)
     out = {}
     for tk in tickers:
         price, chg = _fetch_price(tk)
