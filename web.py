@@ -48,8 +48,11 @@ def _fh_on_message(ws, message):
             return
         now_ts = time.time()
         for trade in data.get("data", []):
-            ticker = trade["s"]
-            price  = round(float(trade["p"]), 2)
+            ticker = trade.get("s")
+            raw_p  = trade.get("p")
+            if not ticker or raw_p is None:
+                continue
+            price  = round(float(raw_p), 2)
             with _prev_close_lock:
                 pc_entry = _prev_close_cache.get(ticker)
             prev_close = pc_entry[0] if pc_entry is not None else None
@@ -453,11 +456,11 @@ def build_payload():
     avg_win  = 0
     avg_loss = 0
     if wins   > 0:
-        w_pls = [((p.get("exit_price",0) - p["entry"]) / p["entry"] * 100)
+        w_pls = [((p.get("exit_price",0) - p.get("entry",0)) / p.get("entry",1) * 100)
                  for p in preds if p.get("result") == "win" and p.get("exit_price") and p.get("entry")]
         avg_win = round(sum(w_pls) / len(w_pls), 1) if w_pls else 0
     if losses > 0:
-        l_pls = [((p.get("exit_price",0) - p["entry"]) / p["entry"] * 100)
+        l_pls = [((p.get("exit_price",0) - p.get("entry",0)) / p.get("entry",1) * 100)
                  for p in preds if p.get("result") == "loss" and p.get("exit_price") and p.get("entry")]
         avg_loss = round(sum(l_pls) / len(l_pls), 1) if l_pls else 0
 
@@ -636,7 +639,7 @@ def build_payload():
 
     # ── Earnings próximos (señales activas) ─────────────────────────────
     earnings_upcoming = sorted(
-        [{"ticker": p["ticker"], "date": p["earnings_date"],
+        [{"ticker": p.get("ticker", ""), "date": p["earnings_date"],
           "signal": p.get("signal", ""), "during": p.get("earnings_during", False)}
          for p in pending if p.get("earnings_date")],
         key=lambda x: x["date"]
