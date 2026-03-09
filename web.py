@@ -52,15 +52,15 @@ def _fh_on_message(ws, message):
             price  = round(float(trade["p"]), 2)
             with _prev_close_lock:
                 pc_entry = _prev_close_cache.get(ticker)
-            prev_close = pc_entry[0] if pc_entry else None
+            prev_close = pc_entry[0] if pc_entry is not None else None
             chg = round((price - prev_close) / prev_close * 100, 2) if prev_close else None
             with _price_lock:
                 old = _price_cache.get(ticker)
                 if chg is None and old:
                     chg = old[1]
                 _price_cache[ticker] = (price, chg, now_ts)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ERROR] _fh_on_message: {e}")
 
 
 def _fh_on_open(ws):
@@ -108,8 +108,8 @@ def _fh_start():
                         break
             threading.Thread(target=_watchdog, daemon=True).start()
             ws.run_forever(ping_interval=30, ping_timeout=10)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WS ERROR] {e}")
         with _fh_lock:
             _fh_ws = None
         # Reconectar rápido si sigue en horario; esperar si cerró por fin de sesión
@@ -204,8 +204,8 @@ def _fetch_price(ticker):
         return None, None
     try:
         fi = yf.Ticker(ticker).fast_info
-        price  = round(float(fi.last_price), 2)   if fi.last_price  else None
-        prev   = float(fi.previous_close)          if fi.previous_close else None
+        price  = round(float(fi.last_price), 2)   if fi.last_price is not None  else None
+        prev   = float(fi.previous_close)          if fi.previous_close is not None else None
         chg    = round((price - prev) / prev * 100, 2) if price and prev else None
         # Guardar prev_close para que Finnhub WS calcule el % de cambio diario
         if prev:
@@ -363,9 +363,9 @@ def build_payload():
 
         # Precio actual + % cambio desde entrada
         cur_price, cur_chg = _fetch_price(p.get("ticker", ""))
-        p["current_price"] = cur_price
+        p["current_price"] = cur_price  # puede ser None si _fetch_price retorna (None, None)
         p["current_chg"]   = cur_chg    # % diario
-        if cur_price and entry > 0:
+        if cur_price is not None and entry > 0:
             raw_vs_entry = (cur_price - entry) / entry * 100
             p["vs_entry_pct"] = round(raw_vs_entry if p.get("signal") == "COMPRAR" else -raw_vs_entry, 2)
             # Progreso real hacia target
@@ -3559,7 +3559,7 @@ def api_prices():
     if not session.get("auth"):
         return jsonify({"error": "unauthorized"}), 401
     preds   = _rjson("predictions.json", [])
-    tickers = list({p["ticker"] for p in preds if p.get("result") == "pending" and p.get("ticker")})
+    tickers = list({p["ticker"] for p in preds if isinstance(p, dict) and "ticker" in p and p.get("result") == "pending" and p.get("ticker")})
     # Sincronizar suscripciones Finnhub con los tickers activos
     _fh_sync_tickers(tickers)
     out = {}

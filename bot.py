@@ -18,10 +18,12 @@ Añadidos sobre v5.2:
   - Circuit breaker: 3 pérdidas seguidas → umbral +5% durante 24h
 """
 
-import os, time, json, random, schedule, requests, feedparser, anthropic, re
+import os, time, json, random, schedule, requests, feedparser, anthropic, re, threading
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pytz
+
+_ws_lock = threading.Lock()  # protege escrituras concurrentes en watch_signals
 
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
@@ -696,7 +698,8 @@ def update_econ_calendar():
             for keyword, event_name in high_impact_keywords.items():
                 if keyword.lower() in title.lower() and event_name not in found_events:
                     found_events.append(event_name)
-    except Exception: pass
+    except Exception as e:
+        print(f"[ERROR] econ_calendar RSS: {e}")
 
     # También revisar macro_news del contexto
     for news in market_context.get("macro_news", []):
@@ -797,10 +800,13 @@ def update_status(text):
                 headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=10,
             )
             if r.status_code == 200:
-                for m in r.json():
-                    if m.get("author", {}).get("bot"):
-                        status_msg_id = m["id"]
-                        break
+                try:
+                    for m in r.json():
+                        if m.get("author", {}).get("bot"):
+                            status_msg_id = m["id"]
+                            break
+                except (ValueError, KeyError) as e:
+                    print(f"[ERROR] update_status JSON GET: {e}")
 
         if status_msg_id:
             r = requests.patch(
@@ -816,7 +822,10 @@ def update_status(text):
             json={"content": text}, headers=auth, timeout=10,
         )
         if r.status_code in (200, 201):
-            status_msg_id = r.json().get("id")
+            try:
+                status_msg_id = r.json().get("id")
+            except (ValueError, KeyError) as e:
+                print(f"[ERROR] update_status JSON POST: {e}")
     except Exception as e:
         print(f"  Status error: {e}")
 
@@ -828,14 +837,20 @@ def post_instrucciones():
             headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=10,
         )
         if r.status_code == 200:
-            for m in r.json():
+            try:
+                _msgs = r.json()
+            except ValueError as e:
+                print(f"[ERROR] post_instrucciones JSON: {e}")
+                _msgs = []
+            for m in _msgs:
                 if m.get("author", {}).get("bot"):
                     requests.delete(
                         f"https://discord.com/api/v10/channels/{DISCORD_INSTRUCCIONES_ID}/messages/{m['id']}",
                         headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, timeout=5,
                     )
                     time.sleep(0.5)
-    except Exception: pass
+    except Exception as e:
+        print(f"[ERROR] post_instrucciones limpieza: {e}")
 
     resolved  = len([p for p in predictions if p.get("result") != "pending"])
     rules_cnt = len(learnings.get("rules", []))
@@ -971,9 +986,11 @@ def update_market_context():
         try:
             r = requests.get("https://api.alternative.me/fng/", timeout=8)
             if r.status_code == 200:
-                fg = int(r.json()["data"][0]["value"])
-        except Exception:
-            pass
+                _fng_data = r.json().get("data") or []
+                if _fng_data:
+                    fg = int(_fng_data[0]["value"])
+        except Exception as e:
+            print(f"[ERROR] fear_greed fallback: {e}")
 
     sp500_change, vix = 0.0, 15.0
     for symbol, key in [("SPY", "sp500"), ("^VIX", "vix")]:
@@ -983,14 +1000,17 @@ def update_market_context():
                 headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
             )
             if r.status_code == 200:
-                closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
-                if len(closes) >= 2:
-                    if key == "sp500":
-                        sp500_change = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 2)
-                    else:
-                        vix = round(closes[-1], 1)
+                _chart_result = r.json().get("chart", {}).get("result") or []
+                if _chart_result:
+                    closes = [c for c in _chart_result[0]["indicators"]["quote"][0].get("close", []) if c]
+                    if len(closes) >= 2:
+                        if key == "sp500":
+                            sp500_change = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 2)
+                        else:
+                            vix = round(closes[-1], 1)
             time.sleep(0.5)
-        except Exception: pass
+        except Exception as e:
+            print(f"[ERROR] update_market_context {symbol}: {e}")
 
     macro_news, econ_events = [], []
     if NEWS_API_KEY:
@@ -1001,7 +1021,8 @@ def update_market_context():
             )
             if r.status_code == 200:
                 macro_news = [a.get("title", "") for a in r.json().get("articles", [])[:6]]
-        except Exception: pass
+        except Exception as e:
+            print(f"[ERROR] macro_news NewsAPI: {e}")
         try:
             r = requests.get(
                 f"https://newsapi.org/v2/everything?q=Federal+Reserve+OR+CPI+OR+inflation&language=en&sortBy=publishedAt&pageSize=4&apiKey={NEWS_API_KEY}",
@@ -1009,7 +1030,8 @@ def update_market_context():
             )
             if r.status_code == 200:
                 econ_events = [a.get("title", "") for a in r.json().get("articles", [])[:4]]
-        except Exception: pass
+        except Exception as e:
+            print(f"[ERROR] econ_events NewsAPI: {e}")
 
     market_context.update({
         "fear_greed": fg, "sp500_change": sp500_change, "vix": vix,
@@ -1043,7 +1065,8 @@ def detect_market_regime():
             headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
         )
         if r.status_code == 200:
-            spy_closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
+            _spy_result = r.json().get("chart", {}).get("result") or []
+            spy_closes = [c for c in _spy_result[0]["indicators"]["quote"][0].get("close", []) if c] if _spy_result else []
 
         if not spy_closes or len(spy_closes) < 20:
             print("  detect_market_regime: datos SPY insuficientes — manteniendo régimen anterior")
@@ -1201,12 +1224,19 @@ def get_premarket_data(ticker):
     Devuelve dict con gap_pct, premarket_price, premarket_volume o None.
     """
     try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d&prePost=true",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
-        )
-        if r.status_code == 429:
-            time.sleep(5)
+        _pm_wait = 5
+        for _pm_attempt in range(3):
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d&prePost=true",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+            )
+            if r.status_code == 429:
+                print(f"[WARN] get_premarket_data 429 {ticker}, reintento en {_pm_wait}s")
+                time.sleep(_pm_wait)
+                _pm_wait *= 2
+                continue
+            break
+        else:
             return None
         if r.status_code != 200:
             return None
@@ -1423,9 +1453,16 @@ def quick_scan():
         "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_losers&count=50",
     ]:
         try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 429:
-                time.sleep(5)
+            _scr_wait = 5
+            for _scr_attempt in range(3):
+                r = requests.get(url, headers=headers, timeout=15)
+                if r.status_code == 429:
+                    print(f"[WARN] screener 429, reintento en {_scr_wait}s")
+                    time.sleep(_scr_wait)
+                    _scr_wait *= 2
+                    continue
+                break
+            else:
                 continue
             if r.status_code != 200:
                 continue
@@ -1616,7 +1653,7 @@ def get_market_data(ticker):
         closes_m = hist["Close"].resample("ME").last().dropna().tolist()
 
         price      = closes[-1]
-        change_pct = ((price - closes[-2]) / closes[-2]) * 100
+        change_pct = ((price - closes[-2]) / closes[-2]) * 100 if closes[-2] else 0.0
         sma20      = sum(closes[-20:]) / 20
         sma50      = sum(closes[-50:]) / 50
         sma200     = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
@@ -1809,12 +1846,19 @@ def get_fundamentals(ticker):
     }
     modules = "defaultKeyStatistics,financialData,calendarEvents,earningsHistory,insiderTransactions,assetProfile"
     try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules={modules}",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=12,
-        )
-        if r.status_code == 429:
-            time.sleep(5)
+        _fund_wait = 5
+        for _fund_attempt in range(3):
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules={modules}",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=12,
+            )
+            if r.status_code == 429:
+                print(f"[WARN] get_fundamentals 429 {ticker}, reintento en {_fund_wait}s")
+                time.sleep(_fund_wait)
+                _fund_wait *= 2
+                continue
+            break
+        else:
             return result
         if r.status_code != 200:
             return result
@@ -1907,14 +1951,16 @@ def get_sentiment(ticker, sector):
                     title = a.get("title", "")
                     news_items.append(f"[NEWS] {title}")
                     sentiment_score += _score_headline(title, positive_words, negative_words)
-        except Exception: pass
+        except Exception as e:
+            print(f"[ERROR] ticker_news NewsAPI {ticker}: {e}")
 
     # RSS Yahoo Finance
     try:
         feed = feedparser.parse(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US")
         for e in feed.entries[:3]:
             news_items.append(f"[YAHOO] {e.title}")
-    except Exception: pass
+    except Exception as e:
+        print(f"[ERROR] ticker_news Yahoo RSS {ticker}: {e}")
 
     # Investing.com
     investing_news = get_investing_news(ticker)
@@ -1935,10 +1981,13 @@ def get_sentiment(ticker, sector):
                 headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
             )
             if r.status_code == 200:
-                closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
-                if len(closes) >= 2:
-                    sector_perf = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 2)
-        except Exception: pass
+                _etf_result = r.json().get("chart", {}).get("result") or []
+                if _etf_result:
+                    closes = [c for c in _etf_result[0]["indicators"]["quote"][0].get("close", []) if c]
+                    if len(closes) >= 2:
+                        sector_perf = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 2)
+        except Exception as e:
+            print(f"[ERROR] sector_perf {etf}: {e}")
 
     # Bias sectorial por geopolítica
     sector_geo_bias = market_context.get("sector_bias", {}).get(etf, "neutral") if etf else "neutral"
@@ -2132,7 +2181,10 @@ def update_prediction_results():
                 headers={"User-Agent": "Mozilla/5.0"}, timeout=8,
             )
             if r.status_code == 200:
-                closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", []) if c]
+                _pred_result = r.json().get("chart", {}).get("result") or []
+                if not _pred_result:
+                    continue
+                closes = [c for c in _pred_result[0]["indicators"]["quote"][0].get("close", []) if c]
                 if not closes:
                     continue
                 current    = closes[-1]
@@ -2163,7 +2215,8 @@ def update_prediction_results():
                         f"📅 {days_since} día(s) | {p.get('signal_type','NORMAL')}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                     )
-        except Exception: pass
+        except Exception as e:
+            print(f"[ERROR] check_predictions {ticker}: {e}")
         time.sleep(0.3)
     save_state()
 
@@ -2669,7 +2722,8 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
         pasa, pf_resumen = pre_filter_convergence(tech, fund, sent, inst_signal, boost, special_signals)
         if not pasa:
             print(f"    {ticker}: prefiltro {pf_resumen}")
-            watch_signals[ticker] = {"last_analyzed": datetime.now(SPAIN_TZ).isoformat(), "developing": False}
+            with _ws_lock:
+                watch_signals[ticker] = {"last_analyzed": datetime.now(SPAIN_TZ).isoformat(), "developing": False}
             save_state()
             return None
         print(f"    {ticker}: prefiltro OK — {pf_resumen}")
@@ -2685,7 +2739,8 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
         return None
 
     if not force and "NO_SIGNAL" in ai_response:
-        watch_signals[ticker] = {"last_analyzed": datetime.now(SPAIN_TZ).isoformat(), "developing": False}
+        with _ws_lock:
+            watch_signals[ticker] = {"last_analyzed": datetime.now(SPAIN_TZ).isoformat(), "developing": False}
         save_state()
         return None
 
@@ -2739,10 +2794,11 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
     session_tag = _session_label(datetime.now(SPAIN_TZ))
     text, signal = format_alert(tech, ai_response, conf_final, session_tag, signal_type)
 
-    watch_signals[ticker] = {
-        "last_analyzed": datetime.now(SPAIN_TZ).isoformat(),
-        "developing":    conf_final >= CONF_FUERTE,
-    }
+    with _ws_lock:
+        watch_signals[ticker] = {
+            "last_analyzed": datetime.now(SPAIN_TZ).isoformat(),
+            "developing":    conf_final >= CONF_FUERTE,
+        }
     save_state()
 
     nivel = "EXCEPCIONAL ⚡" if conf_final >= CONF_EXCEPCIONAL else "FUERTE 🔥" if conf_final >= CONF_FUERTE else "NORMAL 🟢"
@@ -2925,11 +2981,14 @@ def cmd_pendientes():
                 headers={"User-Agent": "Mozilla/5.0"}, timeout=6,
             )
             if r.status_code == 200:
-                closes = r.json()["chart"]["result"][0]["indicators"]["quote"][0].get("close", [])
-                closes = [c for c in closes if c]
-                if closes:
-                    current_price = closes[-1]
-        except Exception: pass
+                _status_result = r.json().get("chart", {}).get("result") or []
+                if _status_result:
+                    closes = _status_result[0]["indicators"]["quote"][0].get("close", [])
+                    closes = [c for c in closes if c]
+                    if closes:
+                        current_price = closes[-1]
+        except Exception as e:
+            print(f"[ERROR] portfolio_status {p['ticker']}: {e}")
 
         entry  = p.get("entry", 0)
         target = p.get("target", 0)
@@ -3059,11 +3118,12 @@ def watch_cycle():
             if ticker not in watch_signals or not watch_signals.get(ticker, {}).get("last_analyzed"):
                 errores_429_ciclo += 1
                 # Marcar cooldown para no reintentar hasta ~20 min
-                watch_signals[ticker] = {
-                    "last_analyzed": (datetime.now(SPAIN_TZ) - timedelta(minutes=40)).isoformat(),
-                    "developing": False,
-                    "reason": "429_cooldown",
-                }
+                with _ws_lock:
+                    watch_signals[ticker] = {
+                        "last_analyzed": (datetime.now(SPAIN_TZ) - timedelta(minutes=40)).isoformat(),
+                        "developing": False,
+                        "reason": "429_cooldown",
+                    }
                 save_state()
             time.sleep(2)
             continue
@@ -3103,7 +3163,11 @@ def listen_commands(init=False):
         if r.status_code != 200:
             return
 
-        messages = r.json()
+        try:
+            messages = r.json()
+        except ValueError as e:
+            print(f"[ERROR] poll_commands JSON: {e}")
+            return
         if not messages:
             return
 
