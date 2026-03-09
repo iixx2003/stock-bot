@@ -1689,11 +1689,6 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
 
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
     <div class="sh" style="margin-bottom:0;flex:1;min-width:200px">📡 Señales activas — {{ pending_ct }} predicciones en curso</div>
-    <span style="font-size:11px;color:var(--t3);background:var(--s2);border:1px solid var(--b1);border-radius:6px;padding:4px 10px;white-space:nowrap">
-      💡 Precio actualiza cada 15 seg
-    </span>
-    <button onclick="document.getElementById('add-pred-modal').classList.add('open')"
-      style="background:var(--green);color:#000;border:none;border-radius:8px;padding:6px 14px;font-weight:700;font-size:12px;cursor:pointer;white-space:nowrap">+ Predicción</button>
   </div>
 
   <!-- Buscador -->
