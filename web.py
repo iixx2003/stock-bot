@@ -1072,6 +1072,15 @@ body{background:var(--bg);color:var(--t1);font-family:'Inter',system-ui,sans-ser
   .dow-grid{grid-template-columns:repeat(4,1fr)}
   #toast-container{bottom:12px;right:12px;left:12px}
   .toast{max-width:100%}
+  /* calendario con earnings — mobile */
+  .cal-grid{gap:2px}
+  .cal-day{min-height:44px;padding:3px 4px}
+  .cal-num{font-size:9px}
+  .cal-pl{font-size:9px}
+  .cal-wl{font-size:8px}
+  .cal-earn-badge{font-size:7px;padding:0 2px}
+  /* earnings panels — mobile */
+  .b-earn-sm{font-size:9px;padding:2px 4px}
 }
 
 /* ── SPARKLINE ── */
@@ -1718,7 +1727,6 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
             <th class="sortable" onclick="sortTable(this,12)">Earnings</th>
             <th class="sortable" onclick="sortTable(this,13)">Sector</th>
             <th class="sortable" onclick="sortTable(this,14)">Días</th>
-            <th title="Position sizing basado en tu capital">💰 Posición</th>
             <th>📝</th>
           </tr>
         </thead>
@@ -1836,23 +1844,6 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
                 {{ p.days_remaining }}d
               </span>
               <br><span style="font-size:10px;color:var(--t3)">{{ p.date[:10] if p.date else '' }}</span>
-            </td>
-            <td class="ps-td" style="padding:6px 8px">
-              <div class="ps-cell ps-empty">—</div>
-              <button class="ps-calc-btn" onclick="openSizerModal(this)"
-                data-ticker="{{ p.ticker }}"
-                data-entry="{{ p.entry|float }}"
-                data-stop="{{ p.stop|float }}"
-                data-target="{{ p.target|float if p.target else 0 }}"
-                data-target-pct="{{ p.target_pct|float if p.target_pct else 0 }}"
-                data-days="{{ p.days_remaining|int if p.days_remaining else 0 }}"
-                data-price="{{ p.current_price if p.current_price else p.entry|float }}"
-                data-confidence="{{ p.confidence|int }}"
-                data-stype="{{ p.get('signal_type','NORMAL') }}"
-                title="Abrir calculadora de posición"
-                style="display:none;margin-top:5px;background:var(--s3);border:1px solid var(--b2);border-radius:6px;color:var(--t2);font-size:10px;font-weight:600;padding:4px 8px;cursor:pointer;width:100%">
-                💰 Calcular posición
-              </button>
             </td>
             <td style="padding:8px 6px;text-align:center">
               <button class="icon-btn" data-note-btn data-note-key="{{ nkey }}"
