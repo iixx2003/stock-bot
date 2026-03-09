@@ -1,7 +1,7 @@
 """StockBot Pro — Panel de control web v2 (multi-página, premium design)"""
 
 from flask import Flask, render_template_string, session, redirect, url_for, request, jsonify
-import json, os, time, threading, math
+import json, os, time, threading, math, requests as _requests
 from datetime import datetime, timedelta, date as _dt_date
 from calendar import monthrange as _mrange, month_name as _mname
 from collections import Counter as _Counter
@@ -195,7 +195,7 @@ def is_premarket_now():
 
 
 def _fetch_price(ticker):
-    """Devuelve (price, change_pct). Usa caché (actualizada por Finnhub WS o yfinance)."""
+    """Devuelve (price, change_pct). Usa caché (actualizada por Finnhub WS o Yahoo directo)."""
     now_ts = time.time()
     # En horario de mercado/premarket (09-22h ES) TTL 3s para máxima frescura; fuera 30s
     ttl = _PRICE_TTL if _fh_trading_hours() else 30
@@ -203,6 +203,31 @@ def _fetch_price(ticker):
         cached = _price_cache.get(ticker)
         if cached and now_ts - cached[2] < ttl:
             return cached[0], cached[1]
+    # Llamada directa a Yahoo Finance (más fiable que fast_info)
+    try:
+        r = _requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=6,
+        )
+        meta  = (r.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+        price = meta.get("regularMarketPrice") or meta.get("previousClose")
+        prev  = meta.get("previousClose") or meta.get("chartPreviousClose")
+        if price is None:
+            return None, None
+        price = round(float(price), 2)
+        prev  = round(float(prev), 2) if prev else None
+        chg   = round((price - prev) / prev * 100, 2) if prev else None
+        if prev:
+            with _prev_close_lock:
+                pc = _prev_close_cache.get(ticker)
+                if not pc or now_ts - pc[1] > _PREV_CLOSE_TTL:
+                    _prev_close_cache[ticker] = (prev, now_ts)
+        with _price_lock:
+            _price_cache[ticker] = (price, chg, now_ts)
+        return price, chg
+    except Exception:
+        pass
+    # Fallback yfinance
     if not _HAS_YF:
         return None, None
     try:
@@ -210,10 +235,9 @@ def _fetch_price(ticker):
         prev = float(fi.previous_close) if fi.previous_close is not None else None
         lp   = fi.last_price if fi.last_price is not None else getattr(fi, "pre_market_price", None)
         if lp is None:
-            lp = prev  # último recurso: precio de cierre anterior
+            lp = prev
         price = round(float(lp), 2) if lp is not None else None
         chg   = round((price - prev) / prev * 100, 2) if price and prev else None
-        # Guardar prev_close para que Finnhub WS calcule el % de cambio diario
         if prev:
             with _prev_close_lock:
                 pc = _prev_close_cache.get(ticker)
