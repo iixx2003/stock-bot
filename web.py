@@ -1881,14 +1881,19 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
                 data-confidence="{{ p.confidence|int }}"
                 data-stype="{{ p.get('signal_type','NORMAL') }}"
                 title="Calcular tamaño de posición"
-                style="background:var(--s3);border:1px solid var(--b2);border-radius:6px;color:var(--t2);font-size:10px;font-weight:600;padding:4px 8px;cursor:pointer;white-space:nowrap">
-                💰
+                style="background:#1e2d3d;border:1px solid #2a3f55;border-radius:10px;color:var(--t2);cursor:pointer;padding:6px 10px;display:flex;flex-direction:column;align-items:center;gap:2px;min-width:52px">
+                <span style="font-size:18px;line-height:1">💰</span>
+                <span style="font-size:9px;font-weight:600;color:#7ab3d4;text-transform:uppercase;letter-spacing:.4px">Posición</span>
               </button>
             </td>
             <td style="padding:8px 6px;text-align:center">
               <button class="icon-btn" data-note-btn data-note-key="{{ nkey }}"
                 onclick="openNoteModal('{{ p.ticker }}','{{ p.date[:10] if p.date else '' }}')"
-                title="Añadir nota">📝</button>
+                title="Añadir nota"
+                style="background:#1e2d3d;border:1px solid #2a3f55;border-radius:10px;cursor:pointer;padding:6px 10px;display:flex;flex-direction:column;align-items:center;gap:2px;min-width:52px">
+                <span style="font-size:18px;line-height:1">📝</span>
+                <span style="font-size:9px;font-weight:600;color:#7ab3d4;text-transform:uppercase;letter-spacing:.4px">Nota</span>
+              </button>
             </td>
           </tr>
           {% endfor %}
@@ -3166,8 +3171,8 @@ function loadNoteBadges() {
   document.querySelectorAll('[data-note-btn]').forEach(btn => {
     const nkey = btn.getAttribute('data-note-key');
     const note = nkey ? localStorage.getItem(nkey) : null;
-    if (note) { btn.textContent = '🗒️'; btn.classList.add('noted'); btn.title = note.substring(0, 80); }
-    else       { btn.textContent = '📝'; btn.classList.remove('noted'); btn.title = 'Añadir nota'; }
+    if (note) { btn.innerHTML = '<span style="font-size:18px;line-height:1">🗒️</span><span style="font-size:9px;font-weight:600;color:#f0b429;text-transform:uppercase;letter-spacing:.4px">Nota ✓</span>'; btn.classList.add('noted'); btn.title = note.substring(0, 80); }
+    else       { btn.innerHTML = '<span style="font-size:18px;line-height:1">📝</span><span style="font-size:9px;font-weight:600;color:#7ab3d4;text-transform:uppercase;letter-spacing:.4px">Nota</span>'; btn.classList.remove('noted'); btn.title = 'Añadir nota'; }
   });
 }
 
