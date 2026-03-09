@@ -1601,33 +1601,82 @@ def _fetch_twelve_data_candles(ticker, _retry=True):
         return None
 
 
+def _fetch_yahoo_candles(ticker):
+    """Fallback: descarga ~500 días de OHLCV diario desde Yahoo Finance (API pública)."""
+    import pandas as pd
+    _wait = 5
+    for _attempt in range(3):
+        try:
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+                params={"interval": "1d", "range": "2y"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15,
+            )
+            if r.status_code == 429:
+                time.sleep(_wait)
+                _wait *= 2
+                continue
+            if r.status_code != 200:
+                return None
+            chart = r.json().get("chart", {})
+            result = (chart.get("result") or [None])[0]
+            if not result:
+                return None
+            timestamps = result.get("timestamp", [])
+            q = result.get("indicators", {}).get("quote", [{}])[0]
+            adj = result.get("indicators", {}).get("adjclose", [{}])
+            closes = (adj[0].get("adjclose") if adj else None) or q.get("close")
+            if not timestamps or not closes or len(timestamps) < 50:
+                return None
+            df = pd.DataFrame({
+                "Open":   q.get("open"),
+                "High":   q.get("high"),
+                "Low":    q.get("low"),
+                "Close":  closes,
+                "Volume": q.get("volume"),
+            }, index=pd.to_datetime(timestamps, unit="s", utc=True))
+            df = df.apply(pd.to_numeric, errors="coerce").dropna(how="all").sort_index()
+            return df if len(df) >= 50 else None
+        except Exception as e:
+            print(f"    [{ticker}] Yahoo candles excepción: {e}")
+            return None
+    return None
+
+
 def prefetch_tickers(tickers):
-    """Descarga historial de todos los tickers vía Twelve Data (funciona en IPs cloud)."""
+    """Descarga historial de todos los tickers vía Twelve Data con fallback a Yahoo Finance."""
     global _hist_cache
     _hist_cache = {}
     if not tickers:
         return
-    if not TWELVE_DATA_KEY:
-        print("  ERROR: TWELVE_DATA_KEY no configurado — añade la variable en Railway")
-        return
     # Filtrar símbolos ya conocidos como inválidos
     valid = [t for t in tickers if t not in _td_invalid_symbols]
     skipped = len(tickers) - len(valid)
+    td_available = bool(TWELVE_DATA_KEY) and not (_td_credits_reset_at and time.time() < _td_credits_reset_at)
+    source_label = "Twelve Data" if td_available else "Yahoo Finance (TD sin créditos)"
     if skipped:
-        print(f"  Descargando historial de {len(valid)} tickers ({skipped} inválidos omitidos)...")
+        print(f"  Descargando historial de {len(valid)} tickers vía {source_label} ({skipped} inválidos omitidos)...")
     else:
-        print(f"  Descargando historial de {len(valid)} tickers vía Twelve Data...")
-    ok = 0
+        print(f"  Descargando historial de {len(valid)} tickers vía {source_label}...")
+    ok_td = ok_yf = 0
     for t in valid:
         try:
-            hist = _fetch_twelve_data_candles(t)
+            hist = None
+            if td_available:
+                hist = _fetch_twelve_data_candles(t)
+                if hist is not None and len(hist) >= 50:
+                    ok_td += 1
+            if hist is None or len(hist) < 50:
+                hist = _fetch_yahoo_candles(t)
+                if hist is not None and len(hist) >= 50:
+                    ok_yf += 1
+                    print(f"    [{t}] Yahoo fallback OK")
             if hist is not None and len(hist) >= 50:
                 _hist_cache[t] = hist
-                ok += 1
-            # rate limit gestionado globalmente por _td_rate_limit() en _fetch_twelve_data_candles
         except Exception as e:
             print(f"    {t}: error prefetch — {e}")
-    print(f"  Twelve Data OK: {ok}/{len(valid)} con datos")
+    print(f"  Datos OK: {ok_td} vía Twelve Data + {ok_yf} vía Yahoo = {ok_td+ok_yf}/{len(valid)} total")
 
 
 def get_market_data(ticker):
@@ -1636,6 +1685,8 @@ def get_market_data(ticker):
             hist = _hist_cache[ticker]
         else:
             hist = _fetch_twelve_data_candles(ticker)
+            if hist is None or len(hist) < 50:
+                hist = _fetch_yahoo_candles(ticker)
         if hist is None or hist.empty or len(hist) < 50:
             print(f"    {ticker}: sin datos de mercado")
             return None
