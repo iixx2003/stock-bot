@@ -139,7 +139,7 @@ def _fh_sync_tickers(tickers):
                 except Exception:
                     pass
         _fh_subscribed.update(to_add)
-        _fh_subscribed -= to_rem
+        _fh_subscribed.difference_update(to_rem)
 
 
 # Arrancar hilo Finnhub WS al importar el módulo
