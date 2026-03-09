@@ -319,6 +319,7 @@ GEO_SECTOR_MAP = {
 predictions    = []
 watch_signals  = {}
 earnings_watch = {}   # {ticker: {date, days_ahead, name, time}} — rellenado cada mañana
+_earnings_notif_date = None  # fecha (date) en que se mandó el último aviso Discord
 learnings      = {
     "rules": [], "sector_memory": {}, "hour_memory": {},
     "error_memory": [], "regime_memory": {}, "last_updated": None,
@@ -938,7 +939,7 @@ def update_earnings_watch():
     Actualiza el watch semanal de earnings. Se ejecuta a las 09:00 cada día laboral.
     Solo hace peticiones HTTP, nunca llama a la IA.
     """
-    global earnings_watch
+    global earnings_watch, _earnings_notif_date
     now = datetime.now(SPAIN_TZ)
     if now.weekday() >= 5:
         return
@@ -961,7 +962,11 @@ def update_earnings_watch():
             for tk, info in sorted(earnings_watch.items(), key=lambda x: x[1]["days_ahead"]):
                 t_tag = "🌅 pre-mkt" if "pre" in info.get("time","").lower() else "🌆 post-cierre" if "after" in info.get("time","").lower() else "🕐 horario"
                 lines.append(f"  • **{tk}** — {info['date']} ({info['days_ahead']}d) {t_tag}")
-            send_solicitud("\n".join(lines))
+            if _earnings_notif_date != now.date():
+                send_solicitud("\n".join(lines))
+                _earnings_notif_date = now.date()
+            else:
+                print("  📅 Notificación earnings ya enviada hoy — saltando Discord")
         else:
             print("  📅 Sin earnings en el universo los próximos 7 días")
     except Exception as e:
