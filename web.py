@@ -3053,8 +3053,8 @@ function sortTable(th, col) {
   rows.sort((a, b) => {
     const av = a.cells[col] ? a.cells[col].textContent.trim() : '';
     const bv = b.cells[col] ? b.cells[col].textContent.trim() : '';
-    const an = parseFloat(av.replace(/[^0-9.\-]/g, ''));
-    const bn = parseFloat(bv.replace(/[^0-9.\-]/g, ''));
+    const an = parseFloat(av.replace(/[^0-9.-]/g, ''));
+    const bn = parseFloat(bv.replace(/[^0-9.-]/g, ''));
     if (!isNaN(an) && !isNaN(bn)) return dir === 'asc' ? an - bn : bn - an;
     return dir === 'asc' ? av.localeCompare(bv, 'es') : bv.localeCompare(av, 'es');
   });
