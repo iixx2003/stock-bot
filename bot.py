@@ -319,7 +319,6 @@ GEO_SECTOR_MAP = {
 predictions    = []
 watch_signals  = {}
 earnings_watch = {}   # {ticker: {date, days_ahead, name, time}} — rellenado cada mañana
-_earnings_notif_date = None  # fecha (date) en que se mandó el último aviso Discord
 learnings      = {
     "rules": [], "sector_memory": {}, "hour_memory": {},
     "error_memory": [], "regime_memory": {}, "last_updated": None,
@@ -939,7 +938,7 @@ def update_earnings_watch():
     Actualiza el watch semanal de earnings. Se ejecuta a las 09:00 cada día laboral.
     Solo hace peticiones HTTP, nunca llama a la IA.
     """
-    global earnings_watch, _earnings_notif_date
+    global earnings_watch
     now = datetime.now(SPAIN_TZ)
     if now.weekday() >= 5:
         return
@@ -947,7 +946,6 @@ def update_earnings_watch():
     try:
         new_watch = fetch_earnings_calendar()
         earnings_watch = new_watch
-        save_state()
 
         if earnings_watch:
             items_str = ", ".join(
@@ -957,18 +955,20 @@ def update_earnings_watch():
             extra = f" (+{len(earnings_watch)-12} más)" if len(earnings_watch) > 12 else ""
             print(f"  📅 {len(earnings_watch)} acciones del universo con earnings próximos: {items_str}{extra}")
 
-            # Notificar en Discord solo si hay resultados
-            lines = [f"📅 **EARNINGS SCANNER** — {len(earnings_watch)} acciones en tu universo esta semana"]
-            for tk, info in sorted(earnings_watch.items(), key=lambda x: x[1]["days_ahead"]):
-                t_tag = "🌅 pre-mkt" if "pre" in info.get("time","").lower() else "🌆 post-cierre" if "after" in info.get("time","").lower() else "🕐 horario"
-                lines.append(f"  • **{tk}** — {info['date']} ({info['days_ahead']}d) {t_tag}")
-            if _earnings_notif_date != now.date():
+            # Notificar en Discord solo una vez al día (persiste en econ_calendar para sobrevivir reinicios)
+            today_str = now.date().isoformat()
+            if econ_calendar.get("earnings_notif_date") != today_str:
+                lines = [f"📅 **EARNINGS SCANNER** — {len(earnings_watch)} acciones en tu universo esta semana"]
+                for tk, info in sorted(earnings_watch.items(), key=lambda x: x[1]["days_ahead"]):
+                    t_tag = "🌅 pre-mkt" if "pre" in info.get("time","").lower() else "🌆 post-cierre" if "after" in info.get("time","").lower() else "🕐 horario"
+                    lines.append(f"  • **{tk}** — {info['date']} ({info['days_ahead']}d) {t_tag}")
                 send_solicitud("\n".join(lines))
-                _earnings_notif_date = now.date()
+                econ_calendar["earnings_notif_date"] = today_str
             else:
                 print("  📅 Notificación earnings ya enviada hoy — saltando Discord")
         else:
             print("  📅 Sin earnings en el universo los próximos 7 días")
+        save_state()
     except Exception as e:
         print(f"  ERROR update_earnings_watch: {e}")
 
