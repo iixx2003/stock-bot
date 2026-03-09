@@ -6,4 +6,5 @@ pytz==2024.1
 pandas==2.2.3
 fear-and-greed==0.4.0
 flask==3.0.3
+waitress==3.0.1
 websocket-client==1.8.0
