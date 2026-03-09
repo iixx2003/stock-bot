@@ -112,6 +112,11 @@ def _fh_start():
             threading.Thread(target=_watchdog, daemon=True).start()
             ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception as e:
+            err_str = str(e)
+            if "401" in err_str or "Invalid API key" in err_str or "Unauthorized" in err_str:
+                print(f"[WS] Finnhub API key inválida — usando Yahoo Finance para precios. Reintento en 6h.")
+                time.sleep(21600)
+                continue
             print(f"[WS ERROR] {e}")
         with _fh_lock:
             _fh_ws = None
