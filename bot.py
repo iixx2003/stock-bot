@@ -1692,9 +1692,15 @@ def prefetch_tickers(tickers):
         try:
             hist = None
             if td_available:
-                hist = _fetch_twelve_data_candles(t)
-                if hist is not None and len(hist) >= 50:
-                    ok_td += 1
+                # Re-check por si los créditos se agotaron en la iteración anterior
+                if _td_credits_reset_at and time.time() < _td_credits_reset_at:
+                    td_available = False
+                    remaining = int(_td_credits_reset_at - time.time())
+                    print(f"  Twelve Data sin créditos — reset en {remaining//3600}h {(remaining%3600)//60}m. Usando Yahoo para el resto.")
+                else:
+                    hist = _fetch_twelve_data_candles(t)
+                    if hist is not None and len(hist) >= 50:
+                        ok_td += 1
             if hist is None or len(hist) < 50:
                 hist = _fetch_yahoo_candles(t)
                 if hist is not None and len(hist) >= 50:
