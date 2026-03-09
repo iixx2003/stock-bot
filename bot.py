@@ -482,7 +482,7 @@ def already_alerted_today(ticker):
 
 
 def alertas_hoy():
-    return sum(1 for p in _preds_today() if p["confidence"] < CONF_EXCEPCIONAL)
+    return len(_preds_today())
 
 
 def ventas_hoy():
@@ -498,16 +498,12 @@ def puede_enviar_alerta(signal, conf, signal_type="NORMAL"):
     now_hour   = now.hour
     now_minute = now.minute
 
-    # Excepcional siempre pasa
-    if conf >= CONF_EXCEPCIONAL:
-        return True, None
-
     # Cola de calidad: antes de HORA_DESBLOQUEO solo Excepcionales
-    if now_hour < HORA_DESBLOQUEO:
+    if conf < CONF_EXCEPCIONAL and now_hour < HORA_DESBLOQUEO:
         return False, f"cola de calidad activa hasta las {HORA_DESBLOQUEO}:00"
 
     # Franja suave pre-apertura USA (15:00–15:30): umbral FUERTE mínimo
-    if now_hour == 15 and now_minute < 30 and conf < CONF_FUERTE:
+    if conf < CONF_EXCEPCIONAL and now_hour == 15 and now_minute < 30 and conf < CONF_FUERTE:
         return False, f"pre-apertura USA — confianza mínima {CONF_FUERTE}% hasta las 15:30"
 
     # Circuit breaker: racha de pérdidas → umbral mínimo elevado
@@ -515,7 +511,7 @@ def puede_enviar_alerta(signal, conf, signal_type="NORMAL"):
         until_str = _cb_active_until.strftime("%d/%m %H:%M") if _cb_active_until else "?"
         return False, f"circuit breaker activo — mínimo {CONF_NORMAL + CB_CONF_BOOST}% hasta {until_str}"
 
-    # Límite total
+    # Límite total (aplica también a señales excepcionales)
     if alertas_hoy() >= MAX_ALERTAS_DIA:
         return False, f"límite diario ({MAX_ALERTAS_DIA}) alcanzado"
 
