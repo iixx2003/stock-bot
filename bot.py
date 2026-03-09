@@ -1018,7 +1018,30 @@ def update_market_context():
             print(f"[ERROR] update_market_context {symbol}: {e}")
 
     macro_news, econ_events = [], []
-    if NEWS_API_KEY:
+    # Finnhub market news (funciona en producción, gratis)
+    if FINNHUB_TOKEN:
+        try:
+            r = requests.get(
+                f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_TOKEN}",
+                timeout=10,
+            )
+            if r.status_code == 200:
+                articles = r.json()[:10]
+                macro_news = [a.get("headline", "") for a in articles if a.get("headline")][:6]
+        except Exception as e:
+            print(f"[ERROR] macro_news Finnhub: {e}")
+        try:
+            r = requests.get(
+                f"https://finnhub.io/api/v1/news?category=forex&token={FINNHUB_TOKEN}",
+                timeout=10,
+            )
+            if r.status_code == 200:
+                articles = r.json()[:6]
+                econ_events = [a.get("headline", "") for a in articles if a.get("headline")][:4]
+        except Exception as e:
+            print(f"[ERROR] econ_events Finnhub: {e}")
+    # Fallback: NewsAPI si no hay Finnhub
+    if not macro_news and NEWS_API_KEY:
         try:
             r = requests.get(
                 f"https://newsapi.org/v2/top-headlines?category=business&language=en&pageSize=6&apiKey={NEWS_API_KEY}",
