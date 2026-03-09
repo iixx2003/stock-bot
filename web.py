@@ -575,10 +575,33 @@ def build_payload():
                           f'<span class="cal-num" style="color:{clr}">{day}</span>'
                           f'<span class="cal-pl" style="color:{clr}">{pl_str}</span>'
                           f'<span class="cal-wl">{data["w"]}W·{data["l"]}L</span>'
-                          f'{earn_html}</div>')
+                          f'</div>')
         else:
-            _cal_html += f'<div class="cal-day{today_cls}"><span class="cal-num">{day}</span>{earn_html}</div>'
+            _cal_html += f'<div class="cal-day{today_cls}"><span class="cal-num">{day}</span></div>'
     _cal_html += '</div>'
+
+    # Calendario de earnings del universo (Apple Calendar style) — separado del P/L
+    _earn_cal_html = '<div class="cal-grid">'
+    for h in ["L", "M", "X", "J", "V", "S", "D"]:
+        _earn_cal_html += f'<div class="cal-hdr">{h}</div>'
+    for _ in range(_first_dow):
+        _earn_cal_html += '<div class="cal-day cal-earn-day"></div>'
+    for day in range(1, _days_in_month + 1):
+        today_cls2 = " today" if day == _today.day else ""
+        eday2 = _earnings_by_day.get(day, [])
+        if eday2:
+            def _earn_cls2(tag):
+                if '\U0001f305' in tag: return 'cal-earn-pre'
+                if '\U0001f306' in tag: return 'cal-earn-after'
+                return 'cal-earn-tbd'
+            pills = "".join(f'<span class="cal-earn-badge {_earn_cls2(tag)}" title="{tk} — {tag}">{tk}</span>' for tk, tag in eday2[:4])
+            if len(eday2) > 4:
+                pills += f'<span class="cal-earn-more">+{len(eday2)-4}</span>'
+            _earn_cal_html += f'<div class="cal-day cal-earn-day has-earn{today_cls2}"><span class="cal-num">{day}</span><div class="cal-earn">{pills}</div></div>'
+        else:
+            _earn_cal_html += f'<div class="cal-day cal-earn-day{today_cls2}"><span class="cal-num">{day}</span></div>'
+    _earn_cal_html += '</div>'
+
     cal_month_name = f"{_mname[_cal_m]} {_cal_y}"
 
     # ── Ticker stats (modal) ────────────────────────────────────────────
@@ -751,6 +774,7 @@ def build_payload():
         "cur_streak_type":  cur_streak_type,
         "cur_streak_ct":    cur_streak_ct,
         "cal_html":         _cal_html,
+        "earn_cal_html":    _earn_cal_html,
         "cal_month_name":   cal_month_name,
         "cal_data":         cal_data,
         "ticker_stats":     ticker_stats,
@@ -1271,12 +1295,14 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 .cal-day.today .cal-num{color:var(--blue)}
 .cal-pl{font-size:11px;font-weight:700;line-height:1.2}
 .cal-wl{font-size:9px;color:var(--t3)}
+.cal-earn-day{min-height:80px!important}
 .cal-earn{display:flex;flex-direction:column;gap:2px;margin-top:3px}
 .cal-earn-badge{font-size:8px;font-weight:600;border-radius:3px;padding:1px 4px;line-height:1.6;cursor:default;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cal-earn-pre{background:rgba(255,149,0,.2);color:#ff9500}
 .cal-earn-after{background:rgba(61,142,248,.2);color:#5ba0ff}
 .cal-earn-tbd{background:rgba(155,109,255,.18);color:#b47fff}
 .cal-earn-more{font-size:8px;color:var(--t3);padding:0 2px;font-weight:600}
+.has-earn{border:1px solid rgba(255,255,255,.07)!important}
 
 /* ── TIME MACHINE ── */
 .tm-wrap{padding:10px 0 4px}
@@ -1598,7 +1624,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
                 {% if st == 'PRE_EARNINGS' %}<span class="badge b-earn">Pre-Earn</span>
                 {% elif st == 'SHORT_SQUEEZE' %}<span class="badge b-sq">Squeeze</span>
                 {% elif st == 'INSIDER_MASSIVE' %}<span class="badge b-ins">Insider</span>
-                {% else %}<span style="font-size:12px;color:var(--t3)">Normal</span>{% endif %}
+                {% else %}<span style="font-size:12px;color:var(--t3)">Predicción</span>{% endif %}
               </td>
               <td class="mono">${{ "%.2f"|format(p.entry|float) }}</td>
               <td class="mono g">${{ "%.2f"|format(p.target|float) }}</td>
@@ -1749,7 +1775,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
               {% if st == 'PRE_EARNINGS' %}<span class="badge b-earn">Pre-Earn</span>
               {% elif st == 'SHORT_SQUEEZE' %}<span class="badge b-sq">Squeeze</span>
               {% elif st == 'INSIDER_MASSIVE' %}<span class="badge b-ins">Insider</span>
-              {% else %}<span style="font-size:11px;color:var(--t3)">Normal</span>{% endif %}
+              {% else %}<span style="font-size:11px;color:var(--t3)">Predicción</span>{% endif %}
             </td>
             <td class="spark-cell">
               {% if p.sparkline_svg %}{{ p.sparkline_svg|safe }}{% else %}<span style="color:var(--t3);font-size:11px">—</span>{% endif %}
@@ -1946,7 +1972,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
               {% if st == 'PRE_EARNINGS' %}<span class="badge b-earn">Pre-Earn</span>
               {% elif st == 'SHORT_SQUEEZE' %}<span class="badge b-sq">Squeeze</span>
               {% elif st == 'INSIDER_MASSIVE' %}<span class="badge b-ins">Insider</span>
-              {% else %}<span style="font-size:11px;color:var(--t3)">Normal</span>{% endif %}
+              {% else %}<span style="font-size:11px;color:var(--t3)">Predicción</span>{% endif %}
             </td>
             <td style="font-size:12px;color:var(--t2)">{{ p.sector or '—' }}</td>
             <td style="font-size:12px;color:var(--t3)">{{ p.days_to_result or '—' }}d</td>
@@ -2318,28 +2344,16 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
     {% endif %}
   </div>
 
-  <!-- ── Calendario de earnings ── -->
-  <div class="sh">📅 Calendario de earnings — señales activas</div>
-  <div class="card" style="margin-bottom:24px">
-    {% if earnings_upcoming %}
-    <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Próximas fechas de presentación de resultados de tus señales activas. ⚠️ indica que el earnings cae dentro de la ventana activa de la señal.</div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px">
-      {% for e in earnings_upcoming %}
-      <div style="display:flex;flex-direction:column;gap:4px;background:var(--s2);border:1px solid {% if e.during %}rgba(155,109,255,.35){% else %}var(--b1){% endif %};border-radius:10px;padding:12px 14px">
-        <div style="display:flex;align-items:center;justify-content:space-between">
-          <span class="tk-link" onclick="openTickerModal('{{ e.ticker }}')" style="font-weight:700;font-size:15px">{{ e.ticker }}</span>
-          {% if e.during %}<span style="font-size:10px;background:rgba(155,109,255,.15);color:#9b6dff;border:1px solid rgba(155,109,255,.3);border-radius:5px;padding:2px 7px">⚠️ Activo</span>{% endif %}
-        </div>
-        <div style="font-size:12px;color:var(--t2)">{{ e.date }}</div>
-        <div style="font-size:11px;color:var(--t3)">
-          {% if e.signal == 'COMPRAR' %}📈 Comprar{% else %}📉 Vender{% endif %}
-        </div>
-      </div>
-      {% endfor %}
-    </div>
-    {% else %}
-    <div class="empty" style="padding:32px"><span class="ei">📅</span><p>Sin earnings próximos en señales activas</p></div>
-    {% endif %}
+  <!-- ── Calendario de earnings del universo ── -->
+  <div class="sh" style="margin-top:8px">📅 Calendario de earnings — {{ cal_month_name }}
+    <span style="margin-left:10px;font-size:11px;color:var(--t3);font-weight:400">
+      <span style="color:#ff9500">●</span> Pre-market &nbsp;
+      <span style="color:#5ba0ff">●</span> After-hours &nbsp;
+      <span style="color:#b47fff">●</span> TBD
+    </span>
+  </div>
+  <div class="card" style="margin-bottom:24px;padding:16px">
+    {{ earn_cal_html|safe }}
   </div>
 
 </div>
