@@ -3552,9 +3552,9 @@ function refreshLivePrices() {
     });
 }
 
-// Arrancar en vivo: primera llamada inmediata, luego cada 5s
+// Arrancar en vivo: primera llamada inmediata, luego cada 2s
 refreshLivePrices();
-setInterval(refreshLivePrices, 5000);
+setInterval(refreshLivePrices, 2000);
 
 async function submitAddPred() {
   const err = document.getElementById('ap-error');
