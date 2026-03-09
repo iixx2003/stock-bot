@@ -3375,7 +3375,7 @@ function calcSizerModal(entry, stop, price, capital, sym, target, targetPct, day
   if (useP <= 0) { resEl.innerHTML = '<span style="color:var(--red)">Sin precio disponible</span>'; return; }
 
   const sharesExact = amt / useP;                          // e.g. 1.504...
-  const sharesDisp  = sharesExact.toFixed(2).replace(/\.?0+$/, ''); // "1.5", "2", "1.3"
+  const sharesDisp  = sharesExact.toFixed(2).replace(/[.]?0+$/, ''); // "1.5", "2", "1.3"
   const realAmt     = amt;                                 // invertimos el importe exacto
   const riskAmt     = sharesExact * stopDist;
   const capPct      = capital > 0 ? (realAmt / capital * 100).toFixed(1) : null;
