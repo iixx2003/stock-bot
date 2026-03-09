@@ -67,6 +67,7 @@ def _fh_on_message(ws, message):
 
 
 def _fh_on_open(ws):
+    print("[WS] Finnhub conectado OK")
     with _fh_lock:
         for tk in list(_fh_subscribed):
             try:
@@ -94,8 +95,8 @@ def _fh_start():
                 f"wss://ws.finnhub.io?token={FINNHUB_KEY}",
                 on_open=_fh_on_open,
                 on_message=_fh_on_message,
-                on_error=lambda ws, e: None,
-                on_close=lambda ws, *a: None,
+                on_error=lambda ws, e: print(f"[WS] Finnhub error: {e}"),
+                on_close=lambda ws, *a: print("[WS] Finnhub desconectado"),
             )
             with _fh_lock:
                 _fh_ws = ws
