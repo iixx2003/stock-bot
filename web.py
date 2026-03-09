@@ -1727,6 +1727,11 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
   <span id="ps-risk-val" style="display:none">10%</span>
   <div id="ps-summary" style="display:none"></div>
 
+  <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+    <button onclick="document.getElementById('add-pred-modal').classList.add('open')"
+      style="background:var(--green);color:#000;border:none;border-radius:8px;padding:8px 18px;font-weight:700;font-size:13px;cursor:pointer">+ Añadir predicción</button>
+  </div>
+
   {% if pending %}
   <div class="card" style="margin-bottom:20px;padding:0">
     <div class="tw">
@@ -2537,6 +2542,41 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
   <div class="modal-box">
     <button class="modal-close" onclick="closeTickerModal()">✕</button>
     <div id="modal-content"></div>
+  </div>
+</div>
+
+<!-- ════ MODAL AÑADIR PREDICCIÓN ════ -->
+<div class="modal-overlay" id="add-pred-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal-box" style="max-width:400px">
+    <button class="modal-close" onclick="document.getElementById('add-pred-modal').classList.remove('open')">✕</button>
+    <h3 style="margin:0 0 18px;font-size:16px">Añadir predicción manual</h3>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <label style="font-size:12px;color:var(--t2)">Ticker
+        <input id="ap-ticker" placeholder="AAPL" style="width:100%;margin-top:4px;padding:8px;background:var(--s2);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font-size:14px;box-sizing:border-box">
+      </label>
+      <label style="font-size:12px;color:var(--t2)">Señal
+        <select id="ap-signal" style="width:100%;margin-top:4px;padding:8px;background:var(--s2);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font-size:14px">
+          <option value="COMPRAR">COMPRAR</option>
+          <option value="VENDER">VENDER</option>
+        </select>
+      </label>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+        <label style="font-size:12px;color:var(--t2)">Entrada $
+          <input id="ap-entry" type="number" step="0.01" placeholder="100.00" style="width:100%;margin-top:4px;padding:8px;background:var(--s2);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font-size:14px;box-sizing:border-box">
+        </label>
+        <label style="font-size:12px;color:var(--t2)">Objetivo $
+          <input id="ap-target" type="number" step="0.01" placeholder="108.00" style="width:100%;margin-top:4px;padding:8px;background:var(--s2);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font-size:14px;box-sizing:border-box">
+        </label>
+        <label style="font-size:12px;color:var(--t2)">Stop $
+          <input id="ap-stop" type="number" step="0.01" placeholder="93.00" style="width:100%;margin-top:4px;padding:8px;background:var(--s2);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font-size:14px;box-sizing:border-box">
+        </label>
+      </div>
+      <label style="font-size:12px;color:var(--t2)">Confianza %
+        <input id="ap-conf" type="number" min="1" max="99" value="85" style="width:100%;margin-top:4px;padding:8px;background:var(--s2);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font-size:14px;box-sizing:border-box">
+      </label>
+      <div id="ap-error" style="color:var(--red);font-size:12px;display:none"></div>
+      <button onclick="submitAddPred()" style="background:var(--green);color:#000;border:none;border-radius:8px;padding:10px;font-weight:700;font-size:14px;cursor:pointer;margin-top:4px">Guardar predicción</button>
+    </div>
   </div>
 </div>
 
@@ -3519,6 +3559,26 @@ function refreshLivePrices() {
 refreshLivePrices();
 setInterval(refreshLivePrices, 5000);
 
+async function submitAddPred() {
+  const err = document.getElementById('ap-error');
+  err.style.display = 'none';
+  const body = {
+    ticker:     document.getElementById('ap-ticker').value.trim().toUpperCase(),
+    signal:     document.getElementById('ap-signal').value,
+    entry:      parseFloat(document.getElementById('ap-entry').value),
+    target:     parseFloat(document.getElementById('ap-target').value),
+    stop:       parseFloat(document.getElementById('ap-stop').value),
+    confidence: parseInt(document.getElementById('ap-conf').value),
+  };
+  if (!body.ticker || !body.entry || !body.target || !body.stop) {
+    err.textContent = 'Rellena todos los campos.'; err.style.display = 'block'; return;
+  }
+  const r = await fetch('/api/add_prediction', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if (d.ok) { document.getElementById('add-pred-modal').classList.remove('open'); location.reload(); }
+  else { err.textContent = d.error || 'Error al guardar.'; err.style.display = 'block'; }
+}
+
 function closeSizerModal() {
   const m = document.getElementById('sizer-modal');
   if (m) m.style.display = 'none';
@@ -3573,6 +3633,35 @@ def api_prices():
         price, chg = _fetch_price(tk)
         out[tk] = {"price": price, "chg": chg}
     return jsonify({"prices": out, "ts": int(time.time())})
+
+
+@app.route("/api/add_prediction", methods=["POST"])
+def api_add_prediction():
+    if not session.get("auth"):
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    ticker  = (body.get("ticker") or "").upper().strip()
+    signal  = body.get("signal", "COMPRAR")
+    entry   = float(body.get("entry") or 0)
+    target  = float(body.get("target") or 0)
+    stop    = float(body.get("stop") or 0)
+    conf    = int(body.get("confidence") or 85)
+    if not ticker or entry <= 0 or target <= 0 or stop <= 0:
+        return jsonify({"error": "Faltan datos obligatorios"}), 400
+    preds = _rjson("predictions.json", [])
+    preds.append({
+        "ticker": ticker, "signal": signal, "confidence": conf,
+        "signal_type": "MANUAL",
+        "date": datetime.now(pytz.timezone("Europe/Madrid")).isoformat(),
+        "result": "pending", "exit_price": None, "days_to_result": None,
+        "entry": round(entry, 2), "target": round(target, 2), "stop": round(stop, 2),
+        "session": "MANUAL",
+    })
+    tmp = "predictions.json.tmp"
+    with open("predictions.json", "w") as f:
+        import json as _json
+        _json.dump(preds, f, indent=2)
+    return jsonify({"ok": True})
 
 
 @app.route("/logout")

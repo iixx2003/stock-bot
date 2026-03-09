@@ -703,11 +703,11 @@ def update_econ_calendar():
             if keyword.lower() in news.lower() and event_name not in found_events:
                 found_events.append(event_name)
 
-    econ_calendar = {
+    econ_calendar.update({
         "high_impact_today": found_events,
         "is_high_impact":    len(found_events) > 0,
         "updated_at":        datetime.now(SPAIN_TZ).isoformat(),
-    }
+    })
     save_state()
 
     if found_events:
