@@ -206,10 +206,13 @@ def _fetch_price(ticker):
     if not _HAS_YF:
         return None, None
     try:
-        fi = yf.Ticker(ticker).fast_info
-        price  = round(float(fi.last_price), 2)   if fi.last_price is not None  else None
-        prev   = float(fi.previous_close)          if fi.previous_close is not None else None
-        chg    = round((price - prev) / prev * 100, 2) if price and prev else None
+        fi   = yf.Ticker(ticker).fast_info
+        prev = float(fi.previous_close) if fi.previous_close is not None else None
+        lp   = fi.last_price if fi.last_price is not None else getattr(fi, "pre_market_price", None)
+        if lp is None:
+            lp = prev  # último recurso: precio de cierre anterior
+        price = round(float(lp), 2) if lp is not None else None
+        chg   = round((price - prev) / prev * 100, 2) if price and prev else None
         # Guardar prev_close para que Finnhub WS calcule el % de cambio diario
         if prev:
             with _prev_close_lock:

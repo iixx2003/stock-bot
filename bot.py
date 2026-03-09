@@ -2688,9 +2688,9 @@ def pre_filter_convergence(tech, fund, sent, inst_signal, boost, special_signals
     resumen = f"{capas_ok}/5 — {' | '.join(motivos) if motivos else 'sin convergencia'}"
     return pasa, resumen
 
-def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcionales=False):
+def analyze_ticker(ticker, name="", sector="Unknown", force=False, force_score=False, solo_excepcionales=False):
     # Cooldown de score bajo: saltar si falló N ciclos consecutivos
-    if not force and _score_cooldown.get(ticker, 0) > 0:
+    if not force and not force_score and _score_cooldown.get(ticker, 0) > 0:
         _score_cooldown[ticker] -= 1
         print(f"  Saltando {ticker} (cooldown score: {_score_cooldown[ticker]} ciclos restantes)")
         return None
@@ -2706,7 +2706,7 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
         market_regime.get("regime") == "BEAR" and market_context.get("fear_greed", 50) < 25
     ) else SCORE_MINIMO
 
-    if not force and tech["tech_score"] < score_minimo_efectivo:
+    if not force and not force_score and tech["tech_score"] < score_minimo_efectivo:
         print(f"    {ticker}: score {tech['tech_score']} insuficiente (mín {score_minimo_efectivo})")
         _score_fail_count[ticker] = _score_fail_count.get(ticker, 0) + 1
         if _score_fail_count[ticker] >= SCORE_FAIL_THRESHOLD:
@@ -2769,7 +2769,7 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, solo_excepcio
             print(f"    {ticker}: {pe_desc}")
 
     # Prefiltro de convergencia — evita llamadas IA innecesarias (~85% ahorro)
-    if not force:
+    if not force and not force_score:
         pasa, pf_resumen = pre_filter_convergence(tech, fund, sent, inst_signal, boost, special_signals)
         if not pasa:
             print(f"    {ticker}: prefiltro {pf_resumen}")
@@ -3161,7 +3161,7 @@ def watch_cycle():
             ticker,
             item.get("name", ticker),
             item.get("sector", "Unknown"),
-            force=is_earnings_forced,          # bypass score si viene del earnings scanner
+            force_score=is_earnings_forced,    # bypass score/cooldown/prefiltro para earnings
             solo_excepcionales=solo_excepcionales,
         )
         if not result:
