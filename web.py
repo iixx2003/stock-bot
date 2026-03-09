@@ -24,7 +24,7 @@ _prev_close_lock  = threading.Lock()
 _PREV_CLOSE_TTL   = 86400
 
 # ─── Finnhub WebSocket (precios en tiempo real) ────────────────────────────────
-FINNHUB_KEY    = os.environ.get("FINNHUB_KEY", "GN255O5B9CERVXLC")
+FINNHUB_KEY    = os.environ.get("FINNHUB_KEY", "d6ld2rhr01qrq6i28gf0d6ld2rhr01qrq6i28gfg")
 _FH_MAX_SYMBOLS = 50   # límite plan gratuito Finnhub
 _fh_ws         = None   # instancia WebSocketApp activa
 _fh_subscribed = set()  # tickers suscritos actualmente
