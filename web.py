@@ -331,7 +331,7 @@ def build_payload():
     ew        = _rjson("earnings_watch.json", {})
 
     pending = sorted(
-        [p for p in preds if p.get("result") == "pending"],
+        [p for p in preds if p.get("result") == "pending" and p.get("confidence", 0) >= 85],
         key=lambda x: x.get("date", ""), reverse=True
     )
     wins     = sum(1 for p in preds if p.get("result") == "win")
