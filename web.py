@@ -554,10 +554,14 @@ def build_payload():
         data = cal_data.get(day, {})
         today_cls = " today" if day == _today.day else ""
         eday = _earnings_by_day.get(day, [])
-        # HTML de badges de earnings (máx 3 visibles + overflow)
+        # Estilo Apple Calendar: pills de colores por horario
         earn_html = ""
         if eday:
-            badges = "".join(f'<span class="cal-earn-badge" title="{tag}">{tk}</span>' for tk, tag in eday[:3])
+            def _earn_cls(tag):
+                if '\U0001f305' in tag: return 'cal-earn-pre'    # 🌅 pre-market → naranja
+                if '\U0001f306' in tag: return 'cal-earn-after'  # 🌆 after-hours → azul
+                return 'cal-earn-tbd'                             # 🕐 TBD → gris
+            badges = "".join(f'<span class="cal-earn-badge {_earn_cls(tag)}" title="{tk} — {tag}">{tk}</span>' for tk, tag in eday[:3])
             if len(eday) > 3:
                 badges += f'<span class="cal-earn-more">+{len(eday)-3}</span>'
             earn_html = f'<div class="cal-earn">{badges}</div>'
@@ -1260,16 +1264,19 @@ tbody tr:hover td{background:rgba(255,255,255,.02)}
 /* ── CALENDARIO P/L ── */
 .cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}
 .cal-hdr{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--t3);text-align:center;padding:4px 0;letter-spacing:.5px}
-.cal-day{min-height:54px;border-radius:8px;border:1px solid transparent;padding:5px 6px;display:flex;flex-direction:column;gap:2px;background:rgba(255,255,255,.02)}
+.cal-day{min-height:70px;border-radius:8px;border:1px solid transparent;padding:5px 6px;display:flex;flex-direction:column;gap:2px;background:rgba(255,255,255,.02)}
 .cal-day.today{border-color:var(--blue)!important;background:rgba(61,142,248,.06)!important}
 .cal-day.has-data{border-width:1px}
 .cal-num{font-size:11px;font-weight:600;color:var(--t3)}
 .cal-day.today .cal-num{color:var(--blue)}
 .cal-pl{font-size:11px;font-weight:700;line-height:1.2}
 .cal-wl{font-size:9px;color:var(--t3)}
-.cal-earn{display:flex;flex-wrap:wrap;gap:2px;margin-top:2px}
-.cal-earn-badge{font-size:8px;font-weight:700;background:rgba(155,109,255,.18);color:#b47fff;border-radius:3px;padding:1px 3px;line-height:1.4;cursor:default}
-.cal-earn-more{font-size:8px;color:var(--t3);padding:1px 2px}
+.cal-earn{display:flex;flex-direction:column;gap:2px;margin-top:3px}
+.cal-earn-badge{font-size:8px;font-weight:600;border-radius:3px;padding:1px 4px;line-height:1.6;cursor:default;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cal-earn-pre{background:rgba(255,149,0,.2);color:#ff9500}
+.cal-earn-after{background:rgba(61,142,248,.2);color:#5ba0ff}
+.cal-earn-tbd{background:rgba(155,109,255,.18);color:#b47fff}
+.cal-earn-more{font-size:8px;color:var(--t3);padding:0 2px;font-weight:600}
 
 /* ── TIME MACHINE ── */
 .tm-wrap{padding:10px 0 4px}
@@ -1680,24 +1687,6 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
   </div>
   {% endif %}
 
-  <!-- Earnings próximos — universo completo -->
-  {% if earnings_watch_all %}
-  <div class="card" style="margin-bottom:14px;padding:14px 16px">
-    <div class="card-title" style="margin-bottom:10px">📅 Earnings próximos — universo ({{ earnings_watch_all|length }} acciones)</div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap">
-      {% for e in earnings_watch_all %}
-      {% set t = e.time|default('') %}
-      {% set tag = '🌅' if 'pre' in t else ('🌆' if 'after' in t else '🕐') %}
-      <div style="display:flex;align-items:center;gap:6px;background:var(--s2);border:1px solid var(--b1);border-radius:7px;padding:5px 10px" title="{{ e.name|default(e.ticker) }} — {{ e.date }}">
-        <span style="font-size:10px">{{ tag }}</span>
-        <span class="tk-link" onclick="openTickerModal('{{ e.ticker }}')" style="font-weight:700;font-size:12px">{{ e.ticker }}</span>
-        <span style="font-size:10px;color:var(--t3)">{{ e.date[5:] }}</span>
-        <span style="font-size:10px;color:var(--t3)">{{ e.days_ahead }}d</span>
-      </div>
-      {% endfor %}
-    </div>
-  </div>
-  {% endif %}
 
   <!-- inputs ocultos para mantener compatibilidad con recalcPositions -->
   <input type="hidden" id="ps-capital">
@@ -1727,6 +1716,7 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
             <th class="sortable" onclick="sortTable(this,12)">Earnings</th>
             <th class="sortable" onclick="sortTable(this,13)">Sector</th>
             <th class="sortable" onclick="sortTable(this,14)">Días</th>
+            <th>💰</th>
             <th>📝</th>
           </tr>
         </thead>
@@ -1844,6 +1834,22 @@ th.sort-desc::after{content:' ▼';font-size:8px;color:var(--green)}
                 {{ p.days_remaining }}d
               </span>
               <br><span style="font-size:10px;color:var(--t3)">{{ p.date[:10] if p.date else '' }}</span>
+            </td>
+            <td style="padding:6px 8px;text-align:center">
+              <button class="ps-calc-btn" onclick="openSizerModal(this)"
+                data-ticker="{{ p.ticker }}"
+                data-entry="{{ p.entry|float }}"
+                data-stop="{{ p.stop|float }}"
+                data-target="{{ p.target|float if p.target else 0 }}"
+                data-target-pct="{{ p.target_pct|float if p.target_pct else 0 }}"
+                data-days="{{ p.days_remaining|int if p.days_remaining else 0 }}"
+                data-price="{{ p.current_price if p.current_price else p.entry|float }}"
+                data-confidence="{{ p.confidence|int }}"
+                data-stype="{{ p.get('signal_type','NORMAL') }}"
+                title="Calcular tamaño de posición"
+                style="background:var(--s3);border:1px solid var(--b2);border-radius:6px;color:var(--t2);font-size:10px;font-weight:600;padding:4px 8px;cursor:pointer;white-space:nowrap">
+                💰
+              </button>
             </td>
             <td style="padding:8px 6px;text-align:center">
               <button class="icon-btn" data-note-btn data-note-key="{{ nkey }}"
