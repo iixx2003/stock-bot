@@ -197,10 +197,8 @@ def is_premarket_now():
 def _fetch_price(ticker):
     """Devuelve (price, change_pct). Usa caché (actualizada por Finnhub WS o yfinance)."""
     now_ts = time.time()
-    # Si el WS está conectado usa TTL corto; si no (premarket/sin WS) usa 30s para no saturar yfinance
-    with _fh_lock:
-        ws_active = _fh_ws is not None
-    ttl = _PRICE_TTL if ws_active else 30
+    # En horario de mercado/premarket (09-22h ES) TTL 3s para máxima frescura; fuera 30s
+    ttl = _PRICE_TTL if _fh_trading_hours() else 30
     with _price_lock:
         cached = _price_cache.get(ticker)
         if cached and now_ts - cached[2] < ttl:
