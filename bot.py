@@ -2588,7 +2588,11 @@ def format_alert(tech, ai_response, conf_final, session_tag="", signal_type="NOR
 
     body = "\n".join(
         line for line in ai_response.splitlines()
-        if not line.startswith("SEÑAL:") and not line.startswith("CONFIANZA:")
+        if not line.startswith("SEÑAL:")
+        and not line.startswith("CONFIANZA:")
+        and not line.startswith("ANÁLISIS DE CONVERGENCIA")
+        and not line.startswith("Capa ")
+        and not line.startswith("* ")
     ).strip()
 
     sign    = "+" if tech["change_pct"] >= 0 else ""
