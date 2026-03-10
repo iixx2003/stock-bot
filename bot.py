@@ -83,7 +83,7 @@ MAX_PRE_EARNINGS_DIA  = 1   # máximo señales PRE-EARNINGS al día
 SCORE_MINIMO = 8   # subido de 6 a 8 para reducir llamadas IA innecesarias
 
 # Cola de calidad: hora a partir de la cual se desbloquean normales/fuertes
-HORA_DESBLOQUEO = 14   # 14:00 hora España
+HORA_DESBLOQUEO = 13   # 13:00 hora España
 
 # Seguridad y monitorización
 OWNER_DISCORD_ID      = os.environ.get("OWNER_DISCORD_ID", "")  # tu user ID de Discord
@@ -355,7 +355,7 @@ ai_calls_hoy        = 0
 # Circuit breaker — 3 pérdidas consecutivas → umbral +5% durante 24h
 _cb_consecutive_losses = 0
 _cb_active_until       = None   # datetime o None
-CB_MAX_LOSSES          = 3
+CB_MAX_LOSSES          = 4
 CB_CONF_BOOST          = 5      # puntos extra al umbral mínimo
 CB_DURATION_HOURS      = 24
 
@@ -3040,11 +3040,13 @@ def cmd_estado():
     rate     = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0
     eco_warn = "\n⚠️ ALTO IMPACTO: " + ", ".join(econ_calendar.get("high_impact_today", [])) if econ_calendar.get("is_high_impact") else ""
 
+    cb_str = f"⚠️ ACTIVO hasta {_cb_active_until.strftime('%d/%m %H:%M')} (mín {CONF_NORMAL + CB_CONF_BOOST}%)" if circuit_breaker_active() else f"inactivo ({_cb_consecutive_losses}/{CB_MAX_LOSSES} pérdidas)"
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"📡 **ESTADO — {now.strftime('%H:%M %d/%m/%Y')}**",
         f"Régimen: {regime} | F&G: {fg}/100 ({_fg_label(fg)}) | VIX: {market_context.get('vix',0)}{eco_warn}",
-        f"Alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA} | Cola calidad: {'activa hasta 14:00' if now.hour < HORA_DESBLOQUEO else 'desbloqueada'}",
+        f"Alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA} | Cola calidad: {f'activa hasta {HORA_DESBLOQUEO}:00' if now.hour < HORA_DESBLOQUEO else 'desbloqueada'}",
+        f"Circuit breaker: {cb_str}",
         f"Llamadas IA hoy: {ai_calls_hoy} | Coste est: ${coste_estimado_hoy:.3f}",
         f"Historial: {wins}✅ {losses}❌ | Acierto: {rate}%",
         f"Predicciones pendientes: {len(pending)}",
@@ -3177,7 +3179,7 @@ def watch_cycle():
     prefetch_tickers([item["ticker"] for item in to_analyze])
 
     _regime_now = market_regime.get("regime", "LATERAL")
-    _max_ai_ciclo = 1 if _regime_now == "BEAR" else MAX_AI_POR_CICLO
+    _max_ai_ciclo = 2 if _regime_now == "BEAR" else MAX_AI_POR_CICLO
 
     for item in to_analyze:
         if alerts_this_cycle >= _max_ai_ciclo:
