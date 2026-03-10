@@ -2315,7 +2315,7 @@ def call_ai(prompt, max_tokens=700):
         if _ai_client is None:
             _ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         msg    = _ai_client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-haiku-4-5-20251001",
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -2927,7 +2927,7 @@ def is_owner(user_id):
 def track_ai_cost():
     """Registra una llamada IA y alerta si se supera el gasto diario."""
     global coste_estimado_hoy, ai_calls_hoy
-    coste_estimado_hoy += 0.00548
+    coste_estimado_hoy += 0.00138
     ai_calls_hoy       += 1
     if coste_estimado_hoy >= COSTE_MAX_DIA:
         send_log(
