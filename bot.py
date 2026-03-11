@@ -83,7 +83,7 @@ CONF_EXCEPCIONAL = 94
 # Límites diarios
 MAX_ALERTAS_DIA       = 3
 MAX_VENTAS_DIA        = 1
-MAX_AI_POR_CICLO      = 3   # máx llamadas IA por ciclo (1 en BEAR, 3 en BULL/LATERAL)
+MAX_AI_POR_CICLO      = 2   # máx llamadas IA por ciclo (1 en BEAR, 2 en BULL/LATERAL)
 MAX_PRE_EARNINGS_DIA  = 1   # máximo señales PRE-EARNINGS al día
 
 # Score técnico mínimo
@@ -1622,7 +1622,7 @@ def quick_scan():
     )
 
     print(f"  Quick scan: {len(candidates)} urgentes + {len(corr_unique)} correlaciones + {len(developing)} en desarrollo")
-    return all_candidates[:15]
+    return all_candidates[:10]
 
 # ═══════════════════════════════════════════════════════════════════════
 # CAPA 2 — DATOS DE MERCADO con divergencias y premarket
@@ -2908,7 +2908,7 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, force_score=F
     else:
         prompt = _build_auto_prompt(tech, fund, sent, inst_signal, boost, special_signals)
 
-    ai_response = call_ai(prompt, max_tokens=700 if force else 900)
+    ai_response = call_ai(prompt, max_tokens=500 if force else 600)
     if not ai_response:
         return None
 
@@ -3217,7 +3217,7 @@ def watch_cycle():
                  watch_signals[t].get("last_analyzed", "2000-01-01T00:00:00+00:00")
              )).total_seconds() > 86400)
     ]
-    rotation = random.sample(not_analyzed, min(4, len(not_analyzed)))
+    rotation = random.sample(not_analyzed, min(2, len(not_analyzed)))
     seen_set  = {c["ticker"] for c in candidates}
     rotation_items = [
         {"ticker": t, "name": t, "sector": "Unknown", "score": 0, "source": "rotation"}
@@ -3591,7 +3591,7 @@ def main():
     watch_cycle()
     listen_commands(init=True)
 
-    schedule.every(5).minutes.do(watch_cycle)
+    schedule.every(10).minutes.do(watch_cycle)
     schedule.every(30).minutes.do(_update_macro_if_market_hours)
     schedule.every().day.at("09:00").do(update_market_context)
     schedule.every().day.at("09:05").do(update_earnings_watch)   # justo después del contexto macro
