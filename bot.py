@@ -58,6 +58,13 @@ SCORE_COOLDOWN_CICLOS = 3  # saltar N ciclos si falla por score repetidamente (e
 SCORE_FAIL_THRESHOLD  = 3  # fallos consecutivos antes de activar cooldown
 _score_fail_count: dict = {}  # {ticker: nº fallos consecutivos}
 
+# Tickers donde tanto Twelve Data como Yahoo fallan — se omiten sin reintentar
+_no_data_symbols: set = set()
+
+# Cache de tickers filtrados por manipulación para no spamear el log cada ciclo
+_manipulation_filtered: dict = {}  # {ticker: timestamp}
+MANIPULATION_LOG_TTL = 4 * 3600   # solo loguear de nuevo pasadas 4h
+
 def _td_rate_limit():
     """Bloquea hasta que haya pasado el intervalo mínimo entre llamadas."""
     global _td_last_call
@@ -1560,7 +1567,10 @@ def quick_scan():
 
                 is_manip, manip_reason = detect_manipulation(sym, change, vol_ratio, price)
                 if is_manip:
-                    print(f"  Filtrado manipulación: {sym} — {manip_reason}")
+                    _now_ts = time.time()
+                    if _now_ts - _manipulation_filtered.get(sym, 0) > MANIPULATION_LOG_TTL:
+                        print(f"  Filtrado manipulación: {sym} — {manip_reason}")
+                        _manipulation_filtered[sym] = _now_ts
                     continue
 
                 score = 0
@@ -1727,8 +1737,8 @@ def prefetch_tickers(tickers):
     _hist_cache = {}
     if not tickers:
         return
-    # Filtrar símbolos ya conocidos como inválidos
-    valid = [t for t in tickers if t not in _td_invalid_symbols]
+    # Filtrar símbolos ya conocidos como inválidos o sin datos en ninguna fuente
+    valid = [t for t in tickers if t not in _td_invalid_symbols and t not in _no_data_symbols]
     skipped = len(tickers) - len(valid)
     td_available = bool(TWELVE_DATA_KEY) and not (_td_credits_reset_at and time.time() < _td_credits_reset_at)
     source_label = "Twelve Data" if td_available else "Yahoo Finance (TD sin créditos)"
@@ -1757,19 +1767,29 @@ def prefetch_tickers(tickers):
                     print(f"    [{t}] Yahoo fallback OK")
             if hist is not None and len(hist) >= 50:
                 _hist_cache[t] = hist
+            else:
+                # Ambas fuentes fallaron — marcar para no reintentar en este ciclo
+                _no_data_symbols.add(t)
         except Exception as e:
             print(f"    {t}: error prefetch — {e}")
+    no_data_count = len([t for t in valid if t in _no_data_symbols])
+    if no_data_count:
+        print(f"  Sin datos en ninguna fuente: {no_data_count} tickers omitidos en ciclos futuros")
     print(f"  Datos OK: {ok_td} vía Twelve Data + {ok_yf} vía Yahoo = {ok_td+ok_yf}/{len(valid)} total")
 
 
-def get_market_data(ticker):
+def get_market_data(ticker, premarket_price=None):
     try:
+        if ticker in _no_data_symbols:
+            return None
         if ticker in _hist_cache:
             hist = _hist_cache[ticker]
         else:
             hist = _fetch_twelve_data_candles(ticker)
             if hist is None or len(hist) < 50:
                 hist = _fetch_yahoo_candles(ticker)
+            if hist is None or len(hist) < 50:
+                _no_data_symbols.add(ticker)
         if hist is None or hist.empty or len(hist) < 50:
             print(f"    {ticker}: sin datos de mercado")
             return None
@@ -1786,8 +1806,18 @@ def get_market_data(ticker):
         closes_w = hist["Close"].resample("W").last().dropna().tolist()
         closes_m = hist["Close"].resample("ME").last().dropna().tolist()
 
-        price      = closes[-1]
-        change_pct = ((price - closes[-2]) / closes[-2]) * 100 if closes[-2] else 0.0
+        # En premarket: inyectar precio actual para que RSI/scores no sean estáticos
+        if premarket_price and premarket_price > 0:
+            prev_close = closes[-1]
+            closes  = closes + [premarket_price]
+            highs   = highs  + [max(premarket_price, highs[-1])]
+            lows    = lows   + [min(premarket_price, lows[-1])]
+            volumes = volumes + [volumes[-1]]  # volumen premarket como estimación
+            price      = premarket_price
+            change_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
+        else:
+            price      = closes[-1]
+            change_pct = ((price - closes[-2]) / closes[-2]) * 100 if closes[-2] else 0.0
         sma20      = sum(closes[-20:]) / 20
         sma50      = sum(closes[-50:]) / 50
         sma200     = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
@@ -2784,7 +2814,15 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, force_score=F
 
     print(f"  Analizando {ticker}...")
 
-    tech = get_market_data(ticker)
+    # Premarket: obtener precio actual ANTES de get_market_data para inyectarlo en RSI
+    pm_data = None
+    _pm_price = None
+    if is_premarket():
+        pm_data = get_premarket_data(ticker)
+        if pm_data:
+            _pm_price = pm_data.get("pre_price")
+
+    tech = get_market_data(ticker, premarket_price=_pm_price)
     if not tech:
         print(f"    {ticker}: sin datos de mercado")
         return None
@@ -2816,13 +2854,11 @@ def analyze_ticker(ticker, name="", sector="Unknown", force=False, force_score=F
     signal_type    = "NORMAL"
     special_signals = {}
 
-    # Premarket
-    if is_premarket():
-        pm_data = get_premarket_data(ticker)
-        if pm_data:
-            special_signals["premarket"] = pm_data
-            if pm_data.get("significant"):
-                print(f"    {ticker}: gap premarket {pm_data['gap_pct']:+.1f}%")
+    # Premarket (pm_data ya obtenido antes de get_market_data para inyectar en RSI)
+    if pm_data:
+        special_signals["premarket"] = pm_data
+        if pm_data.get("significant"):
+            print(f"    {ticker}: gap premarket {pm_data['gap_pct']:+.1f}%")
 
     # Put/call ratio
     pc_ratio, pc_interp = get_put_call_ratio(ticker)
@@ -3175,6 +3211,7 @@ def watch_cycle():
     not_analyzed = [
         t for t in UNIVERSE
         if not already_alerted_today(t)
+        and t not in _no_data_symbols
         and (t not in watch_signals
              or (datetime.now(SPAIN_TZ) - _to_aware(
                  watch_signals[t].get("last_analyzed", "2000-01-01T00:00:00+00:00")
