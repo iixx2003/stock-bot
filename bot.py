@@ -84,6 +84,7 @@ CONF_EXCEPCIONAL = 94
 MAX_ALERTAS_DIA       = 3
 MAX_VENTAS_DIA        = 1
 MAX_AI_POR_CICLO      = 2   # máx llamadas IA por ciclo (1 en BEAR, 2 en BULL/LATERAL)
+MAX_AI_DIA            = 20  # hard cap diario — garantiza ~$4-5/mes con Haiku
 MAX_PRE_EARNINGS_DIA  = 1   # máximo señales PRE-EARNINGS al día
 
 # Score técnico mínimo
@@ -2390,6 +2391,15 @@ def update_prediction_results():
 
 def call_ai(prompt, max_tokens=700):
     global _ai_client
+    # Hard cap diario
+    if ai_calls_hoy >= MAX_AI_DIA:
+        print(f"    IA bloqueada: límite diario {MAX_AI_DIA} llamadas alcanzado")
+        return None
+    # Sin IA nocturna (22:00-09:00 España — mercados cerrados, no hay señales útiles)
+    _hora_es = datetime.now(SPAIN_TZ).hour
+    if _hora_es >= 22 or _hora_es < 9:
+        print(f"    IA bloqueada: horario nocturno ({_hora_es}h), sin mercado activo")
+        return None
     try:
         if _ai_client is None:
             _ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -2466,8 +2476,8 @@ def _build_auto_prompt(tech, fund, sent, inst_signal, conf_boost, special_signal
     regime_desc = market_regime.get("description", "")
 
     # Contexto macro
-    macro_txt = "\n".join(f"- {h}" for h in market_context.get("macro_news", [])[:4]) or "- Sin noticias"
-    econ_txt  = "\n".join(f"- {h}" for h in market_context.get("economic_events", [])[:3]) or "- Sin eventos"
+    macro_txt = "\n".join(f"- {h}" for h in market_context.get("macro_news", [])[:2]) or "- Sin noticias"
+    econ_txt  = "\n".join(f"- {h}" for h in market_context.get("economic_events", [])[:2]) or "- Sin eventos"
 
     # Calendario económico
     eco_warn = ""
@@ -2487,7 +2497,7 @@ def _build_auto_prompt(tech, fund, sent, inst_signal, conf_boost, special_signal
         if bias_down: geo_txt += f" | Sectores penalizados: {', '.join(bias_down)}"
 
     # Noticias
-    news_txt = "\n".join(f"- {h}" for h in sent["news"][:6]) or "- Sin noticias"
+    news_txt = "\n".join(f"- {h}" for h in sent["news"][:3]) or "- Sin noticias"
 
     # Stocktwits
     st = sent.get("stocktwits")
@@ -2571,8 +2581,7 @@ RSI(14): {tech['rsi']} {('SOBREVENTA EXTREMA' if tech['rsi']<25 else 'sobreventa
 MACD: {'ALCISTA' if tech['macd_bullish'] else 'BAJISTA'} | Estocástico K: {tech['stoch_k']}{div_txt}
 Volumen: {tech['vol_ratio']}x | OBV: {tech['obv_trend']} | ATR: ${tech['atr']}
 Momentum: 1m {tech['mom1m']:+.1f}% | 3m {tech['mom3m']:+.1f}%
-Fibonacci: 23.6%=${tech['fib236']} | 38.2%=${tech['fib382']} | 50%=${tech['fib500']} | 61.8%=${tech['fib618']}
-Soporte: ${tech['rl']} ({tech['support_touches']} toques) | Resistencia: ${tech['rh']}
+Soporte: ${tech['rl']} ({tech['support_touches']} toques) | Fib38.2%=${tech['fib382']} | Fib61.8%=${tech['fib618']} | Resistencia: ${tech['rh']}
 52s: mín ${tech['l52']} ({tech['dist_l']:+.1f}%) / máx ${tech['h52']} ({tech['dist_h']:+.1f}%)
 
 FUNDAMENTAL
