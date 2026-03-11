@@ -673,6 +673,11 @@ def update_econ_calendar():
     """
     Actualiza el calendario económico del día usando Investing.com RSS
     y detección de palabras clave en noticias macro.
+
+    Lógica de expiración:
+    - Al detectar un evento por primera vez, se activa con expiración de 2h.
+    - Una vez expirado, se marca como 'visto hoy' y no se re-activa el mismo día.
+    - Solo se consideran noticias del RSS publicadas en las últimas 4h.
     """
     global econ_calendar
     high_impact_keywords = {
@@ -690,10 +695,20 @@ def update_econ_calendar():
         "Powell":          "Fed Speech",
     }
 
+    now       = datetime.now(SPAIN_TZ)
+    today_str = now.date().isoformat()
+    cutoff_dt = now - timedelta(hours=4)
+
     found_events = []
     try:
+        from datetime import timezone as _utc
         feed = feedparser.parse("https://www.investing.com/rss/news_301.rss")
         for entry in feed.entries[:30]:
+            pub = entry.get("published_parsed")
+            if pub:
+                pub_dt = datetime(*pub[:6], tzinfo=_utc.utc).astimezone(SPAIN_TZ)
+                if pub_dt < cutoff_dt:
+                    continue   # noticia demasiado antigua, ignorar
             title = entry.get("title", "") + " " + entry.get("summary", "")
             for keyword, event_name in high_impact_keywords.items():
                 if keyword.lower() in title.lower() and event_name not in found_events:
@@ -701,21 +716,55 @@ def update_econ_calendar():
     except Exception as e:
         print(f"[ERROR] econ_calendar RSS: {e}")
 
-    # También revisar macro_news del contexto
+    # También revisar macro_news del contexto (solo las más recientes)
     for news in market_context.get("macro_news", []):
         for keyword, event_name in high_impact_keywords.items():
             if keyword.lower() in news.lower() and event_name not in found_events:
                 found_events.append(event_name)
 
+    # --- Lógica de expiración: máx 2h activo, sin re-activar el mismo día ---
+    was_high       = econ_calendar.get("is_high_impact", False)
+    expires_at_str = econ_calendar.get("high_impact_expires_at")
+    seen_date      = econ_calendar.get("high_impact_seen_date")
+    new_high       = len(found_events) > 0
+
+    if new_high:
+        if seen_date == today_str:
+            # Ya procesamos y expiró hoy — no re-activar
+            new_high       = False
+            found_events   = []
+            expires_at_str = None
+        elif not was_high:
+            # Primera detección hoy: activar con expiración de 2h
+            expires_at_str = (now + timedelta(hours=2)).isoformat()
+        elif expires_at_str:
+            # Ya activo: comprobar si expiró
+            exp_dt = _to_aware(expires_at_str)
+            if now > exp_dt:
+                new_high       = False
+                found_events   = []
+                expires_at_str = None
+                seen_date      = today_str   # marcar como visto hoy
+    else:
+        expires_at_str = None
+
     econ_calendar.update({
-        "high_impact_today": found_events,
-        "is_high_impact":    len(found_events) > 0,
-        "updated_at":        datetime.now(SPAIN_TZ).isoformat(),
+        "high_impact_today":      found_events,
+        "is_high_impact":         new_high,
+        "high_impact_expires_at": expires_at_str,
+        "high_impact_seen_date":  seen_date,
+        "updated_at":             now.isoformat(),
     })
     save_state()
 
     if found_events:
-        print(f"  Calendario económico: ⚠️ ALTO IMPACTO — {', '.join(found_events)}")
+        exp_str = ""
+        if expires_at_str:
+            try:
+                exp_str = f" (hasta ~{_to_aware(expires_at_str).strftime('%H:%M')})"
+            except Exception:
+                pass
+        print(f"  Calendario económico: ⚠️ ALTO IMPACTO — {', '.join(found_events)}{exp_str}")
         send_log(f"⚠️ Eventos macro hoy: {', '.join(found_events)} — umbral de confianza elevado")
     else:
         print(f"  Calendario económico: sin eventos de alto impacto")
