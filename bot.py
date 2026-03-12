@@ -84,7 +84,7 @@ CONF_EXCEPCIONAL = 94
 MAX_ALERTAS_DIA       = 3
 MAX_VENTAS_DIA        = 1
 MAX_AI_POR_CICLO      = 2   # máx llamadas IA por ciclo (1 en BEAR, 2 en BULL/LATERAL)
-MAX_AI_DIA            = 20  # hard cap diario — garantiza ~$4-5/mes con Haiku
+MAX_AI_DIA            = 50  # hard cap diario — garantiza ~$2-3/mes con Haiku
 MAX_PRE_EARNINGS_DIA  = 1   # máximo señales PRE-EARNINGS al día
 
 # Score técnico mínimo
@@ -3266,7 +3266,8 @@ def watch_cycle():
     pm_flag    = " 🌅PREMARKET" if is_premarket() else ""
     print(f"\n[{now.strftime('%H:%M')} ES] {len(to_analyze)} candidatos | alertas hoy: {alertas_hoy()}/{MAX_ALERTAS_DIA} | {regime}{eco_flag}{pm_flag}")
 
-    alerts_this_cycle = 0
+    alerts_this_cycle  = 0
+    ai_calls_ciclo     = 0
     errores_429_ciclo  = 0
     intentos_ciclo     = 0
 
@@ -3274,10 +3275,12 @@ def watch_cycle():
     prefetch_tickers([item["ticker"] for item in to_analyze])
 
     _regime_now = market_regime.get("regime", "LATERAL")
-    _max_ai_ciclo = 2 if _regime_now == "BEAR" else MAX_AI_POR_CICLO
+    _max_ai_ciclo = 1 if _regime_now == "BEAR" else MAX_AI_POR_CICLO
 
     for item in to_analyze:
-        if alerts_this_cycle >= _max_ai_ciclo:
+        if alerts_this_cycle >= MAX_ALERTAS_DIA:
+            break
+        if ai_calls_ciclo >= _max_ai_ciclo:
             break
 
         ticker = item["ticker"]
@@ -3292,6 +3295,7 @@ def watch_cycle():
 
         intentos_ciclo += 1
         is_earnings_forced = item.get("source", "").startswith("earnings_")
+        _ai_antes = ai_calls_hoy
         result = analyze_ticker(
             ticker,
             item.get("name", ticker),
@@ -3299,6 +3303,7 @@ def watch_cycle():
             force_score=is_earnings_forced,    # bypass score/cooldown/prefiltro para earnings
             solo_excepcionales=solo_excepcionales,
         )
+        ai_calls_ciclo += ai_calls_hoy - _ai_antes
         if not result:
             # Detectar si fue 429 (el ticker queda sin datos)
             if ticker not in watch_signals or not watch_signals.get(ticker, {}).get("last_analyzed"):
